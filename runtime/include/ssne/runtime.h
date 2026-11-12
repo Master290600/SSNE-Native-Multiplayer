@@ -1,0 +1,159 @@
+#pragma once
+#include <cstdint>
+#include <string>
+#include <functional>
+
+#include "ssne/ppc_context.h"
+
+namespace ssne {
+struct PadState;
+
+using FatalHandler = void (*)(const char* message);
+void set_fatal_handler(FatalHandler h);
+[[noreturn]] void fatal(const char* message);
+
+void reset_cpu(PPCContext& ctx);
+void boot_globals(uint32_t mem_size = 0x01800000);
+
+// Load <data_dir>/sys/main.dol into guest RAM and set up what the IPL/apploader would leave behind
+// (disc ID, boot info, FST, BI2). Also mounts the disc for the DI emulation. Returns entry point or 0.
+uint32_t load_game(const std::string& data_dir, std::string& error);
+
+// Registers native replacements for Dolphin SDK functions found by name in the function table.
+void install_sdk_hooks();
+
+// Everything a runner needs: load, scheduler, all native replacements. Returns entry or 0.
+uint32_t boot(PPCContext& ctx, const std::string& data_dir, std::string& error);
+
+// Log sink for guest OSReport output (the port shows it in its window).
+using LogSink = void (*)(const char* line);
+void set_log_sink(LogSink sink);
+void log_message(const std::string& line);
+// Widescreen: horizontal field-of-view factor applied to the game's perspective projections
+// (1 = 4:3, 4/3 = 16:9, 7/4 = 21:9). Takes effect on the next projection the game computes.
+// Frame rate limit: 60 = the game's own VI-synced pacing (default), N > 60 = host-paced cap, 0 = unlimited.
+// While the player is in a vehicle the game runs at 60 fps whatever the limit (its physics need that step).
+void set_frame_limit(int fps);
+int frame_limit();
+void frame_limiter_wait();  // called by GX at each display copy
+// Mouse aim: rotation (radians; +yaw = turn right, +pitch = look up) applied directly to the player's view on
+// the next gameplay frame. active() is true while the game is running its first-person look update.
+void mouse_aim_add(double yaw, double pitch);
+void mouse_aim_add(int port, double yaw, double pitch);
+void mouse_aim_set_multiplayer(bool enabled);
+// Experimental local-simulation netplay. Called on the guest thread at the
+// main-loop time-step boundary; false stops the guest rather than drifting.
+using NetplayStep = std::function<bool(uint64_t tick, uint64_t checksum, bool world_ready, bool& wait_for_world)>;
+void set_netplay_step(NetplayStep step);
+// Native network rendering/input with an independent fixed simulation clock.
+// Configure before boot. Does not compute lockstep hashes or wait for clients.
+void set_authoritative_gameplay(bool enabled);
+void netplay_mouse(int port, double yaw, double pitch);
+// Called on the guest thread after exchanging canonical inputs.
+void netplay_filter_client_pad(PadState& pad,int port=1);
+void netplay_set_roster(unsigned count);
+void netplay_reset_world();
+void netplay_set_local_player(int port);
+int netplay_local_player();
+void netplay_set_visibility(float horizontal, float vertical); // agreed inputs, guest thread
+// Guest thread only: selection applies to camera draws, never world updates.
+bool netplay_render_discard();
+bool netplay_render_local();
+bool netplay_render_ui();
+bool netplay_render_world_camera();
+bool netplay_world_ready();
+// Refresh the original GUI input cache while a native network menu owns input.
+void refresh_native_menu_input(PPCContext&);
+uint32_t netplay_player(int port);
+
+bool mouse_aim_available();
+bool mouse_aim_active();
+// True while the player controls Sam (the game ran its per-frame look update in the last 200 ms) or drives a
+// vehicle: false in menus, cutscenes, loading and the pause screen.
+bool player_control_active();
+// The player is driving a vehicle (jeep, combine harvester).
+bool player_in_vehicle();
+// The controller port (0-3) of the player the keyboard and mouse play (multiplayer): mouse aim, the weapon number keys
+// and player_in_vehicle apply to that player.
+void set_kbm_port(int port);
+// Number-key weapon groups 0-8 (keys 1-9): picks the group's first available weapon (the next one if a weapon of the
+// group is already in hand) and switches to it the game's own way (hle.cpp). Ignored unless on foot.
+void weapon_select_group(int group);
+bool local_information_open();
+bool local_pause_menu_open();
+// Pause: the game thread stops at its next display copy until unpaused (port settings menu).
+void set_paused(bool paused);
+bool paused();
+// Gameplay vertical field of view in degrees (the game uses 63); 0 = original.
+void set_fov(float degrees);
+// Skip intros: when the game shows its first logo screen (Legal.sst), press Start for the player, which takes the
+// game straight to the main menu (the publisher/developer logos and videos and the title screen are skipped).
+void set_skip_intros(bool on);
+// Save states (savestate.cpp): saved / loaded at the start of the game's next frame flip (normally within a frame;
+// up to ~3 s while the game is loading). The result (message for the player) is picked up with take_result.
+struct SavestateResult { bool save = false, ok = false; std::string path, message; };
+void savestate_request(bool save, const std::string& path);
+bool savestate_pending();
+bool savestate_take_result(SavestateResult& out);
+bool savestate_read_info(const std::string& path, uint64_t& unix_time);  // false: no (valid) state there
+using GameFrameObserver = std::function<void(PPCContext&,uint64_t)>;
+// Set before boot or after joining the guest thread; runs at frame-flip safe point.
+void set_game_frame_observer(GameFrameObserver observer);
+void set_game_tick_observer(GameFrameObserver observer);
+// Guest-thread render lease: before view traversal and after all native draws.
+void set_game_render_observer(std::function<void(PPCContext&)> begin,std::function<void(PPCContext&)> end);
+// Original local HUD list traversal after netplay camera filtering. Register before
+// boot or on the guest thread; callbacks run on that thread and must not throw.
+// true begins one traversal; false ends the same traversal, also on unwinding.
+using NativeHudListObserver = void (*)(bool);
+void set_native_hud_list_observer(NativeHudListObserver observer);
+namespace detail {
+// Snapshot the observer so a nested registration change cannot unpair a scope.
+class NativeHudListScope {
+public:
+    explicit NativeHudListScope(NativeHudListObserver observer) : observer_(observer) {
+        if (observer_) observer_(true);
+    }
+    ~NativeHudListScope() { if (observer_) observer_(false); }
+    NativeHudListScope(const NativeHudListScope&) = delete;
+    NativeHudListScope& operator=(const NativeHudListScope&) = delete;
+private:
+    NativeHudListObserver observer_;
+};
+}
+void savestate_safe_point(PPCContext& ctx);  // internal: called at CcEngine::Flip
+// Button prompts: icons drawn over the game's GameCube button glyphs (A, B, X, Y, Z, L, R in that order) when the
+// player uses another controller. Icon ids match tools/make_prompt_icons.py (0 = keep the GameCube glyph).
+// `menu` applies in menus and cutscenes, `control` while the player controls Sam.
+enum PromptGlyph : uint8_t {
+    GLYPH_GC = 0, XB_A, XB_B, XB_X, XB_Y, XB_LB, XB_RB, XB_LT, XB_RT, XB_LS, XB_RS, XB_VIEW, XB_MENU,
+    GLYPH_DPAD_UP, GLYPH_DPAD_DOWN, GLYPH_DPAD_LEFT, GLYPH_DPAD_RIGHT,
+    PS_CROSS, PS_CIRCLE, PS_SQUARE, PS_TRIANGLE, PS_L1, PS_R1, PS_L2, PS_R2, PS_L3, PS_R3, PS_SHARE, PS_OPTIONS,
+    MS_LEFT, MS_RIGHT, MS_MIDDLE, MS_WHEEL_UP, MS_WHEEL_DOWN, MS_BACK, MS_FORWARD,  // then the keyboard keycaps
+};
+void set_button_prompts(const uint8_t menu[7], const uint8_t control[7]);
+// Glyph id of the keycap for a key by its SDL scancode name ("E", "Space", "Escape", ...), 0 if there is none.
+uint8_t prompt_key_glyph(const char* sdl_scancode_name);
+float fov();
+void set_widescreen(float factor);
+void set_hud_edges(bool on);  // widescreen: HUD pieces left / right of the middle at the screen's edges (default on)
+float widescreen();
+float widescreen_frame_factor();  // factor the game's current frame was rendered with (1 outside gameplay)
+bool widescreen_frame_zoomed();   // the current frame's scene camera is zoomed in (sniper scope; widescreen gameplay)
+void set_split_two(int mode);     // 2-player split screen: 0 top / bottom, 1 left / right, -1 the game's setting (next match)
+double game_time();               // seconds of frame time the game has advanced by (SSNE_FIXED_FPS: fixed per frame)
+// Cheats (issues #19, #21): the game's own invulnerability, infinite ammo, all-weapons and fly switches, every
+// unlock (lost levels, gallery, treasure cheats) and movement speed, jump height and weapon damage factors. In effect
+// in single player only (not in co-op or the versus modes). Save states keep the game's values.
+struct Cheats {
+    bool invulnerable = false, infinite_ammo = false, all_weapons = false, unlock_all = false, fly = false;
+    float speed = 1, jump = 1, damage = 1;  // movement speed, jump height and weapon damage factors
+};
+void set_cheats(const Cheats& c);
+bool cheats_available();  // the game's cheat code was found (USA Rev 1)
+bool cheats_active();     // a cheat is in effect right now
+bool cheat_flying();      // flying: the game flies down with L (jump) and up with R (fire)
+bool frontend_presenting();
+bool netplay_render_gui_camera();
+
+} // namespace ssne

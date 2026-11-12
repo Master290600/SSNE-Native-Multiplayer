@@ -1,0 +1,82 @@
+#pragma once
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <thread>
+
+#include <imgui.h>
+
+#include "config.h"
+#include "game_builder.h"
+#include "gc/verify.h"
+#include "updater.h"
+
+class LauncherApp {
+public:
+    explicit LauncherApp(bool updated = false);  // updated: started by the self-update (rebuild the game if needed)
+    ~LauncherApp();
+
+    void on_file_dropped(const std::string& path);
+    void frame();                     // draws the whole UI; call between ImGui::NewFrame/Render
+    bool wants_quit() const { return quit_; }
+    void save_test_state(const std::string& path, uint64_t sequence, uint64_t frame);
+
+private:
+    enum class Phase { Idle, Verifying, Extracting, Building, Updating };
+
+    void select_rom(const std::string& path);
+    void start_verify();
+    void refresh_target(bool force_verify = false);
+    void start_install(bool auto_launch = false);          // extract the disc (if needed) and build the game (if a build kit is present)
+    bool game_built() const;       // a game executable exists next to the launcher
+    bool game_outdated() const;    // built with an older build kit (engine update available): rebuild
+    bool game_ready() const { return target_ready_; }
+    void launch_game();
+    void join_worker();
+    void start_update();           // download and install update_, then restart
+    void draw_update(ImVec2 p0, ImVec2 p1);  // the update prompt / progress over the window
+
+    enum Item { ITEM_PLAY, ITEM_DISC, ITEM_INSTALL, ITEM_FULLSCREEN, ITEM_CLOSE, ITEM_QUIT, ITEM_COUNT };
+    bool item_enabled(int item) const;
+    void activate(int item);
+    void browse();
+
+    void draw_title(ImVec2 p0, ImVec2 p1);
+    void draw_menu(ImVec2 p0, ImVec2 p1);
+    void draw_panel(ImVec2 p0, ImVec2 p1);
+    void draw_prompt_bar(ImVec2 p0, ImVec2 p1);
+    void draw_progress();
+
+    std::string base_dir_, config_path_, data_dir_;
+    bool kit_present_ = false;
+    BuildKit base_kit_, kit_;
+    bool target_valid_ = true, target_present_ = false, target_ready_ = false;
+    std::string target_error_;
+    std::atomic<bool> refresh_pending_{false}, launch_pending_{false}, verified_pending_{false}, installed_pending_{false};
+    struct TestRow { int id; std::string label; bool enabled; ImVec2 a, b; };
+    std::vector<TestRow> test_rows_;
+    std::string build_step_;          // guarded by mu_
+    LauncherConfig cfg_;
+    std::vector<gc::KnownDump> known_;
+
+    std::thread worker_;
+    std::atomic<Phase> phase_{Phase::Idle};
+    std::atomic<uint64_t> prog_done_{0}, prog_total_{1};
+    std::atomic<bool> cancel_{false};
+
+    std::thread update_check_;
+    std::atomic<bool> update_found_{false};  // update_ is set
+    updater::Release update_;
+    bool update_prompt_ = false;      // asking the player
+    std::string update_step_;         // guarded by mu_
+
+    std::mutex mu_;
+    bool have_result_ = false;
+    gc::VerifyResult result_;
+    std::string message_;             // last error / info
+    bool message_is_error_ = false;
+    char path_buf_[1024] = {};
+    std::atomic<bool> quit_{false};
+    int selected_ = ITEM_DISC;
+    float time_ = 0;
+};

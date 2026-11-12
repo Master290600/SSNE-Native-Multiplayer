@@ -1,0 +1,694 @@
+#include "launcher_app.h"
+
+#include <imgui.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+
+#include "launcher_json.h"
+
+#include "gc/disc.h"
+#include "platform.h"
+#include "theme.h"
+
+namespace fs = std::filesystem;
+
+namespace {
+using theme::kGood; using theme::kWarn; using theme::kBad; using theme::kDim;
+
+bool acceptable(gc::VerifyStatus s) {
+    return s == gc::VerifyStatus::Verified || s == gc::VerifyStatus::UnknownDump;
+}
+} // namespace
+
+LauncherApp::LauncherApp(bool updated) {
+    auto trace=[](const char* step) {
+        if(getenv("SSNE_LAUNCHER_TEST_COMMAND")) { fprintf(stderr,"[launcher startup] %s\n",step);fflush(stderr); }
+    };
+    trace("executable directory");
+    base_dir_ = platform::exe_dir();
+    trace("update cleanup");
+    updater::cleanup(base_dir_);
+    {   // The launcher's name until 1.2 (a newer package unpacked over an older one leaves it behind)
+        std::error_code ec;
+#ifdef _WIN32
+        fs::remove(fs::u8path(base_dir_ + "/SillyReEncounter.exe"), ec);
+#else
+        fs::remove(base_dir_ + "/SillyReEncounter", ec);
+#endif
+    }
+    config_path_ = base_dir_ + "/launcher.ini";
+    data_dir_ = base_dir_ + "/game_data";
+    trace("known disc metadata");
+    known_ = gc::load_known_dumps(base_dir_ + "/known_dumps.txt");
+    {
+        std::string err;
+        trace("standard build kit");
+        kit_present_ = load_build_kit(base_dir_ + "/build-kit", base_kit_, err);
+    }
+    trace("launcher configuration");
+    cfg_.load(config_path_);
+    // Installed data must still be there.
+    if (cfg_.installed && !platform::file_exists(data_dir_ + "/sys/main.dol")) cfg_.installed = false;
+    trace("previous disc header");
+    if (!cfg_.rom_path.empty()) {
+        strncpy(path_buf_, cfg_.rom_path.c_str(), sizeof(path_buf_) - 1);
+        // Show the previous result without re-hashing 1.4 GB on every start.
+        if (cfg_.installed && !cfg_.rom_sha1.empty()) {
+            std::string err;
+            if (auto d = gc::Disc::open(cfg_.rom_path, err)) {
+                result_.header = d->header();
+                result_.sha1 = cfg_.rom_sha1;
+                result_.status = gc::VerifyStatus::UnknownDump;
+                for (auto& k : known_)
+                    if (k.sha1 == cfg_.rom_sha1) { result_.status = gc::VerifyStatus::Verified; result_.matched_label = k.label; }
+                result_.message = gc::to_string(result_.status);
+                have_result_ = true;
+            }
+        }
+    }
+    trace("native target selection");
+    refresh_target();
+    trace("startup complete");
+    if (updated) {
+        message_ = std::string("Updated to SSNE-Native ") + updater::current_version() + ".";
+        // A new build kit (engine update): rebuild the game right away, as Update Game would.
+        if (cfg_.installed && kit_present_ && game_outdated()) start_install();
+    }
+    if (cfg_.check_updates && !getenv("SSNE_NO_UPDATE_CHECK"))
+        update_check_ = std::thread([this] {
+            std::string err;
+            if (updater::check(update_, err)) update_found_ = true;
+        });
+}
+
+LauncherApp::~LauncherApp() {
+    cancel_ = true;
+    join_worker();
+    if (update_check_.joinable()) update_check_.join();
+}
+
+void LauncherApp::start_update() {
+    join_worker();
+    update_prompt_ = false;
+    cancel_ = false;
+    prog_done_ = 0; prog_total_ = 1000;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        message_.clear();
+        update_step_ = "Downloading SSNE-Native " + update_.version;
+    }
+    phase_ = Phase::Updating;
+    worker_ = std::thread([this] {
+        std::string launcher, err;
+        bool ok = updater::install(update_, base_dir_, [this](const std::string& step, double f) {
+            std::lock_guard<std::mutex> lk(mu_);
+            update_step_ = step;
+            prog_done_ = uint64_t(std::clamp(f, 0.0, 1.0) * 1000);
+            return !cancel_.load();
+        }, launcher, err);
+        if (ok && platform::launch(launcher, {"--updated"}, base_dir_, err)) {
+            cfg_.save(config_path_);
+            quit_ = true;
+            return;
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        message_ = (ok ? "The update was installed, but the new launcher didn't start (" + err + "): start it again."
+                       : "Update failed: " + err);
+        message_is_error_ = true;
+        phase_ = Phase::Idle;
+    });
+}
+
+void LauncherApp::join_worker() {
+    if (worker_.joinable()) worker_.join();
+}
+
+void LauncherApp::on_file_dropped(const std::string& path) {
+    if (phase_ == Phase::Idle && !refresh_pending_.load()) select_rom(path);
+}
+
+void LauncherApp::select_rom(const std::string& path) {
+    if (path.empty()) return;
+    strncpy(path_buf_, path.c_str(), sizeof(path_buf_) - 1);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        have_result_ = false;
+        message_.clear();
+    }
+    start_verify();
+}
+
+void LauncherApp::start_verify() {
+    join_worker();
+    std::string path = path_buf_;
+    cancel_ = false;
+    prog_done_ = 0; prog_total_ = 1;
+    phase_ = Phase::Verifying;
+    worker_ = std::thread([this, path] {
+        auto r = gc::verify_disc(path, known_, [this](uint64_t d, uint64_t t) {
+            prog_done_ = d; prog_total_ = t ? t : 1;
+            return !cancel_.load();
+        });
+        std::lock_guard<std::mutex> lk(mu_);
+        result_ = r;
+        have_result_ = true;
+        message_ = r.message;
+        message_is_error_ = !acceptable(r.status);
+        verified_pending_ = acceptable(r.status);
+        refresh_pending_ = true;
+        phase_ = Phase::Idle;
+    });
+}
+
+void LauncherApp::refresh_target(bool force_verify) {
+    target_error_.clear();
+    target_valid_ = select_build_target(base_kit_, base_dir_, data_dir_, kit_, target_error_);
+    target_present_ = target_ready_ = false;
+    if (target_valid_) {
+        target_present_ = platform::file_exists(kit_.output_exe(base_dir_));
+        if (kit_.target == BuildTarget::Standard)
+            for (auto& old : platform::legacy_port_exe_names())
+                target_present_ |= platform::file_exists(base_dir_ + "/" + old);
+        std::string err;
+        target_ready_ = game_build_ready(kit_, kit_.output_exe(base_dir_), err, force_verify);
+        if (!kit_present_) target_ready_ = target_present_;
+        if (!err.empty() && !target_ready_) target_error_ = err;
+    }
+}
+
+bool LauncherApp::game_built() const { return target_present_; }
+bool LauncherApp::game_outdated() const { return target_present_ && !target_ready_; }
+
+void LauncherApp::start_install(bool auto_launch) {
+    join_worker();
+    const std::string path = cfg_.rom_path;
+    std::ifstream installed_boot(fs::u8path(data_dir_ + "/sys/boot.bin"),std::ios::binary);
+    char installed_id[6]{};
+    const bool incomplete_data = !installed_boot.read(installed_id,sizeof(installed_id)) ||
+        !platform::file_exists(data_dir_ + "/sys/main.dol");
+    const bool extract = incomplete_data || !cfg_.installed || (!kit_present_ && !auto_launch) ||
+        (kit_.target == BuildTarget::Standard && game_ready() && !auto_launch);
+    cancel_ = false;
+    launch_pending_ = false;
+    prog_done_ = 0; prog_total_ = 1;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        message_.clear(); message_is_error_ = false;
+        build_step_.clear();
+    }
+    phase_ = extract ? Phase::Extracting : Phase::Building;
+    worker_ = std::thread([this, path, extract, auto_launch] {
+        std::string err;
+        bool ok = true;
+        if (extract) {
+            ok = false;
+            if (auto d = gc::Disc::open(path, err))
+                ok = d->extract(data_dir_, err, [this](uint64_t dn, uint64_t t) {
+                    prog_done_ = dn; prog_total_ = t ? t : 1;
+                    return !cancel_.load();
+                });
+            if (ok) installed_pending_ = true;
+        }
+        if (ok && kit_present_) {
+            BuildKit selected;
+            ok = select_build_target(base_kit_, base_dir_, data_dir_, selected, err);
+            if (ok) {
+                phase_ = Phase::Building;
+                prog_done_ = 0; prog_total_ = 1000;
+                GameBuilder builder;
+                ok = builder.build(selected, data_dir_, selected.output_exe(base_dir_),
+                    [this](const std::string& step, double f) {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        build_step_ = step;
+                        prog_done_ = uint64_t(std::clamp(f, 0.0, 1.0) * 1000);
+                    }, cancel_, err);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            message_ = ok ? "The game is ready. Singleplayer and multiplayer are available in the game menu."
+                          : (cancel_ ? "Build cancelled. The previous game was kept." : "Building the game failed: " + err);
+            message_is_error_ = !ok && !cancel_;
+        }
+        refresh_pending_ = true;
+        launch_pending_ = ok && auto_launch;
+        phase_ = Phase::Idle;
+    });
+}
+
+void LauncherApp::launch_game() {
+    refresh_target(true);
+    if (!target_valid_ || !game_ready()) {
+        if (target_valid_ && kit_present_) { start_install(true); return; }
+        std::lock_guard<std::mutex> lk(mu_);
+        message_ = "Launch failed: " + (target_error_.empty() ? "the game is not ready; choose Build Game." : target_error_);
+        message_is_error_ = true;
+        return;
+    }
+    std::string exe = kit_.output_exe(base_dir_);
+    if (kit_.target == BuildTarget::Standard)
+        for (auto& old : platform::legacy_port_exe_names())
+            if (!platform::file_exists(exe)) exe = base_dir_ + "/" + old;
+    std::vector<std::string> args{"--data", data_dir_};
+    if (cfg_.fullscreen) args.push_back("--fullscreen");
+    std::string err;
+    if (!platform::launch(exe, args, kit_.working_directory(base_dir_), err)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        message_ = "Launch failed: " + err;
+        message_is_error_ = true;
+        return;
+    }
+    cfg_.save(config_path_);
+    if (cfg_.close_on_launch) quit_ = true;
+}
+
+// ------------------------------------------------------------------ UI
+// Layout: title across the top, the game-style menu on the left, the disc / install panel on the right and the
+// button-prompt bar along the bottom. Up/Down + Enter drive the menu as well as the mouse.
+
+bool LauncherApp::item_enabled(int item) const {
+    bool idle = phase_ == Phase::Idle;
+    switch (item) {
+    case ITEM_PLAY: return idle && cfg_.installed && (kit_present_ || game_built());
+    case ITEM_DISC: return idle;
+    case ITEM_INSTALL: {
+        std::lock_guard<std::mutex> lk(const_cast<std::mutex&>(mu_));
+        return idle && ((have_result_ && acceptable(result_.status)) || (cfg_.installed && kit_present_));
+    }
+    default: return true;
+    }
+}
+
+void LauncherApp::browse() {
+    std::string p = platform::open_file_dialog("Select your Serious Sam: Next Encounter disc image");
+    if (!p.empty()) select_rom(p);
+}
+
+void LauncherApp::activate(int item) {
+    if (!item_enabled(item)) return;
+    switch (item) {
+    case ITEM_PLAY: launch_game(); break;
+    case ITEM_DISC: browse(); break;
+    case ITEM_INSTALL: start_install(); break;
+    case ITEM_FULLSCREEN: cfg_.fullscreen = !cfg_.fullscreen; cfg_.save(config_path_); break;
+    case ITEM_CLOSE: cfg_.close_on_launch = !cfg_.close_on_launch; cfg_.save(config_path_); break;
+    case ITEM_QUIT: quit_ = true; break;
+    }
+}
+
+void LauncherApp::frame() {
+    if (phase_ == Phase::Idle && refresh_pending_.exchange(false)) {
+        join_worker();
+        if (verified_pending_.exchange(false)) {
+            std::lock_guard<std::mutex> lk(mu_);
+            bool same = cfg_.installed && cfg_.rom_sha1 == result_.sha1;
+            cfg_.rom_path = path_buf_;
+            cfg_.game_id = result_.header.game_id;
+            cfg_.rom_sha1 = result_.sha1;
+            if (!same) cfg_.installed = false;
+            cfg_.save(config_path_);
+        }
+        if (installed_pending_.exchange(false)) { cfg_.installed = true; cfg_.save(config_path_); }
+        refresh_target();
+        if (launch_pending_.exchange(false)) launch_game();
+    }
+    test_rows_.clear();
+    ImGuiIO& io = ImGui::GetIO();
+    time_ += io.DeltaTime;
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImVec2 p0 = vp->WorkPos, p1 = vp->WorkPos + vp->WorkSize;
+    float w = p1.x - p0.x, h = p1.y - p0.y;
+    theme::draw_background(ImGui::GetBackgroundDrawList(), p0, p1, time_);
+
+    if (update_found_.load() && phase_ == Phase::Idle) {
+        update_found_ = false;
+        if (update_.version != cfg_.skip_version) update_prompt_ = true;
+    }
+    bool overlay = update_prompt_ || phase_ == Phase::Updating;
+    // Keyboard navigation (not while typing in the path box, nor under the update prompt).
+    if (!io.WantTextInput && !overlay) {
+        auto step = [&](int dir) {
+            for (int n = 0; n < ITEM_COUNT; n++) {
+                selected_ = (selected_ + dir + ITEM_COUNT) % ITEM_COUNT;
+                if (item_enabled(selected_)) break;
+            }
+        };
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) step(1);
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) step(-1);
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_Space, false))
+            activate(selected_);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && phase_ != Phase::Idle) cancel_ = true;
+    // Don't leave the cursor on an item that just became unavailable.
+    if (!item_enabled(selected_)) {
+        for (int n = 0; n < ITEM_COUNT; n++)
+            if (item_enabled(n)) { selected_ = n; break; }
+    }
+    // Once installed, start on Play.
+    static bool was_installed = false;
+    if (cfg_.installed && !was_installed) selected_ = ITEM_PLAY;
+    was_installed = cfg_.installed;
+
+    ImGui::SetNextWindowPos(p0);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::Begin("##launcher", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoScrollWithMouse);
+    float bar_h = std::clamp(h * 0.075f, 36.0f, 52.0f);
+    float title_h = std::clamp(h * 0.25f, 120.0f, 210.0f);
+    draw_title(p0, ImVec2(p1.x, p0.y + title_h));
+    float top = p0.y + title_h, bottom = p1.y - bar_h - h * 0.035f;
+    float split = p0.x + w * 0.45f;
+    draw_menu(ImVec2(p0.x + w * 0.04f, top), ImVec2(split, bottom));
+    draw_panel(ImVec2(split + w * 0.01f, top), ImVec2(p1.x - w * 0.04f, bottom));
+    draw_prompt_bar(ImVec2(p0.x, p1.y - bar_h), p1);
+    ImGui::End();
+    if (overlay) draw_update(p0, p1);
+}
+
+// Update prompt / progress: a panel over the dimmed launcher.
+void LauncherApp::draw_update(ImVec2 p0, ImVec2 p1) {
+    ImGui::SetNextWindowPos(p0);
+    ImGui::SetNextWindowSize(p1 - p0);
+    ImGui::SetNextWindowFocus();
+    ImGui::Begin("##update", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollWithMouse);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, p1, IM_COL32(0, 0, 12, 160));
+    float w = std::min(620.0f, (p1.x - p0.x) - 40), h = 270;
+    ImVec2 a(p0.x + ((p1.x - p0.x) - w) * 0.5f, p0.y + ((p1.y - p0.y) - h) * 0.5f), b(a.x + w, a.y + h);
+    theme::panel(dl, a, b);
+    const float pad = 22;
+    ImGui::SetCursorScreenPos(a + ImVec2(pad, pad * 0.8f));
+    ImGui::BeginChild("##updatepanel", ImVec2(w - pad * 2, h - pad * 1.6f), ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImVec2 sz = theme::chunky_text(ImGui::GetWindowDrawList(), pos + ImVec2(3, 0), 34,
+                                   phase_ == Phase::Updating ? "Updating" : "Update Available", theme::Look::Normal, time_);
+    ImGui::Dummy(ImVec2(sz.x, sz.y + 6));
+    ImGui::TextWrapped("SSNE-Native %s is available (this is %s).", update_.version.c_str(), updater::current_version());
+    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+    ImGui::TextWrapped("Update downloads it from GitHub, installs it in this folder and restarts the launcher. Your game "
+                       "files, saves and settings are kept; if the new version brings an engine update, the game is "
+                       "rebuilt right after.");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 8));
+    if (phase_ == Phase::Updating) {
+        std::string step;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            step = update_step_;
+        }
+        float f = float(double(prog_done_.load()) / double(prog_total_.load()));
+        char label[256];
+        snprintf(label, sizeof(label), "%s  %d%%", step.c_str(), int(f * 100));
+        theme::progress_bar(f, ImVec2(-110, 30), label);
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(-1, 30))) cancel_ = true;
+    } else {
+        float bw = (ImGui::GetContentRegionAvail().x - 16) / 3;
+        if (ImGui::Button("Update", ImVec2(bw, 34)) || ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))
+            start_update();
+        ImGui::SameLine(0, 8);
+        if (ImGui::Button("Later", ImVec2(bw, 34)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) update_prompt_ = false;
+        ImGui::SameLine(0, 8);
+        if (ImGui::Button("Skip This Version", ImVec2(bw, 34))) {
+            cfg_.skip_version = update_.version;
+            cfg_.save(config_path_);
+            update_prompt_ = false;
+        }
+    }
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+void LauncherApp::draw_title(ImVec2 p0, ImVec2 p1) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float w = p1.x - p0.x, h = p1.y - p0.y;
+    float size = std::min(h * 0.56f, w * 0.082f);
+    const char* title = "Serious Sam";
+    ImVec2 ts = theme::chunky_text(nullptr, ImVec2(0, 0), size, title, theme::Look::Normal, time_);
+    ImVec2 tp(p0.x + (w - ts.x) * 0.5f, p0.y + h * 0.14f);
+    theme::chunky_text(dl, tp, size, title, theme::Look::Normal, time_);
+
+    const char* sub = "NEXT ENCOUNTER NATIVE";
+    float ss = std::max(13.0f, size * 0.26f), sp = ss * 0.55f;
+    float sw = theme::spaced_text(nullptr, theme::fonts.bold, ss, ImVec2(0, 0), 0, sub, sp);
+    ImVec2 sub_pos(p0.x + (w - sw) * 0.5f, tp.y + ts.y + h * 0.06f);
+    theme::spaced_text(dl, theme::fonts.bold, ss, sub_pos + ImVec2(1, 2), IM_COL32(0, 0, 10, 200), sub, sp);
+    theme::spaced_text(dl, theme::fonts.bold, ss, sub_pos, IM_COL32(235, 238, 255, 255), sub, sp);
+
+    const char* legal = "Unofficial fan project. Not affiliated with or endorsed by Croteam, Devolver Digital, Climax, "
+                        "Global Star Software, Take-Two or Nintendo. Requires your own copy of the game.";
+    float ls = 13;
+    ImVec2 lt = theme::fonts.small->CalcTextSizeA(ls, FLT_MAX, 0, legal);
+    dl->AddText(theme::fonts.small, ls, ImVec2(p0.x + (w - lt.x) * 0.5f, sub_pos.y + ss + h * 0.07f),
+                IM_COL32(150, 158, 210, 200), legal);
+}
+
+void LauncherApp::draw_menu(ImVec2 p0, ImVec2 p1) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float w = p1.x - p0.x, h = p1.y - p0.y;
+    float big = std::clamp(h * 0.105f, 26.0f, 50.0f), small = big * 0.72f;
+    bool installed = cfg_.installed;
+    struct Row { int item; const char* label; float size; const char* value; };
+    Row rows[ITEM_COUNT] = {
+        {ITEM_PLAY, "Play", big * 1.12f, nullptr},
+        {ITEM_DISC, "Select Disc", big, nullptr},
+        {ITEM_INSTALL, !installed ? "Install Game" : game_outdated() ? "Update Game" : (kit_present_ && !game_ready()) ? "Build Game" : kit_.target == BuildTarget::NativeMultiplayer ? "Rebuild Game" : "Reinstall", big, nullptr},
+        {ITEM_FULLSCREEN, "Fullscreen", small, cfg_.fullscreen ? "ON" : "OFF"},
+        {ITEM_CLOSE, "Close On Launch", small, cfg_.close_on_launch ? "ON" : "OFF"},
+        {ITEM_QUIT, "Quit", big, nullptr},
+    };
+    float gap = big * 0.30f, total = 0;
+    for (auto& r : rows) total += r.size * 1.05f + gap;
+    float y = p0.y + std::max(0.0f, (h - total) * 0.5f);
+    ImVec2 mouse = ImGui::GetIO().MousePos;
+    for (auto& r : rows) {
+        bool en = item_enabled(r.item);
+        theme::Look look = !en ? theme::Look::Disabled : selected_ == r.item ? theme::Look::Selected : theme::Look::Normal;
+        ImVec2 ts = theme::chunky_text(nullptr, ImVec2(0, 0), r.size, r.label, look, time_);
+        float vw = 0, vs = r.size * 0.62f;
+        if (r.value) vw = theme::fonts.bold->CalcTextSizeA(vs, FLT_MAX, 0, r.value).x + r.size * 0.5f;
+        float x = p0.x + (w - ts.x - vw) * 0.5f;
+        ImVec2 a(x - 12, y - 4), b(x + ts.x + vw + 12, y + r.size * 1.05f + 4);
+        test_rows_.push_back({r.item, r.label, en, a, b});
+        bool hover = ImGui::IsWindowHovered() && mouse.x >= a.x && mouse.x < b.x && mouse.y >= a.y && mouse.y < b.y;
+        if (hover && en) {
+            if (ImGui::GetIO().MouseDelta.x != 0 || ImGui::GetIO().MouseDelta.y != 0) selected_ = r.item;
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { selected_ = r.item; activate(r.item); }
+        }
+        if (look == theme::Look::Selected) {
+            // Soft highlight behind the selected entry.
+            float cy = (a.y + b.y) * 0.5f;
+            dl->AddRectFilledMultiColor(ImVec2(p0.x, a.y), ImVec2((p0.x + p1.x) * 0.5f, b.y), IM_COL32(255, 150, 0, 0),
+                                        IM_COL32(255, 150, 0, 38), IM_COL32(255, 150, 0, 38), IM_COL32(255, 150, 0, 0));
+            dl->AddRectFilledMultiColor(ImVec2((p0.x + p1.x) * 0.5f, a.y), ImVec2(p1.x, b.y), IM_COL32(255, 150, 0, 38),
+                                        IM_COL32(255, 150, 0, 0), IM_COL32(255, 150, 0, 0), IM_COL32(255, 150, 0, 38));
+            (void)cy;
+        }
+        theme::chunky_text(dl, ImVec2(x, y), r.size, r.label, look, time_);
+        if (r.value) {
+            ImVec2 vp(x + ts.x + r.size * 0.5f, y + r.size * 0.62f - vs * 0.5f);
+            ImU32 vc = strcmp(r.value, "ON") == 0 ? IM_COL32(140, 255, 110, 255) : IM_COL32(170, 180, 230, 255);
+            dl->AddText(theme::fonts.bold, vs, vp + ImVec2(1, 2), IM_COL32(0, 0, 10, 200), r.value);
+            dl->AddText(theme::fonts.bold, vs, vp, vc, r.value);
+        }
+        y += r.size * 1.05f + gap;
+    }
+}
+
+void LauncherApp::draw_progress() {
+    float f = float(double(prog_done_.load()) / double(prog_total_.load()));
+    std::string what = phase_ == Phase::Verifying ? "Checking disc" : "Copying the game files";
+    if (phase_ == Phase::Building) {
+        std::lock_guard<std::mutex> lk(mu_);
+        what = build_step_.empty() ? "Building the game" : build_step_;
+    }
+    char label[256];
+    snprintf(label, sizeof(label), "%s  %d%%", what.c_str(), int(f * 100));
+    theme::progress_bar(f, ImVec2(-110, 30), label);
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(-1, 30))) cancel_ = true;
+    test_rows_.push_back({100, "Cancel", true, ImGui::GetItemRectMin(), ImGui::GetItemRectMax()});
+}
+
+void LauncherApp::draw_panel(ImVec2 p0, ImVec2 p1) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    theme::panel(dl, p0, p1);
+    const float pad = 20;
+    ImGui::SetCursorScreenPos(p0 + ImVec2(pad, pad * 0.8f));
+    ImGui::BeginChild("##panel", ImVec2(p1.x - p0.x - pad * 2, p1.y - p0.y - pad * 1.6f), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoBackground);
+    ImDrawList* cdl = ImGui::GetWindowDrawList();
+    auto heading = [&](const char* text) {
+        ImVec2 pos = ImGui::GetCursorScreenPos();
+        ImVec2 sz = theme::chunky_text(cdl, pos + ImVec2(3, 0), 34, text, theme::Look::Normal, time_);
+        ImGui::Dummy(ImVec2(sz.x, sz.y + 2));
+    };
+    bool busy = phase_ != Phase::Idle;
+
+    heading("Disc Image");
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (phase_ == Phase::Verifying) {
+            ImGui::TextColored(kDim, "Reading the whole disc to check it...");
+        } else if (!have_result_) {
+            ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+            ImGui::TextWrapped("Choose your Serious Sam: Next Encounter disc image: an .iso / .gcm dump or a Dolphin "
+                               "image (.rvz, .wia, .gcz, .ciso). You can also drop it on this window.");
+            ImGui::PopStyleColor();
+        } else {
+            const auto& r = result_;
+            ImVec4 col = r.status == gc::VerifyStatus::Verified ? kGood
+                       : r.status == gc::VerifyStatus::UnknownDump ? kWarn : kBad;
+            ImGui::PushFont(theme::fonts.bold);
+            ImGui::TextColored(col, "%s", gc::to_string(r.status));
+            ImGui::PopFont();
+            if (!r.header.game_id.empty())
+                ImGui::Text("%s   |   %s   |   Rev %d   |   Disc %d", r.header.title.c_str(), r.header.game_id.c_str(),
+                            r.header.version, r.header.disc_number + 1);
+            ImGui::PushFont(theme::fonts.small);
+            if (!r.format.empty()) ImGui::TextColored(kDim, "Image: %s", r.format.c_str());
+            if (!r.sha1.empty()) ImGui::TextColored(kDim, "SHA-1: %s", r.sha1.c_str());
+            if (!r.matched_label.empty()) ImGui::TextColored(kDim, "Matches: %s", r.matched_label.c_str());
+            ImGui::PopFont();
+        }
+    }
+    ImGui::Spacing();
+    ImGui::BeginDisabled(busy);
+    ImGui::SetNextItemWidth(-190);
+    bool enter = ImGui::InputTextWithHint("##rom", "Path to your disc image", path_buf_, sizeof(path_buf_),
+                                          ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::Button("Browse", ImVec2(85, 0))) browse();
+    ImGui::SameLine();
+    if (ImGui::Button("Verify", ImVec2(-1, 0)) || enter) select_rom(path_buf_);
+    ImGui::EndDisabled();
+    if (phase_ == Phase::Verifying) draw_progress();
+
+    ImGui::Dummy(ImVec2(0, 10));
+    heading("Game");
+    bool ok;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        ok = have_result_ && acceptable(result_.status);
+    }
+    bool ready = game_ready();
+    if (phase_ == Phase::Extracting) {
+        ImGui::TextColored(kDim, "Step 1: copying the game's files out of your disc image...");
+        draw_progress();
+    } else if (phase_ == Phase::Building) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+        ImGui::TextWrapped("Step 2: building the game on this PC from your disc. This takes a few minutes.");
+        ImGui::PopStyleColor();
+        draw_progress();
+    } else if (cfg_.installed && (ready || !kit_present_)) {
+        ImGui::PushFont(theme::fonts.bold);
+        ImGui::TextColored(kGood, "Installed");
+        ImGui::PopFont();
+        ImGui::SameLine();
+        ImGui::TextColored(kDim, ready ? "and built on this PC. Ready to play." : "in game_data next to the launcher.");
+    } else if (cfg_.installed && game_outdated()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
+        ImGui::TextWrapped("This launcher has an updated game engine (performance improvements). Choose Update Game to "
+                           "rebuild the game on this PC. Play also builds the current game before starting it.");
+        ImGui::PopStyleColor();
+    } else if (cfg_.installed) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
+        ImGui::TextWrapped("Game files installed, but the game hasn't been built yet. Choose Build Game.");
+        ImGui::PopStyleColor();
+    } else if (ok) {
+        if (kit_present_ && kit_.toolchain_url.empty()) {
+            ImGui::TextWrapped("Install Game copies the game's files out of your disc (about 1.3 GB), then builds the game "
+                               "on this PC with the %s compiler installed on this system. Nothing is downloaded.",
+                               kit_.toolchain_name.empty() ? "C++" : kit_.toolchain_name.c_str());
+        } else if (kit_present_) {
+            ImGui::TextWrapped("Install Game copies the game's files out of your disc (about 1.3 GB), then builds the game "
+                               "on this PC. The first time it downloads the free %s compiler (about %d MB) from its "
+                               "official release. Nothing from the game is ever downloaded.",
+                               kit_.toolchain_name.c_str(), kit_.toolchain_size_mb);
+        } else {
+            ImGui::TextWrapped("Install Game copies the game's files (about 1.3 GB) out of the disc image into game_data "
+                               "next to the launcher.");
+        }
+    } else {
+        ImGui::TextColored(kDim, "Waiting for a verified disc.");
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!message_.empty() && phase_ == Phase::Idle) {
+            ImGui::Dummy(ImVec2(0, 6));
+            ImGui::PushStyleColor(ImGuiCol_Text, message_is_error_ ? kBad : kDim);
+            ImGui::TextWrapped("%s", message_.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
+
+    // Progress strip along the bottom: Disc -> Data -> Ready.
+    const char* steps[3] = {"1  Disc verified", "2  Game installed", "3  Ready to play"};
+    bool built = cfg_.installed && (ready || !kit_present_);
+    bool done[3] = {ok || cfg_.installed, cfg_.installed, built};
+    float avail = ImGui::GetContentRegionAvail().x, ph = 34, gap = 10;
+    float pw = (avail - gap * 2) / 3;
+    ImVec2 base(ImGui::GetWindowPos().x, ImGui::GetWindowPos().y + ImGui::GetWindowHeight() - ph - 2);
+    for (int i = 0; i < 3; i++) {
+        ImVec2 a(base.x + i * (pw + gap), base.y), b(a.x + pw, a.y + ph);
+        bool next = !done[i] && (i == 0 || done[i - 1]);
+        ImU32 fill = done[i] ? IM_COL32(40, 120, 40, 200) : next ? IM_COL32(150, 80, 0, 200) : IM_COL32(20, 24, 70, 200);
+        ImU32 edge = done[i] ? IM_COL32(140, 255, 110, 200) : next ? IM_COL32(255, 170, 40, 230) : IM_COL32(90, 100, 170, 160);
+        cdl->AddRectFilled(a, b, fill, ph * 0.5f);
+        cdl->AddRect(a, b, edge, ph * 0.5f, 0, 1.5f);
+        ImVec2 ts = theme::fonts.bold->CalcTextSizeA(16, FLT_MAX, 0, steps[i]);
+        cdl->AddText(theme::fonts.bold, 16, ImVec2(a.x + (pw - ts.x) * 0.5f, a.y + (ph - ts.y) * 0.5f),
+                     done[i] || next ? IM_COL32(255, 255, 255, 255) : IM_COL32(150, 160, 210, 255), steps[i]);
+    }
+    ImGui::EndChild();
+}
+
+void LauncherApp::draw_prompt_bar(ImVec2 p0, ImVec2 p1) {
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float h = p1.y - p0.y;
+    dl->AddRectFilledMultiColor(p0, p1, IM_COL32(70, 72, 90, 150), IM_COL32(70, 72, 90, 150),
+                                IM_COL32(30, 32, 44, 200), IM_COL32(30, 32, 44, 200));
+    dl->AddLine(p0, ImVec2(p1.x, p0.y), IM_COL32(255, 255, 255, 50), 1.0f);
+    float kh = h * 0.56f, x = p0.x + 18, y = p0.y + (h - kh) * 0.5f;
+    x += theme::key_prompt(dl, ImVec2(x, y), kh, "Enter", "Select", IM_COL32(40, 170, 60, 255)) + 26;
+    x += theme::key_prompt(dl, ImVec2(x, y), kh, "Up/Down", "Move", IM_COL32(60, 90, 200, 255)) + 26;
+    if (phase_ != Phase::Idle) theme::key_prompt(dl, ImVec2(x, y), kh, "Esc", "Cancel", IM_COL32(200, 40, 40, 255));
+    const char* hint = "Drop a disc image anywhere on this window";
+    ImVec2 ts = theme::fonts.small->CalcTextSizeA(kh * 0.6f, FLT_MAX, 0, hint);
+    dl->AddText(theme::fonts.small, kh * 0.6f, ImVec2(p1.x - ts.x - 20, p0.y + (h - ts.y) * 0.5f),
+                IM_COL32(190, 195, 230, 220), hint);
+}
+
+// Hidden, opt-in input tests report the same hit rectangles used by the real UI.
+void LauncherApp::save_test_state(const std::string& path, uint64_t sequence, uint64_t frame_number) {
+    using launcher::JSONValue;
+    const char* phases[] = {"Idle", "Verifying", "Extracting", "Building", "Updating"};
+    JSONValue::Array rows;
+    for (const auto& r : test_rows_)
+        rows.emplace_back(JSONValue::Object{{"id",r.id},{"label",r.label},{"enabled",r.enabled},
+            {"bounds",JSONValue::Array{double(r.a.x),double(r.a.y),double(r.b.x),double(r.b.y)}}});
+    std::lock_guard<std::mutex> lk(mu_);
+    JSONValue state(JSONValue::Object{{"accepted_sequence",int64_t(sequence)},{"frame",int64_t(frame_number)},
+        {"phase",phases[int(phase_.load())]},{"installed",cfg_.installed},{"game_built",game_built()},
+        {"game_ready",game_ready()},{"game_outdated",game_outdated()},{"message",message_},
+        {"is_error",message_is_error_},{"build_step",build_step_},
+        {"progress",double(prog_done_.load()) / double(prog_total_.load())},{"rows",std::move(rows)},
+        {"target",kit_.target == BuildTarget::NativeMultiplayer ? "multiplayer" : "standard"},
+        {"output_exe",kit_.output_exe(base_dir_)},{"working_directory",kit_.working_directory(base_dir_)}});
+    fs::path out = fs::u8path(path), tmp = out; tmp += ".tmp";
+    { std::ofstream f(tmp, std::ios::binary | std::ios::trunc); f << launcher::write_json(state); }
+    std::error_code ec;
+    fs::remove(out, ec); ec.clear(); fs::rename(tmp, out, ec);
+}

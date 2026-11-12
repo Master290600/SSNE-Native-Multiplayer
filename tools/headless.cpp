@@ -1,0 +1,506 @@
+// ssne-headless: runs the recompiled game with no window, for bring-up and CI.
+//   ssne-headless --data <extracted_game_dir> [--seconds N]
+// Prints OSReport output and the reason execution stopped. A watchdog reports the last
+// function entered if the guest spins (typically waiting on hardware that isn't emulated yet).
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include <thread>
+
+#include "ssne/recomp_hooks.h"
+#include "ssne/audio.h"
+#include "ssne/exi.h"
+#include "ssne/gx_gpu.h"
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
+#include "ssne/gx.h"
+#include "ssne/hw.h"
+#include "ssne/input.h"
+#include "ssne/runtime.h"
+#include "ssne/scheduler.h"
+#include "ssne/thread_util.h"
+
+[[noreturn]] static void throw_fatal(const char* m) { throw std::runtime_error(m); }
+
+#if defined(__clang__) && !defined(_WIN32)
+// PGO training (SSNE_PGO_GENERATE): the profile is normally written at exit, which _Exit skips.
+extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
+#endif
+[[noreturn]] static void quit(int code) {
+#if defined(__clang__) && !defined(_WIN32)
+    if (__llvm_profile_write_file) __llvm_profile_write_file();
+#endif
+    std::_Exit(code);
+}
+
+#ifdef __linux__
+// Headless OpenGL for testing the GPU renderer: surfaceless EGL (Mesa), loaded at runtime.
+static void* (*s_egl_getproc)(const char*) = nullptr;
+static void* egl_getproc(const char* name) { return s_egl_getproc(name); }
+static bool egl_init(std::string& err) {
+    void* lib = dlopen("libEGL.so.1", RTLD_NOW);
+    if (!lib) { err = "libEGL.so.1 not found"; return false; }
+    using P = void*;
+    s_egl_getproc = reinterpret_cast<void* (*)(const char*)>(dlsym(lib, "eglGetProcAddress"));
+    auto get_platform = reinterpret_cast<P (*)(unsigned, void*, const int*)>(s_egl_getproc("eglGetPlatformDisplayEXT"));
+    auto init = reinterpret_cast<unsigned (*)(P, int*, int*)>(dlsym(lib, "eglInitialize"));
+    auto bind = reinterpret_cast<unsigned (*)(unsigned)>(dlsym(lib, "eglBindAPI"));
+    auto create = reinterpret_cast<P (*)(P, P, P, const int*)>(dlsym(lib, "eglCreateContext"));
+    auto make = reinterpret_cast<unsigned (*)(P, P, P, P)>(dlsym(lib, "eglMakeCurrent"));
+    if (!get_platform || !init || !bind || !create || !make) { err = "EGL entry points missing"; return false; }
+    P d = get_platform(0x31DD /* EGL_PLATFORM_SURFACELESS_MESA */, nullptr, nullptr);
+    int ma, mi;
+    if (!init(d, &ma, &mi)) { err = "eglInitialize failed"; return false; }
+    bind(0x30A2 /* EGL_OPENGL_API */);
+    const int attrs[] = {0x3098, 3, 0x30FB, 3, 0x30FD, 1, 0x3038};  // GL 3.3 core
+    P ctx = create(d, nullptr, nullptr, attrs);
+    if (!ctx) { err = "eglCreateContext failed"; return false; }
+    make(d, nullptr, nullptr, ctx);
+    return true;
+}
+#endif
+
+#ifdef SSNE_COUNT_CALLS
+uint32_t g_ssne_call_counts[1u << 19];
+#endif
+
+double g_control_start = -1;  // game time when the player first got control (presses at "@g" times count from it)
+
+int main(int argc, char** argv) {
+    std::string data = "game_data";
+    int seconds = 10;
+    std::string dump_dir;
+    int dump_ms = 500;
+    std::string wav_path;
+    bool gpu = false;
+    float wide = 1.0f;
+    int gpu_scale = 1;
+    struct Press { uint16_t button; double at; double dur = 0.2; uint8_t sx = 128, sy = 128, cx = 128, cy = 128; int port = 0; bool game = false; };
+    std::vector<Press> presses;
+    double pause_at = -1, pause_len = 0;
+    std::vector<double> ram_dumps;
+    struct Poke { double t; uint32_t addr, value; };  // --poke16 T:ADDR:VALUE  write a halfword at T seconds
+    std::vector<Poke> pokes;
+    std::vector<std::pair<double, int>> fps_changes;  // --fps-at T:N  frame rate limit N from T seconds
+    std::vector<std::pair<double, ssne::Cheats>> cheat_changes;  // --cheats T:god,ammo,weapons,unlock,fly,speed=N,jump=N,damage=N (T:off)
+    std::vector<uint32_t> watches;
+    std::vector<uint32_t> watches_f;  // --watchf ADDR  log every change of a float  // --watch16 ADDR  log every change of a halfword (with the time)
+    double count_from = -1, count_to = -1;
+    std::string count_path;
+    struct Aim { double t, yaw, pitch; };
+    std::vector<Aim> aims;
+    std::vector<std::pair<double, int>> weapons;  // --weapon T:GROUP  number key GROUP+1 at T seconds
+    struct StateOp { double t; bool save; std::string path; };
+    std::vector<StateOp> state_ops;  // --dump-ram 95,98,101: raw MEM1 snapshots to /tmp/ram_<t>.bin  // --press A@5.0,START@8,R@90:5 (hold 5 s)
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--data" && i + 1 < argc) data = argv[++i];
+        else if (a == "--seconds" && i + 1 < argc) seconds = atoi(argv[++i]);
+        else if (a == "--dump-frames" && i + 1 < argc) dump_dir = argv[++i];
+        else if (a == "--dump-ms" && i + 1 < argc) dump_ms = atoi(argv[++i]);
+        else if (a == "--wav" && i + 1 < argc) wav_path = argv[++i];
+        else if (a == "--memcard" && i + 1 < argc) ssne::exi_configure_memcard(argv[++i]);
+        else if (a == "--no-memcard") ssne::exi_configure_memcard("");
+        else if (a == "--audio-original") ssne::audio_set_hq(false);
+        else if (a == "--mix" && i + 1 < argc) { int m = 100, x = 100; sscanf(argv[++i], "%d:%d", &m, &x); ssne::audio_set_mix(m, x); }
+        else if (a == "--gpu") gpu = true;
+        else if (a == "--kbm-port" && i + 1 < argc) ssne::set_kbm_port(atoi(argv[++i]) - 1);  // 1-4: mouse aim / weapon keys
+        else if (a == "--split2" && i + 1 < argc) ssne::set_split_two(atoi(argv[++i]));  // 0 top / bottom, 1 side by side
+        else if (a == "--pads" && i + 1 < argc) {  // controllers plugged in (1-4)
+            int n = atoi(argv[++i]);
+            for (int k = 1; k < 4; k++) ssne::set_pad_connected(k, k < n);
+        }
+        else if (a == "--shader-cache" && i + 1 < argc) ssne::gpu_renderer_set_shader_cache(argv[++i]);  // dir (exists)
+        else if (a == "--skip-intros") ssne::set_skip_intros(true);
+        else if ((a == "--save-state" || a == "--load-state") && i + 1 < argc) {  // --save-state T:path
+            std::string v = argv[++i];
+            size_t c = v.find(':');
+            state_ops.push_back({atof(v.substr(0, c).c_str()), a == "--save-state", v.substr(c + 1)});
+        }
+        else if (a == "--ps-prompts") {  // PlayStation glyphs, Xbox-style layout
+            const uint8_t menu[7] = {ssne::PS_CROSS, ssne::PS_CIRCLE, ssne::PS_R1, ssne::PS_L1, ssne::PS_TRIANGLE, ssne::PS_CROSS, ssne::PS_R2};
+            const uint8_t ctl[7] = {ssne::PS_SQUARE, ssne::PS_CIRCLE, ssne::PS_R1, ssne::PS_L1, ssne::PS_TRIANGLE, ssne::PS_CROSS, ssne::PS_R2};
+            ssne::set_button_prompts(menu, ctl);
+        }
+        else if (a == "--kb-prompts") {  // keyboard / mouse prompts of the port's default bindings
+            auto key = [](const char* n) { return ssne::prompt_key_glyph(n); };
+            const uint8_t menu[7] = {key("Space"), key("Escape"), key("Q"), key("F"), key("Tab"), key("Space"), key("Left Ctrl")};
+            const uint8_t ctl[7] = {key("E"), key("R"), key("Q"), ssne::MS_WHEEL_UP, key("Tab"), key("Space"), ssne::MS_LEFT};
+            ssne::set_button_prompts(menu, ctl);
+        }
+        else if (a == "--xbox-prompts") {  // Xbox layout button prompts (jump on A, use on X)
+            const uint8_t menu[7] = {ssne::XB_A, ssne::XB_B, ssne::XB_RB, ssne::XB_LB, ssne::XB_Y, ssne::XB_A, ssne::XB_RT};
+            const uint8_t ctl[7] = {ssne::XB_X, ssne::XB_B, ssne::XB_RB, ssne::XB_LB, ssne::XB_Y, ssne::XB_A, ssne::XB_RT};
+            ssne::set_button_prompts(menu, ctl);
+        }
+        else if (a == "--fps" && i + 1 < argc) ssne::set_frame_limit(atoi(argv[++i]));
+        else if (a == "--weapon" && i + 1 < argc) {
+            double t = 0;
+            int g = 0;
+            sscanf(argv[++i], "%lf:%d", &t, &g);
+            weapons.push_back({t, g});
+        }
+        else if (a == "--fov" && i + 1 < argc) ssne::set_fov(float(atof(argv[++i])));
+        else if (a == "--aim" && i + 1 < argc) {  // --aim T:YAW:PITCH  one mouse-aim rotation (radians) at T seconds
+            double t = 0, y = 0, p = 0;
+            sscanf(argv[++i], "%lf:%lf:%lf", &t, &y, &p);
+            aims.push_back({t, y, p});
+        }
+#ifdef SSNE_COUNT_CALLS
+        else if (a == "--count-calls" && i + 1 < argc) {  // --count-calls FROM:TO:file  calls per function in [FROM, TO) s
+            char path[512] = {};
+            sscanf(argv[++i], "%lf:%lf:%511s", &count_from, &count_to, path);
+            count_path = path;
+        }
+#endif
+        else if (a == "--fps-at" && i + 1 < argc) {
+            double t = 0; int n = 60;
+            sscanf(argv[++i], "%lf:%d", &t, &n);
+            fps_changes.push_back({t, n});
+        }
+        else if (a == "--cheats" && i + 1 < argc) {
+            std::string v = argv[++i];
+            size_t c = v.find(':');
+            ssne::Cheats ch;
+            for (size_t at = c + 1; at < v.size();) {
+                size_t e = v.find(',', at);
+                std::string w = v.substr(at, e == std::string::npos ? std::string::npos : e - at);
+                if (w == "god") ch.invulnerable = true;
+                else if (w == "ammo") ch.infinite_ammo = true;
+                else if (w == "weapons") ch.all_weapons = true;
+                else if (w == "unlock") ch.unlock_all = true;
+                else if (w.rfind("speed=", 0) == 0) ch.speed = float(atof(w.c_str() + 6));
+                else if (w.rfind("jump=", 0) == 0) ch.jump = float(atof(w.c_str() + 5));
+                else if (w.rfind("damage=", 0) == 0) ch.damage = float(atof(w.c_str() + 7));
+                else if (w == "fly") ch.fly = true;
+                at = e == std::string::npos ? v.size() : e + 1;
+            }
+            cheat_changes.push_back({atof(v.substr(0, c).c_str()), ch});
+        }
+        else if (a == "--watchf" && i + 1 < argc) watches_f.push_back(uint32_t(strtoul(argv[++i], nullptr, 16)));
+        else if (a == "--watch16" && i + 1 < argc) watches.push_back(uint32_t(strtoul(argv[++i], nullptr, 16)));
+        else if (a == "--poke16" && i + 1 < argc) {
+            Poke k{};
+            sscanf(argv[++i], "%lf:%x:%u", &k.t, &k.addr, &k.value);
+            pokes.push_back(k);
+        }
+        else if (a == "--dump-ram" && i + 1 < argc) {
+            std::string v = argv[++i];
+            for (size_t pos = 0; pos < v.size();) {
+                size_t c = v.find(',', pos);
+                ram_dumps.push_back(atof(v.substr(pos, c - pos).c_str()));
+                if (c == std::string::npos) break;
+                pos = c + 1;
+            }
+        }
+        else if (a == "--pause" && i + 1 < argc) {  // --pause T:D  pause the game at T seconds for D seconds
+            std::string v = argv[++i];
+            pause_at = atof(v.c_str());
+            size_t c = v.find(':');
+            pause_len = c == std::string::npos ? 1.0 : atof(v.substr(c + 1).c_str());
+        }
+        else if (a == "--norender" && i + 1 < argc) {
+#ifdef _WIN32
+            _putenv_s("SSNE_NORENDER", argv[++i]);
+#else
+            setenv("SSNE_NORENDER", argv[++i], 1);
+#endif
+        }  // seconds (1 = always)
+        else if (a == "--widescreen" && i + 1 < argc) wide = float(atof(argv[++i]));
+        else if (a == "--scale" && i + 1 < argc) gpu_scale = atoi(argv[++i]);
+        else if (a == "--press" && i + 1 < argc) {
+            std::string spec = argv[++i];
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                size_t comma = spec.find(',', pos);
+                std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                int press_port = 0;  // p2:A@5 = controller 2
+                if (item.size() > 3 && item[0] == 'p' && item[2] == ':' && item[1] >= '1' && item[1] <= '4') {
+                    press_port = item[1] - '1';
+                    item = item.substr(3);
+                }
+                size_t at = item.find('@');
+                std::string name = item.substr(0, at);
+                // A@g45: 45 s of game time after the player first got control (in a level)
+                const bool game_clock = item.size() > at + 1 && item[at + 1] == 'g';
+                double t = atof(item.substr(at + (game_clock ? 2 : 1)).c_str());
+                size_t colon = item.find(':');
+                double dur = colon == std::string::npos ? 0.2 : atof(item.substr(colon + 1).c_str());
+                size_t first = presses.size();
+                static const struct { const char* n; uint16_t b; } kNames[] = {
+                    {"A", ssne::PAD_A}, {"B", ssne::PAD_B}, {"X", ssne::PAD_X}, {"Y", ssne::PAD_Y},
+                    {"START", ssne::PAD_START}, {"Z", ssne::PAD_Z}, {"L", ssne::PAD_L}, {"R", ssne::PAD_R},
+                    {"UP", ssne::PAD_UP}, {"DOWN", ssne::PAD_DOWN}, {"LEFT", ssne::PAD_LEFT}, {"RIGHT", ssne::PAD_RIGHT}};
+                for (auto& k : kNames) if (name == k.n) presses.push_back({k.b, t});
+                // Analog stick directions use pseudo-button codes 0x8000+dir
+                if (name == "SUP") presses.push_back({0x8001, t});
+                if (name == "SDOWN") presses.push_back({0x8002, t});
+                if (name == "SLEFT") presses.push_back({0x8003, t});
+                if (name == "SRIGHT") presses.push_back({0x8004, t});
+                if (name == "CLEFT") presses.push_back({0x8005, t});
+                if (name == "CRIGHT") presses.push_back({0x8006, t});
+                if (name == "CUP") presses.push_back({0x8007, t});
+                if (name == "CDOWN") presses.push_back({0x8008, t});
+                // RAW<x>_<y>: main stick at raw bytes x, y (128 = center), e.g. RAW1_1@60:4 = full down-left
+                if (name.rfind("RAW", 0) == 0) {
+                    int x = 128, y = 128, cx = 128, cy = 128;  // RAW<x>_<y>_<cx>_<cy>: C-stick too
+                    sscanf(name.c_str() + 3, "%d_%d_%d_%d", &x, &y, &cx, &cy);
+                    Press pr{0x8009, t};
+                    pr.sx = uint8_t(x); pr.sy = uint8_t(y); pr.cx = uint8_t(cx); pr.cy = uint8_t(cy);
+                    presses.push_back(pr);
+                }
+                for (size_t k = first; k < presses.size(); k++) {
+                    presses[k].dur = dur; presses[k].port = press_port; presses[k].game = game_clock;
+                }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        }
+    }
+    if (!g_ssne_has_game_code) { puts("no game code linked"); return 1; }
+    ssne::set_fatal_handler(throw_fatal);
+    if (gpu) {
+#ifdef __linux__
+        std::string err;
+        if (!egl_init(err) || !ssne::gpu_renderer_init(egl_getproc, gpu_scale, err)) { printf("GPU init failed: %s\n", err.c_str()); return 1; }
+        ssne::gx_use_gpu(true);
+        ssne::gpu_renderer_set_widescreen(wide);
+#else
+        puts("--gpu is only supported on Linux (EGL) in the headless runner"); return 1;
+#endif
+    }
+    ssne::set_widescreen(wide);
+    std::atomic<bool> done{false};
+    ssne::spawn_guest_thread([&] {
+        static PPCContext ctx;
+        std::string err;
+        uint32_t entry = ssne::boot(ctx, data, err);
+        if (!entry) { printf("load failed: %s\n", err.c_str()); done = true; return; }
+        printf("[headless] %zu functions, entry %08X\n", g_ssne_func_count, entry);
+        try {
+            ssne_call(ctx, entry);
+            puts("[headless] entry returned");
+        } catch (const std::exception& e) {
+            printf("[headless] stopped: %s\n", e.what());
+        }
+        done = true;
+    });
+    auto t0 = std::chrono::steady_clock::now();
+    // Optionally record the audio output (AI DMA) to a WAV file.
+    FILE* wav = nullptr;
+    uint32_t wav_frames = 0, wav_rate = 0;
+    std::vector<int16_t> abuf;
+    if (!wav_path.empty()) {
+        wav = fopen(wav_path.c_str(), "wb");
+        if (wav) { uint8_t hdr[44] = {}; fwrite(hdr, 1, 44, wav); ssne::audio_set_sink_active(true); }
+    }
+    auto drain_audio = [&] {
+        if (!wav) return;
+        uint32_t n = ssne::audio_buffered();
+        if (!n) return;
+        abuf.resize(n * 2);
+        ssne::audio_pull(abuf.data(), n);
+        if (!wav_rate) wav_rate = ssne::audio_rate();
+        fwrite(abuf.data(), 4, n, wav);
+        wav_frames += n;
+    };
+    // Optionally save the latest displayed frame periodically (PPM) for inspection.
+    auto next_dump = t0;
+    int dumped = 0;
+    uint64_t seq = 0;
+    std::vector<uint32_t> px;
+    while (!done && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(seconds)) {
+        if (gpu) {
+            // Act as the render thread: execute recorded frames as they arrive.
+            auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+            while (std::chrono::steady_clock::now() < until) {
+                if (!ssne::gpu_renderer_run(4)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        drain_audio();
+        if (g_control_start < 0 && ssne::player_control_active()) {
+            g_control_start = ssne::game_time();
+            printf("[headless] player control at game %.3fs\n", g_control_start);
+        }
+        {   // scripted controller input: each press is held for 200 ms
+            double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            ssne::PadState pss[4];
+            for (auto& p : presses) {
+                const double now = p.game ? (g_control_start < 0 ? -1e9 : ssne::game_time() - g_control_start) : el;
+                if (!(now >= p.at && now < p.at + p.dur)) continue;
+                ssne::PadState& ps = pss[p.port];
+                if (p.button == 0x8001) ps.stick_y = 230;
+                else if (p.button == 0x8002) ps.stick_y = 26;
+                else if (p.button == 0x8003) ps.stick_x = 26;
+                else if (p.button == 0x8004) ps.stick_x = 230;
+                else if (p.button == 0x8005) ps.cstick_x = 26;
+                else if (p.button == 0x8006) ps.cstick_x = 230;
+                else if (p.button == 0x8007) ps.cstick_y = 230;
+                else if (p.button == 0x8008) ps.cstick_y = 26;
+                else if (p.button == 0x8009) { ps.stick_x = p.sx; ps.stick_y = p.sy; ps.cstick_x = p.cx; ps.cstick_y = p.cy; }
+                else ps.buttons |= p.button;
+            }
+            for (auto& op : state_ops)
+                if (op.t >= 0 && el >= op.t) {
+                    printf("[headless] %s state %s at %.2fs\n", op.save ? "saving" : "loading", op.path.c_str(), el);
+                    ssne::savestate_request(op.save, op.path);
+                    op.t = -1;
+                }
+            { ssne::SavestateResult res; if (ssne::savestate_take_result(res)) printf("[headless] state result: %s (%s)\n", res.message.c_str(), res.ok ? "ok" : "failed"); }
+            if (pause_at >= 0) ssne::set_paused(el >= pause_at && el < pause_at + pause_len);
+            for (auto& w : weapons)
+                if (w.first >= 0 && el >= w.first) { printf("[headless] weapon key %d\n", w.second + 1); ssne::weapon_select_group(w.second); w.first = -1; }
+            for (Aim& a : aims)
+                if (a.t >= 0 && el >= a.t) {
+                    printf("[headless] mouse aim %+.3f %+.3f (active %d)\n", a.yaw, a.pitch, int(ssne::mouse_aim_active()));
+                    ssne::mouse_aim_add(a.yaw, a.pitch);
+                    a.t = -1;
+                }
+#ifdef SSNE_COUNT_CALLS
+            if (count_from >= 0 && el >= count_from) { memset(g_ssne_call_counts, 0, 4u << 19); count_from = -1; }
+            if (count_to >= 0 && el >= count_to) {
+                if (FILE* f = fopen(count_path.c_str(), "w")) {
+                    for (uint32_t k = 0; k < (1u << 19); k++)
+                        if (g_ssne_call_counts[k]) fprintf(f, "%08X %u\n", 0x80000000u + k * 4, g_ssne_call_counts[k]);
+                    fclose(f);
+                }
+                count_to = -1;
+            }
+#endif
+            {
+                static std::vector<int> last(watches.size(), -1);
+                for (size_t q = 0; q < watches.size(); q++) {
+                    if (watches[q] < 0x80000000u || watches[q] >= 0x81800000u) continue;
+                    const uint8_t* m = ssne::g_ram + (watches[q] - 0x80000000u);
+                    int v = m[0] << 8 | m[1];
+                    if (v != last[q]) {
+                        printf("[watch] %08X = %d at %.3fs (game %.3fs)\n", watches[q], v, el, ssne::game_time());
+                        last[q] = v;
+                    }
+                }
+            }
+            {
+                static std::vector<float> lastf(watches_f.size(), -12345.f);
+                for (size_t q = 0; q < watches_f.size(); q++) {
+                    if (watches_f[q] < 0x80000000u || watches_f[q] >= 0x81800000u) continue;
+                    const uint8_t* m = ssne::g_ram + (watches_f[q] - 0x80000000u);
+                    uint32_t u = uint32_t(m[0]) << 24 | uint32_t(m[1]) << 16 | uint32_t(m[2]) << 8 | m[3];
+                    float v;
+                    memcpy(&v, &u, 4);
+                    if (v != lastf[q]) {
+                        printf("[watchf] %08X = %.3f (%+.3f) at %.3fs\n", watches_f[q], v, lastf[q] == -12345.f ? 0.f : v - lastf[q], el);
+                        lastf[q] = v;
+                    }
+                }
+            }
+            for (auto& cc : cheat_changes)
+                if (cc.first >= 0 && el >= cc.first) { ssne::set_cheats(cc.second); printf("[headless] cheats at %.2fs\n", el); cc.first = -1; }
+            for (auto& fc : fps_changes)
+                if (fc.first >= 0 && el >= fc.first) { ssne::set_frame_limit(fc.second); printf("[headless] frame limit %d\n", fc.second); fc.first = -1; }
+            for (Poke& k : pokes)
+                if (k.t >= 0 && el >= k.t && k.addr >= 0x80000000u && k.addr < 0x81800000u) {
+                    uint8_t* m = ssne::g_ram + (k.addr - 0x80000000u);
+                    m[0] = uint8_t(k.value >> 8); m[1] = uint8_t(k.value);
+                    printf("[headless] poke %08X = %u at %.2fs\n", k.addr, k.value, el);
+                    k.t = -1;
+                }
+            for (double& t : ram_dumps)
+                if (t >= 0 && el >= t) {
+                    char fn[64];
+                    snprintf(fn, sizeof(fn), "/tmp/ram_%g.bin", t);
+                    if (FILE* f = fopen(fn, "wb")) { fwrite(ssne::g_ram, 1, 24u << 20, f); fclose(f); }
+                    printf("[headless] RAM snapshot %s at %.2fs\n", fn, el);
+                    t = -1;
+                }
+            for (int port = 0; port < 4; port++) {
+                ssne::PadState& ps = pss[port];
+                if (ps.buttons & ssne::PAD_R) ps.trigger_r = 255;
+                if (ps.buttons & ssne::PAD_L) ps.trigger_l = 255;
+                ssne::set_pad(port, ps);
+            }
+        }
+        {   // every 5 s: frames per second (display copies)
+            static auto last = t0;
+            static uint64_t last_copies = 0;
+            auto now = std::chrono::steady_clock::now();
+            if (now - last >= std::chrono::seconds(5)) {
+                uint64_t copies = ssne::gx_render_stats().display_copies;
+                double dt = std::chrono::duration<double>(now - last).count();
+                auto au = ssne::audio_stats();
+                if (gpu) { auto gs = ssne::gpu_renderer_stats(); printf("[gpu] frames %llu draws %llu tris %llu copies %llu uploads %llu reinterp %llu programs %llu (%.0f ms compiling) last frame %.1f ms\n", (unsigned long long)gs.frames, (unsigned long long)gs.draws, (unsigned long long)gs.triangles, (unsigned long long)gs.tex_copies, (unsigned long long)gs.uploads, (unsigned long long)gs.reinterpretations, (unsigned long long)gs.programs, gs.shader_ms, gs.frame_ms); }
+                printf("[perf] t=%.0fs  %.1f fps  | audio: %llu cmdlists, %u voices playing, %llu AI frames\n",
+                       std::chrono::duration<double>(now - t0).count(), double(copies - last_copies) / dt,
+                       (unsigned long long)au.cmdlists, au.active_voices, (unsigned long long)au.ai_frames);
+                fflush(stdout);
+                last = now;
+                last_copies = copies;
+            }
+        }
+        if (!dump_dir.empty() && std::chrono::steady_clock::now() >= next_dump) {
+            next_dump += std::chrono::milliseconds(dump_ms);
+            int w, h;
+            bool have = false;
+            if (gpu) { static uint64_t gseq = 0; auto o = ssne::gpu_renderer_output(); if (o.seq != gseq && ssne::gpu_renderer_read_output(px, w, h)) { gseq = o.seq; have = true; } }
+            else have = ssne::gx_get_frame(px, w, h, seq);
+            if (have) {
+                char name[512];
+                long ms = long(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+                snprintf(name, sizeof(name), "%s/t%06ld.ppm", dump_dir.c_str(), ms);
+                dumped++;
+                if (FILE* f = fopen(name, "wb")) {
+                    fprintf(f, "P6\n%d %d\n255\n", w, h);
+                    for (uint32_t c : px) { uint8_t rgb[3] = {uint8_t(c), uint8_t(c >> 8), uint8_t(c >> 16)}; fwrite(rgb, 1, 3, f); }
+                    fclose(f);
+                }
+            }
+        }
+    }
+    if (wav) {
+        drain_audio();
+        auto le32 = [](uint8_t* p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = uint8_t(v >> (8 * i)); };
+        uint8_t h[44] = {'R','I','F','F',0,0,0,0,'W','A','V','E','f','m','t',' ',16,0,0,0,1,0,2,0};
+        if (!wav_rate) wav_rate = 32000;
+        le32(h + 4, 36 + wav_frames * 4);
+        le32(h + 24, wav_rate);
+        le32(h + 28, wav_rate * 4);
+        h[32] = 4; h[34] = 16;
+        memcpy(h + 36, "data", 4);
+        le32(h + 40, wav_frames * 4);
+        fseek(wav, 0, SEEK_SET);
+        fwrite(h, 1, 44, wav);
+        fclose(wav);
+        printf("[headless] wrote %s (%u frames @ %u Hz)\n", wav_path.c_str(), wav_frames, wav_rate);
+    }
+    if (!done) {
+        auto st = ssne::scheduler_stats();
+        auto hw = ssne::hw_stats();
+        printf("[headless] still running after %ds: %d guest threads (%d ready), %llu interrupts, %llu retraces, "
+               "%llu ARAM DMAs, %llu disc reads (%llu KB)\n", seconds, st.threads, st.ready,
+               (unsigned long long)st.interrupts, (unsigned long long)st.retraces, (unsigned long long)hw.aram_dmas,
+               (unsigned long long)hw.disc_reads, (unsigned long long)(hw.disc_bytes / 1024));
+        auto gx = ssne::gx_stats();
+        printf("[headless] GX: %llu KB stream, %llu commands, %llu primitives (%llu vertices), %llu display lists, "
+               "%llu EFB copies, %llu draw-done, %llu tokens (last %u)%s\n",
+               (unsigned long long)(gx.bytes / 1024), (unsigned long long)gx.commands, (unsigned long long)gx.primitives,
+               (unsigned long long)gx.vertices, (unsigned long long)gx.display_lists, (unsigned long long)gx.efb_copies,
+               (unsigned long long)gx.draw_done, (unsigned long long)gx.tokens, gx.last_token,
+               gx.unknown_opcode ? " [stream desync seen]" : "");
+        auto rs = ssne::gx_render_stats();
+        printf("[headless] render: %llu triangles, %llu pixels, %llu display copies, %llu texture copies, "
+               "%llu textures decoded, %llu line/point prims skipped\n",
+               (unsigned long long)rs.triangles, (unsigned long long)rs.pixels, (unsigned long long)rs.display_copies,
+               (unsigned long long)rs.tex_copies, (unsigned long long)rs.textures_decoded, (unsigned long long)rs.lines_skipped);
+        fflush(stdout);
+        quit(3);
+    }
+    quit(0);
+    return 0;
+}

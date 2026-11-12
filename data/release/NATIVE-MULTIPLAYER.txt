@@ -1,0 +1,70 @@
+SSNE-Native – normaler Launcher mit integriertem Multiplayer (Build 202)
+
+Start: SSNE-Native.exe
+Die vorhandene Spielruntime benoetigt einen Installationspfad ohne Umlaute
+oder andere Nicht-ASCII-Zeichen; der bisherige SSNE-Native-Ordner passt.
+1. Eigenes unterstütztes PAL-Disc-Image (G3BP9G) auswählen oder ins Fenster ziehen.
+2. Install Game / Build Game erstellt das vollständige native Spiel inklusive
+   Multiplayer. Der Launcher führt Übersetzung und Multiplayer-Anpassungen
+   selbst aus. Eine zusätzliche Python-Installation ist dafür nicht nötig.
+   Der kostenlose Compiler wird bei Bedarf wie bisher einmal heruntergeladen.
+3. Play startet das Spiel. Dort im Original-Hauptmenü „Mehrspieler“ wählen,
+   um ein Spiel zu erstellen oder beizutreten. Einzelspieler bleibt verfügbar.
+   Für einen zweiten Spieler auf demselben PC SSNE-Native.exe erneut öffnen.
+
+Start-Multiplayer.cmd und Rebuild-Multiplayer.cmd werden nicht benötigt.
+Ein fehlender/überholter Spiel-Build wird auch über Play erstellt und danach
+automatisch gestartet. Rebuild Game erneuert ihn aus den eigenen Spieldaten.
+
+Maus-Menues: Ein echter Auswahlwechsel spielt denselben Originalsound wie
+die Tastatur. Bewegungen innerhalb desselben Felds wiederholen ihn nicht.
+Nach einem Update das Spiel neu starten.
+
+Fahrzeuge: Schießen bleibt auf der Feuertaste, Ein-/Aussteigen auf
+„Benutzen“ (standardmäßig E). Das gilt auch für den Host im Koop.
+
+Eigene Fadenkreuze im nativen PAL-Spiel:
+PNG-Dateien in crosshairs neben der Spiel-EXE kopieren; beim integrierten
+Multiplayer ist das Multiplayer/crosshairs. Unter F12 > Graphics (Grafik) >
+Fadenkreuz mit „Neu laden“ die Liste aktualisieren, die Textur auswählen und
+„Eigene PNG verwenden“ aktivieren. Vorschau, Größe und Deckkraft helfen bei der
+Anpassung. „Originalfarbe übernehmen“ ist standardmäßig an: Die PNG übernimmt die
+originale Gesundheits-/Zielfarbe. Ausschalten behält ihre eigenen Farben. Bei einer
+weißen PNG ist die Originalfarbe unverfälscht sichtbar. Die Auswahl bleibt lokal
+und wird in den Einstellungen gespeichert.
+„Original-Fadenkreuz verwenden“ oder das Ausschalten stellt das Original wieder her.
+
+Je Bild sind höchstens 1024 Pixel pro Richtung und 4 MiB erlaubt. Ein transparenter
+Hintergrund mit mindestens einem sichtbaren Pixel eignet sich als Fadenkreuz.
+Der sichtbare Alpha-Bereich wird zentriert; die ursprüngliche PNG bleibt unverändert.
+Fehlende, defekte und vollständig transparente Dateien lassen das Original aktiv.
+„Neu laden“ übernimmt auch Änderungen an einer Datei mit unverändertem Namen.
+
+Größe 32 entspricht der originalen Fadenkreuzgröße mit der Skalierung der aktuellen
+Waffe und Spieleransicht. 14 bedeutet 14/32 dieser Größe, keine festen Bildschirmpixel.
+Für kleine Punkt-Texturen ist Größe 14 mit 100 % Deckkraft ein möglicher
+Startwert.
+
+Vorhandene Installation:
+Das native Spiel liegt weiterhin unter Multiplayer, damit die bisherigen
+Einstellungen und Host-Spielstände erhalten bleiben. Spieldaten werden aus
+game_data verwendet. Die alte Einzelspieler-Datei im Hauptordner bleibt
+unverändert. Beide Spieler müssen denselben Multiplayer-Runtime-Build verwenden.
+
+Weitergeben:
+Dieses Launcher-Paket enthält keine Disc-Daten und kein aus der Disc erstelltes
+Spiel. Jeder Spieler benötigt sein eigenes Disc-Image und erstellt das Spiel
+über den Launcher selbst. game_data, persönliche Spielstände und die erzeugten
+Spiel-EXE-Dateien gehören nicht in ein weitergegebenes Paket.
+
+Runtime: Build 202, Protokoll 63. Launcher-Paket: Version 1.2.7.202.
+Die Integration ändert die Start-/Erstellen-Abläufe; sie ist keine erneute
+Abnahme der gesamten Koop-Kampagne.
+
+Mehrspieler > Sitzungsoptionen:
+- Name vor dem Erstellen/Beitreten setzen (bis 24 Zeichen).
+- Gegnerzahl x1 bis x5; Bosse und Story-Figuren bleiben einzeln.
+- Munitionslimit x1 bis x5 oder Unendlich (maximal 32.767 pro Typ).
+- Munition pro Pickup x1 bis x5; Verbrauch bleibt normal.
+Der Host legt die Regeln fest. Clients sehen diese Werte schreibgeschuetzt.
+Neue Faktoren wirken auf kuenftige Spawns/Pickups. Eigene Optionen bleiben gespeichert.

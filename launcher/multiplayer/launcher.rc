@@ -1,0 +1,24 @@
+#include <windows.h>
+// Disc-derived artwork is not included in the source distribution.
+1 RT_MANIFEST "launcher.manifest"
+1 VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904B0"
+  BEGIN
+   VALUE "FileDescription", "SSNE-RECOOP Multiplayer Launcher\0"
+   VALUE "ProductName", "SSNE-RECOOP Multiplayer\0"
+   VALUE "FileVersion", "1.0.0\0"
+   VALUE "OriginalFilename", "SSNE-RECOOP-Multiplayer.exe\0"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x409, 1200
+ END
+END
