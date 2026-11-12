@@ -15,7 +15,7 @@ game locally from your own supported GameCube disc image.
    downloaded automatically from its official, checksum-pinned release. No Python
    installation or separate multiplayer CMD is required for players.
 5. In the original game menu choose **Mehrspieler / Multiplayer** to host or join.
-   Both players need the same runtime build. The current package uses **build 202,
+   Both players need the same runtime build. The current package uses **build 203,
    protocol 63**.
 
 The release contains the launcher, tools, native runtime/build kit, patch recipe,
@@ -24,7 +24,11 @@ translations, built game executables and personal saves are created locally.
 
 This is an experimental multiplayer build. Component tests and focused host/client
 checks do not certify every campaign level or every network condition. See
-[release notes](docs/RELEASE-NOTES-202.md) for the tested scope and limitations.
+[release notes](docs/RELEASE-NOTES-203.md) for the tested scope and limitations.
+
+Use **F12 > Game and menu language** to choose English, German or French.
+F12 changes immediately; the original PAL game menus apply the choice after
+restarting. Automatic follows the original game setting.
 
 Launcher updates use this repository's releases. Developer build instructions are
 in [docs/BUILDING.md](docs/BUILDING.md), credits in [docs/CREDITS.md](docs/CREDITS.md).

@@ -38,7 +38,6 @@ struct State {
     std::shared_ptr<const ssne::CustomCrosshairImage> published_image;
 } state;
 std::string utf8(const fs::path& path){const auto text=path.u8string();return {text.begin(),text.end()};}
-const char* localized(const char* en,const char* de,const char* fr){const auto language=native_crosshair_language();return language==1?de:language==2?fr:en;}
 void publish(bool enabled,int size,int opacity,bool native_color) {
     size=std::clamp(size,8,256);opacity=std::clamp(opacity,1,100);
     if(state.published&&state.published_enabled==enabled&&state.published_size==size&&state.published_native_color==native_color&&
@@ -133,10 +132,7 @@ std::string current_error() {
     if(!state.image_error.empty())return state.image_error;
     if(!state.preview_error.empty())return state.preview_error;
     if(!state.catalog_error.empty())return state.catalog_error;
-    if(state.requested_enabled&&state.image&&!native_crosshair_supported())return localized(
-        "The original HUD is not ready; the original crosshair remains active.",
-        "Das Original-HUD ist noch nicht bereit; das Original-Fadenkreuz bleibt aktiv.",
-        "L'affichage d'origine n'est pas encore pret ; le viseur d'origine reste actif.");
+    if(state.requested_enabled&&state.image&&!native_crosshair_supported())return "The original HUD is not ready; the original crosshair remains active.";
     return {};
 }
 void write_render_state() {

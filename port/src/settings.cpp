@@ -367,6 +367,12 @@ bool load_settings(Settings& s, const std::string& path) {
     get("pause_unfocused", s.pause_unfocused);
     get("skip_intros", s.skip_intros);
     get("state_slot", s.state_slot);
+    if(s.game_language < -1 || s.game_language > 2)s.game_language=-1;
+    if(const auto field=kv.find("game_language");field!=kv.end()) {
+        const auto& text=field->second;int parsed=-1;
+        const auto result=std::from_chars(text.data(),text.data()+text.size(),parsed);
+        s.game_language=result.ec==std::errc{} && result.ptr==text.data()+text.size() && parsed>=-1 && parsed<=2?parsed:-1;
+    }
     get("pad_prompts", s.prompts);
     get("kbm_player", s.kbm_player);
     for (int i = 0; i < Settings::kPadSlots; i++) get(("pad" + std::to_string(i + 1) + "_player").c_str(), s.pad_player[i]);
@@ -571,6 +577,7 @@ bool save_settings(const Settings& s, const std::string& path) {
     o << "cheat_jump = " << s.cheat_jump << "    # jump height in percent, 100-500\n";
     o << "cheat_damage = " << s.cheat_damage << "    # weapon damage in percent, 100-1000\n";
     o << "[general]\n";
+    o << "game_language = " << (s.game_language>=-1 && s.game_language<=2?s.game_language:-1) << "    # next start: -1 saved game choice, 0 English, 1 German, 2 French\n";
     o << "pause_in_menu = " << (s.pause_in_menu ? 1 : 0) << "\n";
     o << "pause_unfocused = " << (s.pause_unfocused ? 1 : 0) << "    # pause while the window is in the background\n";
     o << "skip_intros = " << (s.skip_intros ? 1 : 0) << "    # start at the main menu\n";

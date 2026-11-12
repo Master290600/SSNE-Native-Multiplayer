@@ -30,6 +30,9 @@ struct NativeFrontendServices {
     std::function<unsigned(int,unsigned)> bot; // action: count=0, add=1, remove=-1
     std::function<void(PPCContext&)> initialized;
 };
+// Set once after loading host settings and before starting the guest thread.
+// Later F12 changes are saved for the next launch; this override stays fixed.
+void configure_native_startup_language(int);
 void configure_native_frontend(NativeFrontendServices);
 // Guest frame thread only, just like session start and the native widgets.
 MultiplayerOptions native_frontend_options();

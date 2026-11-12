@@ -43,6 +43,7 @@
 #include "settings.h"
 #include "controller_input.h"
 #include "settings_menu.h"
+#include "settings_menu_i18n.h"
 #include "mod_menu.h"
 #include "png_write.h"
 #include "game_view_geometry.h"
@@ -1459,11 +1460,11 @@ void draw_bot_controls() {
     std::lock_guard session_lock(g_session_mutex);
     if(g_coop_host && g_coop_server){
         const auto people=g_coop_server->participants();
-        ImGui::Separator();ImGui::TextUnformatted("AI bots");static int skill=1;const char* skills[]={"Easy","Normal","Hard"};ImGui::Combo("Bot difficulty",&skill,skills,3);
-        if(ImGui::Button("Add bot") && !g_coop_server->add_bot(unsigned(skill+1)))toast("No free player slot in the selected mode");
+        ImGui::Separator();port::menu_ui::TextUnformatted("AI bots");static int skill=1;const char* skills[]={"Easy","Normal","Hard"};port::menu_ui::Combo("Bot difficulty",&skill,skills,3);
+        if(port::menu_ui::Button("Add bot") && !g_coop_server->add_bot(unsigned(skill+1)))toast(port::menu_ui::text("No free player slot in the selected mode"));
         const auto mask=g_coop_server->bot_mask();
-        for(unsigned slot=1;slot<people.size();++slot)if(mask&(1u<<slot)){ImGui::PushID(int(slot));ImGui::Text("%s (%s)",people[slot].name.c_str(),skills[std::clamp(int(g_coop_server->bot_skill(slot))-1,0,2)]);ImGui::SameLine();if(ImGui::SmallButton("Remove"))g_coop_server->remove_bot(people[slot].id);ImGui::PopID();}
-        ImGui::TextUnformatted("Bots occupy free player slots. Humans have priority.");
+        for(unsigned slot=1;slot<people.size();++slot)if(mask&(1u<<slot)){ImGui::PushID(int(slot));port::menu_ui::Text("%s (%s)",people[slot].name.c_str(),port::menu_ui::text(skills[std::clamp(int(g_coop_server->bot_skill(slot))-1,0,2)]));ImGui::SameLine();if(port::menu_ui::SmallButton("Remove"))g_coop_server->remove_bot(people[slot].id);ImGui::PopID();}
+        port::menu_ui::TextUnformatted("Bots occupy free player slots. Humans have priority.");
     }
 }
 
@@ -1743,6 +1744,8 @@ int main(int argc, char** argv) {
 
     bool have_file = port::load_settings(g_set, g_settings_path);
     if(!have_file && !network_game())have_file=port::load_settings(g_set,base_dir+"settings-netplay.ini");
+    // Freeze the native language request before the guest thread starts.
+    port::coop::configure_native_startup_language(g_set.game_language);
     // Command-line options override settings.ini for this run (and are saved if the menu changes anything).
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -2182,6 +2185,7 @@ int main(int argc, char** argv) {
         flush_crosshair_test_imgui();
         ImGui::NewFrame();
         draw_game_view();
+        port::menu_ui::set_language(g_set.game_language>=0?unsigned(g_set.game_language):port::native_crosshair_language());
         draw_overlay(data_dir, dt);
         {
             port::MenuInfo mi;

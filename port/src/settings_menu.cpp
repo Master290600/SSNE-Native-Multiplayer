@@ -1,4 +1,5 @@
 #include "settings_menu.h"
+#include "settings_menu_i18n.h"
 #include "mod_menu.h"
 
 #include "ssne/runtime.h"
@@ -55,7 +56,7 @@ void write_crosshair_ui_trace(const Settings& settings) {
     std::ostringstream out;auto rect=[&](ImVec2 a,ImVec2 b){out<<'['<<a.x<<','<<a.y<<','<<b.x<<','<<b.y<<']';};
     out<<"{\"menu_open\":"<<(g_open?"true":"false")<<",\"frame\":"<<ImGui::GetFrameCount()<<",\"window\":";rect(g_crosshair_ui_window_a,g_crosshair_ui_window_b);
     out<<",\"clip\":";rect(g_crosshair_ui_clip_a,g_crosshair_ui_clip_b);
-    out<<",\"enabled\":"<<(settings.crosshair_enabled?"true":"false")<<",\"file\":"<<trace_json_string(settings.crosshair_file)<<",\"size\":"<<settings.crosshair_size<<",\"opacity\":"<<settings.crosshair_opacity<<",\"native_color\":"<<(settings.crosshair_native_color?"true":"false")<<",\"widgets\":[";
+    out<<",\"language\":"<<menu_ui::current_language<<",\"language_preference\":"<<settings.game_language<<",\"enabled\":"<<(settings.crosshair_enabled?"true":"false")<<",\"file\":"<<trace_json_string(settings.crosshair_file)<<",\"size\":"<<settings.crosshair_size<<",\"opacity\":"<<settings.crosshair_opacity<<",\"native_color\":"<<(settings.crosshair_native_color?"true":"false")<<",\"widgets\":[";
     bool comma=false;for(const auto& w:g_crosshair_ui_widgets){if(comma)out<<',';comma=true;out<<"{\"id\":"<<trace_json_string(w.id)<<",\"rect\":";rect(w.a,w.b);out<<",\"clip\":";rect(w.clip_a,w.clip_b);out<<",\"visible\":"<<(w.visible?"true":"false")<<",\"enabled\":"<<(w.enabled?"true":"false")<<'}';}out<<"]}";
     std::ofstream file("crosshair-ui-state.json.pending",std::ios::binary|std::ios::trunc);file<<out.str();file.close();
     if(file){std::remove("crosshair-ui-state.json");std::rename("crosshair-ui-state.json.pending","crosshair-ui-state.json");}
@@ -78,13 +79,13 @@ void assign(Settings& s, const Bind& b) {
 
 void help(const char* text) {
     ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+    menu_ui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) menu_ui::SetTooltip("%s", menu_ui::text(text));
 }
 
 bool slider_pct(const char* label, float& v, float lo, float hi) {
     int pct = int(v * 100.f + 0.5f);
-    bool ch = ImGui::SliderInt(label, &pct, int(lo * 100), int(hi * 100), "%d%%");
+    bool ch = menu_ui::SliderInt(label, &pct, int(lo * 100), int(hi * 100), "%d%%");
     if (ch) v = float(pct) / 100.f;
     return ch;
 }
@@ -94,7 +95,7 @@ bool bind_button(const Bind& b, bool pad, int action, int slot) {
     std::string label = waiting ? std::string(pad ? "press a pad button..." : "press a key, mouse button or wheel...") : bind_name(b);
     label += "##" + std::to_string(pad) + "_" + std::to_string(action) + "_" + std::to_string(slot);
     if (waiting) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.35f, 0.05f, 1));
-    bool clicked = ImGui::Button(label.c_str(), ImVec2(-1, 0));
+    bool clicked = menu_ui::Button(label.c_str(), ImVec2(-1, 0));
     if (waiting) ImGui::PopStyleColor();
     if (clicked) g_cap = {true, pad, action, slot};
     // Right click clears the binding.
@@ -102,67 +103,67 @@ bool bind_button(const Bind& b, bool pad, int action, int slot) {
 }
 
 bool crosshair_controls(Settings& s,const MenuInfo& info) {
-    const auto text=[&](const char* en,const char* de,const char* fr){return info.crosshair_language==1?de:info.crosshair_language==2?fr:en;};
+    // The entire F12 menu follows the selected display language.
     bool changed=false;
     if(trace_crosshair_ui()){const auto list=ImGui::GetWindowDrawList();g_crosshair_ui_clip_a=list->GetClipRectMin();g_crosshair_ui_clip_b=list->GetClipRectMax();}
-    ImGui::SeparatorText(text("Crosshair","Fadenkreuz","Viseur"));
-    changed|=ImGui::Checkbox(text("Use custom PNG###crosshair_enabled","Eigene PNG verwenden###crosshair_enabled","Utiliser un PNG personnel###crosshair_enabled"),&s.crosshair_enabled);trace_crosshair_widget("enabled");
-    const char* current=s.crosshair_file.empty()?text("Choose a PNG","PNG wählen","Choisir un PNG"):s.crosshair_file.c_str();
+    menu_ui::SeparatorText("Crosshair");
+    changed|=menu_ui::Checkbox("Use custom PNG###crosshair_enabled",&s.crosshair_enabled);trace_crosshair_widget("enabled");
+    const char* current=s.crosshair_file.empty()?"Choose a PNG":s.crosshair_file.c_str();
     ImGui::SetNextItemWidth(280);
-    if(ImGui::BeginCombo(text("Texture###crosshair_file","Textur###crosshair_file","Texture###crosshair_file"),current)) {
+    if(menu_ui::BeginCombo("Texture###crosshair_file",current)) {
         size_t file_index=0;
         for(const auto& file:info.crosshair_files) {
             const bool selected=s.crosshair_file==file;
             ImGui::PushID(file.c_str());const auto label_pos=ImGui::GetCursorScreenPos();
-            const bool picked=ImGui::Selectable("##crosshair_entry",selected,ImGuiSelectableFlags_None,ImVec2(0,ImGui::GetTextLineHeight()));
+            const bool picked=menu_ui::Selectable("##crosshair_entry",selected,ImGuiSelectableFlags_None,ImVec2(0,ImGui::GetTextLineHeight()));
             trace_crosshair_widget("file_"+std::to_string(file_index++));
             // Filenames are literal text: embedded ##/### never change their label or ID.
             ImGui::GetWindowDrawList()->AddText(label_pos,ImGui::GetColorU32(ImGuiCol_Text),file.c_str());
             if(picked) {s.crosshair_file=file;s.crosshair_enabled=true;changed=true;}
             if(selected)ImGui::SetItemDefaultFocus();ImGui::PopID();
         }
-        if(info.crosshair_files.empty())ImGui::TextDisabled("%s",text("No PNG files found","Keine PNG-Dateien gefunden","Aucun fichier PNG"));
+        if(info.crosshair_files.empty())menu_ui::TextDisabled("%s",menu_ui::text("No PNG files found"));
         ImGui::EndCombo();
     }
     trace_crosshair_widget("file");
     ImGui::SameLine();
-    if(ImGui::Button(text("Refresh###crosshair_reload","Neu laden###crosshair_reload","Actualiser###crosshair_reload")))g_crosshair_reload=true;trace_crosshair_widget("reload");
+    if(menu_ui::Button("Refresh###crosshair_reload"))g_crosshair_reload=true;trace_crosshair_widget("reload");
     if(!info.crosshair_directory.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text,kDim);
-        ImGui::TextWrapped("%s %s",text("PNG folder:","PNG-Ordner:","Dossier PNG :"),info.crosshair_directory.c_str());
+        menu_ui::TextWrapped("%s %s",menu_ui::text("PNG folder:"),info.crosshair_directory.c_str());
         ImGui::PopStyleColor();
     }
     ImGui::PushStyleColor(ImGuiCol_Text,kDim);
-    ImGui::TextWrapped("%s",text("Copy transparent PNGs into this folder, then refresh. Changes are local to this player.","Transparente PNGs in diesen Ordner kopieren und neu laden. Die Auswahl gilt nur für diesen Spieler.","Copiez des PNG transparents dans ce dossier, puis actualisez. Ce choix est propre à ce joueur."));
+    menu_ui::TextWrapped("%s",menu_ui::text("Copy transparent PNGs into this folder, then refresh. Changes are local to this player."));
     ImGui::PopStyleColor();
     ImGui::BeginDisabled(!s.crosshair_enabled);
     ImGui::SetNextItemWidth(280);
-    changed|=ImGui::SliderInt(text("Size###crosshair_size","Größe###crosshair_size","Taille###crosshair_size"),&s.crosshair_size,8,256,"%d");trace_crosshair_widget("size",s.crosshair_enabled);
-    help(text("32 keeps the original size; scales with the current weapon/player view.","32 entspricht der Originalgröße; skaliert mit Waffe und Spieleransicht.","32 garde la taille d'origine ; suit l'arme et la vue du joueur."));
+    changed|=menu_ui::SliderInt("Size###crosshair_size",&s.crosshair_size,8,256,"%d");trace_crosshair_widget("size",s.crosshair_enabled);
+    help("32 keeps the original size; scales with the current weapon/player view.");
     ImGui::SetNextItemWidth(280);
-    changed|=ImGui::SliderInt(text("Opacity###crosshair_opacity","Deckkraft###crosshair_opacity","Opacité###crosshair_opacity"),&s.crosshair_opacity,1,100,"%d%%");trace_crosshair_widget("opacity",s.crosshair_enabled);
-    changed|=ImGui::Checkbox(text("Use original color###crosshair_native_color","Originalfarbe übernehmen###crosshair_native_color","Utiliser la couleur d'origine###crosshair_native_color"),&s.crosshair_native_color);trace_crosshair_widget("native",s.crosshair_enabled);
-    help(text("Apply the original health/target color to the PNG. Disable to keep the PNG colors.","Übernimmt die originale Gesundheits-/Zielfarbe für die PNG. Ausschalten behält die PNG-Farben.","Applique la couleur d'origine de santé/cible au PNG. Désactivez pour garder les couleurs du PNG."));
+    changed|=menu_ui::SliderInt("Opacity###crosshair_opacity",&s.crosshair_opacity,1,100,"%d%%");trace_crosshair_widget("opacity",s.crosshair_enabled);
+    changed|=menu_ui::Checkbox("Use original color###crosshair_native_color",&s.crosshair_native_color);trace_crosshair_widget("native",s.crosshair_enabled);
+    help("Apply the original health/target color to the PNG. Disable to keep the PNG colors.");
     ImGui::EndDisabled();
     if(info.crosshair_preview_tex&&info.crosshair_preview_w>0&&info.crosshair_preview_h>0) {
-        ImGui::TextColored(kDim,"%s",text("Preview","Vorschau","Aperçu"));
+        menu_ui::TextColored(kDim,"%s",menu_ui::text("Preview"));
         const float max_size=80.f,scale=max_size/std::max(info.crosshair_preview_w,info.crosshair_preview_h);
         const ImVec2 size(info.crosshair_preview_w*scale,info.crosshair_preview_h*scale);
         ImGui::Image((ImTextureID)(intptr_t)info.crosshair_preview_tex,size,ImVec2(info.crosshair_preview_u0,info.crosshair_preview_v0),ImVec2(info.crosshair_preview_u1,info.crosshair_preview_v1),ImVec4(1,1,1,s.crosshair_opacity/100.f),ImVec4(.3f,.3f,.3f,1));
     }
-    if(s.crosshair_enabled&&s.crosshair_file.empty())ImGui::TextColored(kWarn,"%s",text("Choose a PNG; the original is used until then.","PNG auswählen; bis dahin bleibt das Original aktiv.","Choisissez un PNG ; le viseur d'origine reste actif."));
+    if(s.crosshair_enabled&&s.crosshair_file.empty())menu_ui::TextColored(kWarn,"%s",menu_ui::text("Choose a PNG; the original is used until then."));
     if(s.crosshair_enabled&&!info.crosshair_error.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text,kWarn);
-        ImGui::TextWrapped("%s %s",text("The original crosshair remains active:","Das Original-Fadenkreuz bleibt aktiv:","Le viseur d'origine reste actif :"),info.crosshair_error.c_str());
+        menu_ui::TextWrapped("%s %s",menu_ui::text("The original crosshair remains active:"),menu_ui::message(info.crosshair_error).c_str());
         ImGui::PopStyleColor();
     }
-    if(ImGui::Button(text("Use original crosshair###crosshair_original","Original-Fadenkreuz verwenden###crosshair_original","Utiliser le viseur d'origine###crosshair_original"))) {s.crosshair_enabled=false;s.crosshair_native_color=true;changed=true;}trace_crosshair_widget("original");
+    if(menu_ui::Button("Use original crosshair###crosshair_original")) {s.crosshair_enabled=false;s.crosshair_native_color=true;changed=true;}trace_crosshair_widget("original");
     return changed;
 }
 
 bool tab_graphics(Settings& s, const MenuInfo& info) {
     bool ch = false;
-    ImGui::SeparatorText("Presets");
+    menu_ui::SeparatorText("Presets");
     {
         static const char* kNames[] = {"Low", "Medium", "High", "Ultra"};
         static const char* kHelp[] = {
@@ -173,83 +174,83 @@ bool tab_graphics(Settings& s, const MenuInfo& info) {
         ImGui::BeginDisabled(!info.gpu_active);
         for (int i = 0; i < 4; i++) {
             if (i) ImGui::SameLine();
-            if (ImGui::Button(kNames[i], ImVec2(90, 0))) { s.graphics_preset(i); ch = true; }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kHelp[i]);
+            if (menu_ui::Button(kNames[i], ImVec2(90, 0))) { s.graphics_preset(i); ch = true; }
+            if (ImGui::IsItemHovered()) menu_ui::SetTooltip("%s", menu_ui::text(kHelp[i]));
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::TextColored(kDim, "  (resolution, anti-aliasing, filtering)");
+        menu_ui::TextColored(kDim, "  (resolution, anti-aliasing, filtering)");
     }
-    ImGui::SeparatorText("Display");
-    ch |= ImGui::Checkbox("Fullscreen  (F11 / Alt+Enter)", &s.fullscreen);
+    menu_ui::SeparatorText("Display");
+    ch |= menu_ui::Checkbox("Fullscreen  (F11 / Alt+Enter)", &s.fullscreen);
     if (info.displays.size() > 1) {
         std::string cur = s.display < 0 || s.display >= int(info.displays.size()) ? "Where the window is"
                         : std::to_string(s.display + 1) + ": " + info.displays[size_t(s.display)];
         ImGui::SetNextItemWidth(300);
-        if (ImGui::BeginCombo("Monitor", cur.c_str())) {
-            if (ImGui::Selectable("Where the window is", s.display < 0)) { s.display = -1; ch = true; }
+        if (menu_ui::BeginCombo("Monitor", cur.c_str())) {
+            if (menu_ui::Selectable("Where the window is", s.display < 0)) { s.display = -1; ch = true; }
             for (size_t i = 0; i < info.displays.size(); i++) {
                 std::string name = std::to_string(i + 1) + ": " + info.displays[i];
-                if (ImGui::Selectable(name.c_str(), s.display == int(i))) { s.display = int(i); ch = true; }
+                if (menu_ui::Selectable(name.c_str(), s.display == int(i))) { s.display = int(i); ch = true; }
             }
             ImGui::EndCombo();
         }
         help("The screen used for fullscreen (and where the window opens).");
     }
-    ch |= ImGui::Checkbox("Vertical sync", &s.vsync);
+    ch |= menu_ui::Checkbox("Vertical sync", &s.vsync);
     help("Syncs to your monitor's refresh rate: no tearing. Turn it off only with a frame rate limit set.");
     {
         ImGui::SetNextItemWidth(300);
-        ch |= ImGui::Combo("Info bar at the top  (Shift+F1)", &s.top_bar, "Hidden\0Frame rate only\0Full (frame rate, key hints)\0");
+        ch |= menu_ui::Combo("Info bar at the top  (Shift+F1)", &s.top_bar, "Hidden\0Frame rate only\0Full (frame rate, key hints)\0");
         help("The small bar in the top-left corner. Shift+F1 cycles through the three.");
     }
-    ch |= ImGui::Checkbox("Show shader preparation", &s.shader_notice);
+    ch |= menu_ui::Checkbox("Show shader preparation", &s.shader_notice);
     help("When shaders have to be compiled (the first start, or after a graphics driver update), a small box in the\n"
          "bottom-right corner shows the progress. The frame rate can dip until it's done.");
 
-    ImGui::SeparatorText("Frame rate");
+    menu_ui::SeparatorText("Frame rate");
     static const int kFps[] = {60, 120, 144, 165, 240, 0};
     static const char* kFpsNames[] = {"60 (original)", "120", "144", "165", "240", "Unlimited (vsync)"};
     int cur = 0;
     for (int i = 0; i < 6; i++) if (kFps[i] == s.fps_limit) cur = i;
     ImGui::SetNextItemWidth(260);
-    if (ImGui::Combo("Frame rate limit  (F10)", &cur, kFpsNames, 6)) { s.fps_limit = kFps[cur]; ch = true; }
+    if (menu_ui::Combo("Frame rate limit  (F10)", &cur, kFpsNames, 6)) { s.fps_limit = kFps[cur]; ch = true; }
     help("The game times gameplay by real elapsed time, so it plays at the same speed at any frame rate.\n"
          "Menus, the pause screen, cutscenes and vehicles always run at 60 (their animations and the jeep's\n"
          "physics depend on the original frame rate).\n"
          "Unlimited is still capped by your monitor when vertical sync is on.");
     ImGui::BeginDisabled(info.network);
-    ch |= ImGui::Checkbox("Sync game to display", &s.sync_display);
+    ch |= menu_ui::Checkbox("Sync game to display", &s.sync_display);
     help("With vertical sync on, the 60 fps limit and a 60 Hz display, the game advances exactly once per display "
          "refresh instead of on its own 59.94 Hz clock, which otherwise drifts against the display and shows a "
          "frame twice every few seconds (a small stutter).");
     if (s.sync_display) {
         ImGui::SameLine();
-        ImGui::TextColored(kDim, info.display_synced ? "(active)" : "(inactive: needs vsync, 60 fps and a ~60 Hz display)");
+        menu_ui::TextColored(kDim, info.display_synced ? "(active)" : "(inactive: needs vsync, 60 fps and a ~60 Hz display)");
     }
     ImGui::EndDisabled();
-    if(info.network) ImGui::TextColored(kDim,"The cooperative host paces the game; each PC renders locally.");
+    if(info.network) menu_ui::TextColored(kDim,"The cooperative host paces the game; each PC renders locally.");
 
-    ImGui::SeparatorText("Image");
+    menu_ui::SeparatorText("Image");
     static const char* kAspect[] = {"4:3 (original)", "16:9", "21:9", "Automatic (window shape)"};
     ImGui::SetNextItemWidth(260);
-    ch |= ImGui::Combo("Aspect ratio  (F8)", &s.aspect, kAspect, 4);
+    ch |= menu_ui::Combo("Aspect ratio  (F8)", &s.aspect, kAspect, 4);
     help("Widescreen widens the view during gameplay; menus (also pause, NETRICSA and briefings) and cutscenes stay 4:3.\n"
          "Automatic matches the window or screen (16:10, 3440x1440 and other shapes, up to 32:9).");
     if (s.aspect > 0) {
-        ch |= ImGui::Checkbox("HUD at the screen edges", &s.hud_edges);
+        ch |= menu_ui::Checkbox("HUD at the screen edges", &s.hud_edges);
         help("Widescreen gameplay: health, ammo and the weapon bar sit at the edges of the screen, like in a widescreen\n"
              "game. Off: the HUD keeps the GameCube's 4:3 layout in the middle of the screen.");
     }
-    ch |= ImGui::Checkbox("Fill the sides of 4:3 screens", &s.side_fill);
+    ch |= menu_ui::Checkbox("Fill the sides of 4:3 screens", &s.side_fill);
     help("Menus and cutscenes are 4:3: on a wider window, show a blurred, darkened copy of the picture at the sides\n"
          "instead of black bars (GPU renderer).");
     {
         float hfov = 2.f * std::atan(std::tan(0.5f * float(s.fov) * 0.017453292f) * 1.4286f * ssne::widescreen()) / 0.017453292f;
         char ffmt[64];
-        snprintf(ffmt, sizeof(ffmt), s.fov == 63 ? "%%d deg (original)  - %.0f horizontal" : "%%d deg  - %.0f horizontal", hfov);
+        snprintf(ffmt, sizeof(ffmt), menu_ui::text(s.fov == 63 ? "%%d deg (original)  - %.0f horizontal" : "%%d deg  - %.0f horizontal"), hfov);
         ImGui::SetNextItemWidth(260);
-        ch |= ImGui::SliderInt("Field of view", &s.fov, 45, 110, ffmt);
+        ch |= menu_ui::SliderInt("Field of view", &s.fov, 45, 110, ffmt);
         help("Vertical field of view in gameplay (the game uses 63). The horizontal value depends on the aspect ratio.\n"
              "Your weapon, menus and cutscene framing are not affected. Right-click to reset.");
         if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) { s.fov = 63; ch = true; }
@@ -262,7 +263,7 @@ bool tab_graphics(Settings& s, const MenuInfo& info) {
         int aa = 0;
         for (int i = 0; i < 6; i++) if (s.antialiasing == kAaIds[i]) aa = i;
         ImGui::SetNextItemWidth(260);
-        if (ImGui::Combo("Anti-aliasing", &aa, kAaNames, 6)) { s.antialiasing = kAaIds[aa]; ch = true; }
+        if (menu_ui::Combo("Anti-aliasing", &aa, kAaNames, 6)) { s.antialiasing = kAaIds[aa]; ch = true; }
         help("Smooths jagged edges.\n"
              "FXAA: a quick filter over the finished image; almost free, slightly softer.\n"
              "MSAA: smooths the edges of 3D geometry while it is drawn; sharp, costs more GPU time the higher it goes.\n"
@@ -271,21 +272,21 @@ bool tab_graphics(Settings& s, const MenuInfo& info) {
         if (aa >= 2 && aa <= 4 && info.gpu_active) {
             int want = 1 << (aa - 1);
             if (info.msaa_active < want)
-                ImGui::TextColored(kWarn, "Your GPU allows MSAA %dx at most here.", info.msaa_active);
+                menu_ui::TextColored(kWarn, "Your GPU allows MSAA %dx at most here.", info.msaa_active);
         }
-        if (aa == 5 && s.scale > 0) ImGui::TextColored(kWarn, "Supersampling needs Automatic or Native resolution (below).");
+        if (aa == 5 && s.scale > 0) menu_ui::TextColored(kWarn, "Supersampling needs Automatic or Native resolution (below).");
     }
     {
         static const char* kAfNames[] = {"Off (original)", "2x", "4x", "8x", "16x"};
         int af = 0;
         while (af < 4 && (2 << af) <= s.anisotropy) af++;
         ImGui::SetNextItemWidth(260);
-        if (ImGui::Combo("Anisotropic filtering", &af, kAfNames, 5)) { s.anisotropy = 1 << af; ch = true; }
+        if (menu_ui::Combo("Anisotropic filtering", &af, kAfNames, 5)) { s.anisotropy = 1 << af; ch = true; }
         help("Keeps floor, wall and road textures sharp when seen at a steep angle or far away, instead of\n"
              "blurring them. Only 3D surface textures are affected; menus and text stay as they were.\n"
              "Costs very little on most GPUs; 16x is the sharpest.");
         if (af > 0 && info.gpu_active && info.aniso_active < s.anisotropy)
-            ImGui::TextColored(kWarn, "Your GPU allows %dx at most.", info.aniso_active);
+            menu_ui::TextColored(kWarn, "Your GPU allows %dx at most.", info.aniso_active);
     }
     {
         static const char* kRes[] = {"Automatic", "Native (screen / window resolution)", "1x  (640x448)", "2x  (1280x896)",
@@ -293,7 +294,7 @@ bool tab_graphics(Settings& s, const MenuInfo& info) {
                                       "7x  (4480x3136)", "8x  (5120x3584)"};
         int sel = s.scale == 0 ? 0 : s.scale < 0 ? 1 : s.scale + 1;
         ImGui::SetNextItemWidth(320);
-        if (ImGui::Combo("Internal resolution  (F6/F7)", &sel, kRes, IM_ARRAYSIZE(kRes))) {
+        if (menu_ui::Combo("Internal resolution  (F6/F7)", &sel, kRes, IM_ARRAYSIZE(kRes))) {
             s.scale = sel == 0 ? 0 : sel == 1 ? -1 : sel - 1;
             ch = true;
         }
@@ -302,36 +303,37 @@ bool tab_graphics(Settings& s, const MenuInfo& info) {
              "1080p screen) - the sharpest image without scaling; GPU cost between 2x and 3x on a 1080p screen.\n"
              "1x-8x: multiples of the GameCube's 640x448 (scaled to your window).");
         if (s.scale == 0 && info.current_scale > 0)
-            ImGui::TextColored(kDim, "Now rendering at %dx (%dx%d)", info.current_scale, 640 * info.current_scale,
+            menu_ui::TextColored(kDim, "Now rendering at %dx (%dx%d)", info.current_scale, 640 * info.current_scale,
                                448 * info.current_scale);
         else if (s.scale < 0 && info.native_h > 0)
-            ImGui::TextColored(kDim, "Now rendering at %dx%d", info.out_w, info.out_h);
+            menu_ui::TextColored(kDim, "Now rendering at %dx%d", info.out_w, info.out_h);
         if (info.gpu_ms > 0) {
-            if (s.scale == 0) { ImGui::SameLine(); ImGui::TextColored(kDim, " -  GPU %.1f ms per frame", info.gpu_ms); }
-            else ImGui::TextColored(info.gpu_ms > 14.f ? kWarn : kDim, "GPU %.1f ms per frame%s", info.gpu_ms,
-                                    info.gpu_ms > 14.f ? " - too slow for 60 fps, try a lower resolution" : "");
+            if (s.scale == 0) { ImGui::SameLine(); menu_ui::TextColored(kDim, " -  GPU %.1f ms per frame", info.gpu_ms); }
+            else menu_ui::TextColored(info.gpu_ms > 14.f ? kWarn : kDim, "GPU %.1f ms per frame%s", info.gpu_ms,
+                                    info.gpu_ms > 14.f ? menu_ui::text(" - too slow for 60 fps, try a lower resolution") : "");
         }
     }
     ImGui::EndDisabled();
 
     ch|=crosshair_controls(s,info);
 
-    ImGui::SeparatorText("Renderer");
+    menu_ui::SeparatorText("Renderer");
     int r = s.renderer == "software" ? 1 : 0;
     static const char* kRend[] = {"GPU (OpenGL 3.3)", "Software (CPU)"};
     ImGui::SetNextItemWidth(260);
-    if (ImGui::Combo("Renderer", &r, kRend, 2)) { s.renderer = r ? "software" : "gpu"; ch = true; }
+    if (menu_ui::Combo("Renderer", &r, kRend, 2)) { s.renderer = r ? "software" : "gpu"; ch = true; }
     bool running_sw = !info.gpu_active;
-    if ((s.renderer == "software") != running_sw) ImGui::TextColored(kWarn, "Takes effect the next time you start the game.");
-    if (info.gpu_active) ImGui::TextColored(kDim, "Running: %s", info.renderer_info.c_str());
-    else ImGui::TextColored(kDim, "Running: software renderer");
+    if ((s.renderer == "software") != running_sw) menu_ui::TextColored(kWarn, "Takes effect the next time you start the game.");
+    if (info.gpu_active) menu_ui::TextColored(kDim, "Running: %s", info.renderer_info.c_str());
+    else menu_ui::TextColored(kDim, "Running: software renderer");
     ImGui::Spacing();
-    if (ImGui::Button("Reset graphics to defaults")) { s.reset_graphics(); ch = true; }
+    if (menu_ui::Button("Reset graphics to defaults")) { s.reset_graphics(); ch = true; }
     return ch;
 }
 
 void tab_hotkeys() {
-    ImGui::TextColored(kDim, "Keys that work any time in the game window (not rebindable).");
+    ImGui::PushTextWrapPos(0.f);
+    menu_ui::TextColored(kDim, "Keys that work any time in the game window (not rebindable).");
     ImGui::Spacing();
     static const char* keys[][2] = {
         {"F12  /  pad Back", "Settings menu (Esc closes it)"},
@@ -351,69 +353,71 @@ void tab_hotkeys() {
         {"F11  /  Alt+Enter", "Fullscreen"},
     };
     if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 170);
-        ImGui::TableSetupColumn("Action");
+        menu_ui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 170);
+        menu_ui::TableSetupColumn("Action");
         for (auto& k : keys) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::TextColored(kAccent, "%s", k[0]);
+            menu_ui::TextColored(kAccent, "%s", menu_ui::text(k[0]));
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(k[1]);
+            menu_ui::TextUnformatted(k[1]);
         }
         ImGui::EndTable();
     }
+    ImGui::PopTextWrapPos();
 }
 
 bool tab_audio(Settings& s) {
     bool ch = false;
     ImGui::SetNextItemWidth(300);
-    ch |= ImGui::SliderInt("Volume  (F4 / Shift+F4)", &s.volume, 0, 200, "%d%%");
+    ch |= menu_ui::SliderInt("Volume  (F4 / Shift+F4)", &s.volume, 0, 200, "%d%%");
     ImGui::SetNextItemWidth(300);
-    ch |= ImGui::SliderInt("Music and videos", &s.music_volume, 0, 100, "%d%%");
+    ch |= menu_ui::SliderInt("Music and videos", &s.music_volume, 0, 100, "%d%%");
     help("The soundtrack and the sound of the cutscene videos (on top of the volume above).");
     ImGui::SetNextItemWidth(300);
-    ch |= ImGui::SliderInt("Sound effects", &s.sfx_volume, 0, 100, "%d%%");
+    ch |= menu_ui::SliderInt("Sound effects", &s.sfx_volume, 0, 100, "%d%%");
     help("Weapons, enemies, pickups, menu sounds (on top of the volume above).");
-    ch |= ImGui::Checkbox("Mute  (F3)", &s.muted);
-    ImGui::SeparatorText("Quality");
+    ch |= menu_ui::Checkbox("Mute  (F3)", &s.muted);
+    menu_ui::SeparatorText("Quality");
     int q = s.audio_hq ? 1 : 0;
     ImGui::SetNextItemWidth(300);
-    if (ImGui::Combo("Resampling", &q, "Original (linear, as on GameCube)\0High quality (band-limited)\0")) {
+    if (menu_ui::Combo("Resampling", &q, "Original (linear, as on GameCube)\0High quality (band-limited)\0")) {
         s.audio_hq = q == 1;
         ch = true;
     }
-    ImGui::TextColored(kDim, "The music is 44.1 kHz and the GameCube converts it to 32 kHz with linear interpolation,\n"
+    menu_ui::TextColored(kDim, "The music is 44.1 kHz and the GameCube converts it to 32 kHz with linear interpolation,\n"
                              "which dulls the treble and adds aliasing. High quality uses a 64-tap filter instead.");
     ImGui::Spacing();
-    if (ImGui::Button("Reset audio to defaults")) { s.reset_audio(); ch = true; }
+    if (menu_ui::Button("Reset audio to defaults")) { s.reset_audio(); ch = true; }
     return ch;
 }
 
 bool tab_keyboard(Settings& s) {
+    ImGui::PushTextWrapPos(0.f);
     bool ch = false;
-    ImGui::TextColored(kDim, "Click a slot, then press a key, mouse button or wheel. Right-click clears. Esc cancels.");
-    ImGui::SeparatorText("Mouse");
-    ch |= ImGui::Checkbox("Mouse look  (click the game to capture the mouse, F2 releases it)", &s.mouse_look);
+    menu_ui::TextColored(kDim, "Click a slot, then press a key, mouse button or wheel. Right-click clears. Esc cancels.");
+    menu_ui::SeparatorText("Mouse");
+    ch |= menu_ui::Checkbox("Mouse look  (click the game to capture the mouse, F2 releases it)", &s.mouse_look);
     ImGui::BeginDisabled(!s.mouse_look);
-    ch |= ImGui::Checkbox("Direct mouse aim", &s.mouse_aim);
+    ch |= menu_ui::Checkbox("Direct mouse aim", &s.mouse_aim);
     help("On: the mouse turns the view directly, 1:1 like a PC shooter (no acceleration, same at any frame rate).\n"
          "Off: the mouse moves the GameCube C-stick, like the original controls.");
     ImGui::EndDisabled();
     ImGui::SetNextItemWidth(300);
     ch |= slider_pct("Mouse sensitivity", s.mouse_sens, 0.1f, 5.0f);
-    ch |= ImGui::Checkbox("Invert mouse Y", &s.mouse_invert_y);
-    ImGui::SeparatorText("Bindings");
+    ch |= menu_ui::Checkbox("Invert mouse Y", &s.mouse_invert_y);
+    menu_ui::SeparatorText("Bindings");
     if (ImGui::BeginTable("##kb", 1 + Settings::kKbSlots, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("GameCube control", ImGuiTableColumnFlags_WidthStretch, 1.4f);
-        ImGui::TableSetupColumn("Primary", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Secondary", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("Third", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        menu_ui::TableSetupColumn("GameCube control", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        menu_ui::TableSetupColumn("Primary", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        menu_ui::TableSetupColumn("Secondary", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        menu_ui::TableSetupColumn("Third", ImGuiTableColumnFlags_WidthStretch, 1.0f);
         ImGui::TableHeadersRow();
         for (int a = 0; a < ACT_COUNT; a++) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
             ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(action_name(a));
+            menu_ui::TextUnformatted(action_name(a));
             for (int k = 0; k < Settings::kKbSlots; k++) {
                 ImGui::TableSetColumnIndex(1 + k);
                 if (bind_button(s.kb[a][k], false, a, k)) { s.kb[a][k] = Bind{}; ch = true; }
@@ -422,94 +426,101 @@ bool tab_keyboard(Settings& s) {
         ImGui::EndTable();
     }
     ImGui::Spacing();
-    if (ImGui::Button("Reset keyboard & mouse to defaults")) { s.reset_keyboard(); ch = true; }
+    if (menu_ui::Button("Reset keyboard & mouse to defaults")) { s.reset_keyboard(); ch = true; }
+    ImGui::PopTextWrapPos();
     return ch;
 }
 
 bool tab_players(Settings& s, const MenuInfo& info) {
+    ImGui::PushTextWrapPos(0.f);
     bool ch = false;
-    if(info.network) ImGui::TextWrapped("This PC controls one online player. Network coop supports up to eight players, versus up to four. Enabled controllers and keyboard/mouse control your own player.");
+    if(info.network) menu_ui::TextWrapped("This PC controls one online player. Network coop supports up to eight players, versus up to four. Enabled controllers and keyboard/mouse control your own player.");
     if(info.bot_controls)info.bot_controls();
-    ImGui::TextColored(kDim, "Split screen for 2-4 players: in the game choose MultiPlayer, then every player presses A to join.");
-    ImGui::TextColored(kDim, "Co-operative is for 2 players; Deathmatch, Hold the Flag and Pass the Bomb for up to 4.");
-    ImGui::SeparatorText("Who plays which player");
+    menu_ui::TextColored(kDim, "Split screen for 2-4 players: in the game choose MultiPlayer, then every player presses A to join.");
+    menu_ui::TextColored(kDim, "Co-operative is for 2 players; Deathmatch, Hold the Flag and Pass the Bomb for up to 4.");
+    menu_ui::SeparatorText("Who plays which player");
     static const char* kPlayers[] = {"Player 1", "Player 2", "Player 3", "Player 4"};
     int kp = s.kbm_player - 1;
     ImGui::SetNextItemWidth(200);
-    if (ImGui::Combo("Keyboard & mouse", &kp, kPlayers, 4)) { s.kbm_player = kp + 1; ch = true; }
+    if (menu_ui::Combo("Keyboard & mouse", &kp, kPlayers, 4)) { s.kbm_player = kp + 1; ch = true; }
     help("Mouse aim and the number keys for weapons go to this player.");
     static const char* kPadChoices[] = {"Not used", "Player 1", "Player 2", "Player 3", "Player 4"};
     for (int i = 0; i < Settings::kPadSlots; i++) {
         char label[32];
-        snprintf(label, sizeof(label), "Controller %d", i + 1);
+        snprintf(label, sizeof(label), menu_ui::text("Controller %d"), i + 1);
         ImGui::SetNextItemWidth(200);
-        ch |= ImGui::Combo(label, &s.pad_player[i], kPadChoices, 5);
+        const auto row_id=std::string(label)+"###controller_player_"+std::to_string(i);
+        ch |= menu_ui::Combo(row_id.c_str(), &s.pad_player[i], kPadChoices, 5);
         ImGui::SameLine();
-        if (info.pads[i].empty()) ImGui::TextColored(kDim, "(not connected)");
-        else ImGui::TextColored(kDim, "%s", info.pads[i].c_str());
+        if (info.pads[i].empty()) menu_ui::TextColored(kDim, "(not connected)");
+        else menu_ui::TextColored(kDim, "%s", info.pads[i].c_str());
     }
     help("Controllers are numbered in the order they were connected. By default the keyboard, the mouse and\n"
          "controller 1 all play player 1, and every further controller the next player.\n"
          "Over the internet with Parsec or Steam Remote Play Together, the remote players' controllers show\n"
          "up here like your own.");
-    if (ImGui::Button("Reset players to defaults")) { s.reset_players(); ch = true; }
-    ImGui::SeparatorText("Split screen");
+    if (menu_ui::Button("Reset players to defaults")) { s.reset_players(); ch = true; }
+    menu_ui::SeparatorText("Split screen");
     static const char* kSplit[] = {"Automatic (side by side in widescreen)", "Top and bottom", "Side by side"};
-    ImGui::SetNextItemWidth(300);
-    ch |= ImGui::Combo("Two players", &s.split_two, kSplit, 3);
+    ImGui::SetNextItemWidth(360);
+    ch |= menu_ui::Combo("Two players", &s.split_two, kSplit, 3);
     help("How the screen is shared by two players; applies from the next match.\n"
          "Three and four players always share it in quarters.");
+    ImGui::PopTextWrapPos();
     return ch;
 }
 
 bool tab_cheats(Settings& s, const MenuInfo& info) {
-    if(ImGui::Button("Open mod menu (Insert)"))mod_menu_set_open(true);
+    ImGui::PushTextWrapPos(0.f);
+    if(menu_ui::Button("Open mod menu (Insert)"))mod_menu_set_open(true);
     bool ch = false;
-    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "Cheats are highly experimental and not fully tested: they can break the game (levels, scripts,");
-    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "progress). They will stay that way: the game is meant to be played without them. Use at your own risk.");
-    ImGui::TextColored(kDim, "For single player only: they are off in co-op and the other multiplayer modes.");
-    ImGui::TextColored(kDim, "They work at once, also in a running level, and \"cheats\" shows in the info bar while one is on.");
-    if (info.network) ImGui::TextColored(kDim,"Shared cheats and spawns are controlled by the host in the mod menu (Insert).");
+    menu_ui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "Cheats are highly experimental and not fully tested: they can break the game (levels, scripts,");
+    menu_ui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "progress). They will stay that way: the game is meant to be played without them. Use at your own risk.");
+    menu_ui::TextColored(kDim, "For single player only: they are off in co-op and the other multiplayer modes.");
+    menu_ui::TextColored(kDim, "They work at once, also in a running level, and \"cheats\" shows in the info bar while one is on.");
+    if (info.network) menu_ui::TextColored(kDim,"Shared cheats and spawns are controlled by the host in the mod menu (Insert).");
     else if (!info.cheats_available)
-        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "Cheat hooks are unavailable for this disc revision.");
+        menu_ui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "Cheat hooks are unavailable for this disc revision.");
     ImGui::BeginDisabled(info.network || !info.cheats_available);
-    ImGui::SeparatorText("Player");
-    ch |= ImGui::Checkbox("Invulnerable", &s.cheat_invulnerable);
+    menu_ui::SeparatorText("Player");
+    ch |= menu_ui::Checkbox("Invulnerable", &s.cheat_invulnerable);
     help("Nothing hurts Sam: health and armor stay where they are (enemies, falls, lava, drowning).");
-    ch |= ImGui::Checkbox("Infinite ammo", &s.cheat_infinite_ammo);
+    ch |= menu_ui::Checkbox("Infinite ammo", &s.cheat_infinite_ammo);
     help("Every weapon fires without using ammo (fills the ammo once when turned on).");
-    ch |= ImGui::Checkbox("All weapons", &s.cheat_all_weapons);
+    ch |= menu_ui::Checkbox("All weapons", &s.cheat_all_weapons);
     help("Every weapon, with full ammo for all of them (filled when turned on and at each level start).");
     ImGui::SetNextItemWidth(300);
-    ch |= ImGui::SliderInt("Movement speed", &s.cheat_speed, 100, 300, "%d%%");
+    ch |= menu_ui::SliderInt("Movement speed", &s.cheat_speed, 100, 300, "%d%%");
     help("How fast Sam runs, in the air and on skates too. 100% is the game's own speed.");
     ImGui::SetNextItemWidth(300);
-    ch |= ImGui::SliderInt("Jump height", &s.cheat_jump, 100, 500, "%d%%");
+    ch |= menu_ui::SliderInt("Jump height", &s.cheat_jump, 100, 500, "%d%%");
     help("How high Sam jumps. 100% is the game's own height.");
-    ch |= ImGui::Checkbox("Flying", &s.cheat_fly);
+    ch |= menu_ui::Checkbox("Flying", &s.cheat_fly);
     help("The game's own debug flight: no gravity, and Sam passes through walls and floors (it's easy to\n"
          "leave the level: turn it off above solid ground). Move and look as usual; hold jump to fly up and\n"
          "fire to fly down.");
-    ImGui::SeparatorText("Weapons");
+    menu_ui::SeparatorText("Weapons");
     ImGui::SetNextItemWidth(300);
-    ch |= ImGui::SliderInt("Damage", &s.cheat_damage, 100, 1000, "%d%%");
+    ch |= menu_ui::SliderInt("Damage", &s.cheat_damage, 100, 1000, "%d%%");
     help("How much damage Sam's weapons do. 100% is the game's own damage.");
-    ImGui::SeparatorText("Game");
-    ch |= ImGui::Checkbox("Unlock everything", &s.cheat_unlock_all);
+    menu_ui::SeparatorText("Game");
+    ch |= menu_ui::Checkbox("Unlock everything", &s.cheat_unlock_all);
     help("The 10 lost levels, the gallery and the game's own treasure cheats, as if all the treasure had\n"
          "been collected. Nothing is written to the memory card: turned off, they are locked again.");
     ImGui::EndDisabled();
     ImGui::Spacing();
-    if (ImGui::Button("Turn all cheats off")) { s.reset_cheats(); ch = true; }
+    if (menu_ui::Button("Turn all cheats off")) { s.reset_cheats(); ch = true; }
+    ImGui::PopTextWrapPos();
     return ch;
 }
 
 bool tab_gamepad(Settings& s, const MenuInfo& info) {
+    ImGui::PushTextWrapPos(0.f);
     bool ch = false;
-    if (info.pad_name.empty()) ImGui::TextColored(kWarn, "No controller connected (plug one in at any time).");
-    else ImGui::TextColored(kDim, "Controller: %s", info.pad_name.c_str());
-    ImGui::TextColored(kDim, "Left stick = move, right stick = look. Back/Select opens this menu.");
-    ImGui::SeparatorText("Sticks and triggers");
+    if (info.pad_name.empty()) menu_ui::TextColored(kWarn, "No controller connected (plug one in at any time).");
+    else menu_ui::TextColored(kDim, "Controller: %s", info.pad_name.c_str());
+    menu_ui::TextColored(kDim, "Left stick = move, right stick = look. Back/Select opens this menu.");
+    menu_ui::SeparatorText("Sticks and triggers");
     ImGui::SetNextItemWidth(300);
     ch |= slider_pct("Stick deadzone", s.pad_deadzone, 0.0f, 0.5f);
     help("Stick movement smaller than this is ignored (fixes drift). The rest of the range is rescaled.");
@@ -518,28 +529,28 @@ bool tab_gamepad(Settings& s, const MenuInfo& info) {
     ImGui::SetNextItemWidth(300);
     ch |= slider_pct("Trigger click point", s.trigger_threshold, 0.1f, 1.0f);
     help("How far an analog trigger must be pulled to also press the GameCube's digital L/R click.");
-    ch |= ImGui::Checkbox("Invert look Y", &s.pad_invert_y);
-    ch |= ImGui::Checkbox("Swap sticks (left = look, right = move)", &s.swap_sticks);
-    ImGui::SeparatorText("Rumble");
-    ch |= ImGui::Checkbox("Rumble", &s.rumble);
+    ch |= menu_ui::Checkbox("Invert look Y", &s.pad_invert_y);
+    ch |= menu_ui::Checkbox("Swap sticks (left = look, right = move)", &s.swap_sticks);
+    menu_ui::SeparatorText("Rumble");
+    ch |= menu_ui::Checkbox("Rumble", &s.rumble);
     help("The GameCube controller's vibration (taking damage, explosions, heavy weapons), on your gamepad.\n"
          "Works with Xbox, PlayStation, Switch Pro and most other controllers.");
     ImGui::BeginDisabled(!s.rumble);
     ImGui::SetNextItemWidth(300);
     ch |= slider_pct("Rumble strength", s.rumble_strength, 0.1f, 1.0f);
     ImGui::SameLine();
-    if (ImGui::Button("Test")) g_rumble_test = true;
+    if (menu_ui::Button("Test")) g_rumble_test = true;
     ImGui::EndDisabled();
-    ImGui::SeparatorText("Buttons");
-    if (ImGui::Button("Xbox layout (A jumps)")) { s.pad_preset_xbox(); ch = true; }
+    menu_ui::SeparatorText("Buttons");
+    if (menu_ui::Button("Xbox layout (A jumps)")) { s.pad_preset_xbox(); ch = true; }
     help("A jump (also selects in menus and skips cutscenes), X use, B back, Y the GameCube's Z,\n"
          "LB / RB switch weapons, RT fire, Start pause. The default.");
     ImGui::SameLine();
-    if (ImGui::Button("GameCube layout")) { s.pad_preset_gamecube(); ch = true; }
+    if (menu_ui::Button("GameCube layout")) { s.pad_preset_gamecube(); ch = true; }
     help("The buttons in the GameCube controller's positions: A use / select, B, X and Y as on the GameCube,\n"
          "LT jump (analog, like the GameCube's L), RT fire, RB the Z button.");
     ImGui::SameLine();
-    if (ImGui::Button("Swap A/B and X/Y")) {
+    if (menu_ui::Button("Swap A/B and X/Y")) {
         std::swap(s.pad[ACT_A], s.pad[ACT_B]);
         std::swap(s.pad[ACT_X], s.pad[ACT_Y]);
         ch = true;
@@ -551,68 +562,69 @@ bool tab_gamepad(Settings& s, const MenuInfo& info) {
         int cur = 0;
         for (int i = 0; i < 5; i++) if (s.prompts == kIds[i]) cur = i;
         ImGui::SetNextItemWidth(300);
-        if (ImGui::Combo("On-screen buttons", &cur, kNames, 5)) { s.prompts = kIds[cur]; ch = true; }
+        if (menu_ui::Combo("On-screen buttons", &cur, kNames, 5)) { s.prompts = kIds[cur]; ch = true; }
         help("The buttons the game shows in menus and hints (\"A Select\", \"Press A to skip\").\n"
              "Automatic shows your keys and mouse buttons, or Xbox / PlayStation buttons when you play with a\n"
              "controller, matching your bindings.");
     }
-    ImGui::TextColored(kDim, "Click a slot, then press a controller button or pull a trigger. Right-click clears. Esc cancels.");
+    menu_ui::TextColored(kDim, "Click a slot, then press a controller button or pull a trigger. Right-click clears. Esc cancels.");
     if (ImGui::BeginTable("##pad", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("GameCube control", ImGuiTableColumnFlags_WidthStretch, 1.2f);
-        ImGui::TableSetupColumn("Controller", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        menu_ui::TableSetupColumn("GameCube control", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        menu_ui::TableSetupColumn("Controller", ImGuiTableColumnFlags_WidthStretch, 1.4f);
         ImGui::TableHeadersRow();
         for (int a = kFirstButtonAction; a < ACT_COUNT; a++) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
             ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted(action_name(a));
+            menu_ui::TextUnformatted(action_name(a));
             ImGui::TableSetColumnIndex(1);
             if (bind_button(s.pad[a], true, a, 0)) { s.pad[a] = Bind{}; ch = true; }
         }
         ImGui::EndTable();
     }
     ImGui::Spacing();
-    if (ImGui::Button("Reset gamepad to defaults")) { s.reset_gamepad(); ch = true; }
+    if (menu_ui::Button("Reset gamepad to defaults")) { s.reset_gamepad(); ch = true; }
+    ImGui::PopTextWrapPos();
     return ch;
 }
 
 bool tab_states(Settings& s, const MenuInfo& info) {
     bool ch = false;
-    ImGui::TextWrapped("Save the game exactly where you are and come back to that moment later. F5 saves to the "
+    menu_ui::TextWrapped("Save the game exactly where you are and come back to that moment later. F5 saves to the "
                        "selected slot and F9 loads it (Shift+F5 picks the next slot).");
     ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-    if(!info.network) ImGui::TextWrapped("Loading a state also puts the memory card back as it was when the state was saved "
+    if(!info.network) menu_ui::TextWrapped("Loading a state also puts the memory card back as it was when the state was saved "
                        "(the card as it was before loading is kept as a .bak file next to it).");
     ImGui::PopStyleColor();
-    if(info.network) ImGui::TextWrapped(info.network_host?"The host saves and restores the shared cooperative session in these slots.":"The host controls shared saves. Your local profile is kept separate.");
-    if (!info.states_available) ImGui::TextColored(kWarn, info.network && !info.network_host ? "Only the host can save or load this session." : "Save states are available once the game is running.");
+    if(info.network) menu_ui::TextWrapped(info.network_host?"The host saves and restores the shared cooperative session in these slots.":"The host controls shared saves. Your local profile is kept separate.");
+    if (!info.states_available) menu_ui::TextColored(kWarn, info.network && !info.network_host ? "Only the host can save or load this session." : "Save states are available once the game is running.");
     ImGui::Spacing();
     ImGui::BeginDisabled(!info.states_available);
     for (int i = 0; i < 5; i++) {
         const MenuInfo::Slot& sl = info.slots[i];
         ImGui::PushID(i);
         bool selected = s.state_slot == i + 1;
-        if (ImGui::RadioButton("##sel", selected)) { s.state_slot = i + 1; ch = true; }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Use this slot for F5 / F9");
+        if (menu_ui::RadioButton("##sel", selected)) { s.state_slot = i + 1; ch = true; }
+        if (ImGui::IsItemHovered()) menu_ui::SetTooltip("Use this slot for F5 / F9");
         ImGui::SameLine();
         ImVec2 thumb(128, 90);
         if (sl.tex) ImGui::Image((ImTextureID)(intptr_t)sl.tex, thumb);
         else ImGui::Dummy(thumb);
         ImGui::SameLine();
         ImGui::BeginGroup();
-        ImGui::Text("Slot %d", i + 1);
-        if (sl.exists) ImGui::TextColored(kDim, "%s", sl.when.c_str());
-        else ImGui::TextColored(kDim, "empty");
-        if (ImGui::Button("Save")) { g_state_req_slot = i + 1; g_state_req_save = true; }
+        menu_ui::Text("Slot %d", i + 1);
+        if (sl.exists) menu_ui::TextColored(kDim, "%s", sl.when.c_str());
+        else menu_ui::TextColored(kDim, "empty");
+        if (menu_ui::Button("Save")) { g_state_req_slot = i + 1; g_state_req_save = true; }
         ImGui::SameLine();
         ImGui::BeginDisabled(!sl.exists);
-        if (ImGui::Button("Load")) { g_state_req_slot = i + 1; g_state_req_save = false; }
+        if (menu_ui::Button("Load")) { g_state_req_slot = i + 1; g_state_req_save = false; }
         ImGui::EndDisabled();
         ImGui::EndGroup();
         ImGui::PopID();
     }
     ImGui::EndDisabled();
-    if (!info.states_dir.empty()) ImGui::TextColored(kDim, "Folder: %s", info.states_dir.c_str());
+    if (!info.states_dir.empty()) menu_ui::TextColored(kDim, "Folder: %s", info.states_dir.c_str());
     return ch;
 }
 
@@ -682,6 +694,7 @@ bool menu_handle_event(const SDL_Event& e, Settings& s, bool& changed) {
 
 bool draw_menu(Settings& s, const MenuInfo& info) {
     trace_crosshair_reset();
+    menu_ui::set_language(s.game_language>=0?unsigned(s.game_language):unsigned(info.crosshair_language));
     if (!g_open) {write_crosshair_ui_trace(s);return false;}
     bool ch = false;
     const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -690,35 +703,51 @@ bool draw_menu(Settings& s, const MenuInfo& info) {
     ImGui::SetNextWindowSize(size, ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(1.0f);
     bool open = true;
-    ImGui::Begin("Settings", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+    menu_ui::Begin("Settings", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                                         ImGuiWindowFlags_NoSavedSettings);
     if(trace_crosshair_ui()){g_crosshair_ui_window_a=ImGui::GetWindowPos();const auto bounds=ImGui::GetWindowSize();g_crosshair_ui_window_b={g_crosshair_ui_window_a.x+bounds.x,g_crosshair_ui_window_a.y+bounds.y};const auto list=ImGui::GetWindowDrawList();g_crosshair_ui_clip_a=list->GetClipRectMin();g_crosshair_ui_clip_b=list->GetClipRectMax();}
-    ImGui::TextColored(kAccent, "SERIOUS SAM: NEXT ENCOUNTER NATIVE - Settings");
-    ImGui::SameLine();
-    ImGui::TextColored(kDim, "   F12 / Esc to close. Changes apply and save immediately.");
+    menu_ui::TextColored(kAccent, "SERIOUS SAM: NEXT ENCOUNTER NATIVE - Settings");
+    menu_ui::TextWrapped("   F12 / Esc to close. Changes apply and save immediately.");
+    const char* language_names[]={"Game setting (automatic)","English","Deutsch","Français"};
+    int language=s.game_language+1;ImGui::SetNextItemWidth(230);
+    if(menu_ui::BeginCombo("Game and menu language###menu_language",language_names[std::clamp(language,0,3)])){
+        for(int i=0;i<4;++i){
+            const bool picked=menu_ui::Selectable(language_names[i],language==i);
+            trace_crosshair_widget("language_"+std::to_string(i));
+            if(picked){s.game_language=i-1;ch=true;menu_ui::set_language(s.game_language>=0?unsigned(s.game_language):unsigned(info.crosshair_language));}
+        }
+        ImGui::EndCombo();
+    }
+    trace_crosshair_widget("language");
+    help("F12 changes immediately. The game language changes after restarting the game.");
+    if(s.game_language>=0 && s.game_language!=info.crosshair_language) {
+        ImGui::PushTextWrapPos(0.f);
+        menu_ui::TextColored(kWarn,"Restart the game to apply this language to the original menus.");
+        ImGui::PopTextWrapPos();
+    }
     ImGui::BeginDisabled(info.network);
-    ch |= ImGui::Checkbox("Pause in this menu", &s.pause_in_menu);
+    ch |= menu_ui::Checkbox("Pause in this menu", &s.pause_in_menu);
     ImGui::SameLine();
-    ch |= ImGui::Checkbox("Pause in the background", &s.pause_unfocused);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pause and silence the game while its window isn't focused (Alt+Tab).");
+    ch |= menu_ui::Checkbox("Pause in the background", &s.pause_unfocused);
+    if (ImGui::IsItemHovered()) menu_ui::SetTooltip("Pause and silence the game while its window isn't focused (Alt+Tab).");
     ImGui::EndDisabled();
-    if(info.network && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("The shared cooperative game continues while this PC has its settings open or is in the background.");
+    if(info.network && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) menu_ui::SetTooltip("The shared cooperative game continues while this PC has its settings open or is in the background.");
     ImGui::SameLine();
-    ch |= ImGui::Checkbox("Skip intros", &s.skip_intros);
+    ch |= menu_ui::Checkbox("Skip intros", &s.skip_intros);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Start at the main menu: the logos, intro videos and title screen are skipped\n"
+        menu_ui::SetTooltip("Start at the main menu: the logos, intro videos and title screen are skipped\n"
                           "(the memory card check stays). Applies from the next start.");
-    ImGui::SameLine(ImGui::GetWindowWidth() - 120);
-    if (ImGui::Button("Exit game", ImVec2(100, 0))) g_exit_requested = true;
+    ImGui::SameLine();
+    if (menu_ui::Button("Exit game")) g_exit_requested = true;
     if (ImGui::BeginTabBar("##tabs")) {
-        if (ImGui::BeginTabItem("Graphics", nullptr, g_select_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##g"); ch |= tab_graphics(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Audio", nullptr, g_select_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##a"); ch |= tab_audio(s); ImGui::EndChild(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Keyboard & Mouse", nullptr, g_select_tab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##k"); ch |= tab_keyboard(s); ImGui::EndChild(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Gamepad", nullptr, g_select_tab == 3 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##p"); ch |= tab_gamepad(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Players", nullptr, g_select_tab == 6 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##pl"); ch |= tab_players(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Cheats", nullptr, g_select_tab == 7 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##c"); ch |= tab_cheats(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Save states", nullptr, g_select_tab == 5 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##s"); ch |= tab_states(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Hotkeys", nullptr, g_select_tab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##h"); tab_hotkeys(); ImGui::EndChild(); ImGui::EndTabItem(); }
+        if (menu_ui::BeginTabItem("Graphics", nullptr, g_select_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##g"); ch |= tab_graphics(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
+        if (menu_ui::BeginTabItem("Audio", nullptr, g_select_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##a"); ch |= tab_audio(s); ImGui::EndChild(); ImGui::EndTabItem(); }
+        if (menu_ui::BeginTabItem("Keyboard & Mouse", nullptr, g_select_tab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##k"); ch |= tab_keyboard(s); ImGui::EndChild(); ImGui::EndTabItem(); }
+        if (menu_ui::BeginTabItem("Gamepad", nullptr, g_select_tab == 3 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##p"); ch |= tab_gamepad(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
+        if (menu_ui::BeginTabItem("Players", nullptr, g_select_tab == 6 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##pl"); ch |= tab_players(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
+        if (menu_ui::BeginTabItem("Cheats", nullptr, g_select_tab == 7 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##c"); ch |= tab_cheats(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
+        if (menu_ui::BeginTabItem("Save states", nullptr, g_select_tab == 5 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##s"); ch |= tab_states(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
+        if (menu_ui::BeginTabItem("Hotkeys", nullptr, g_select_tab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##h"); tab_hotkeys(); ImGui::EndChild(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
         g_select_tab = -1;
     }

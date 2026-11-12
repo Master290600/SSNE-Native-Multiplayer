@@ -1,4 +1,4 @@
-SSNE-Native – normaler Launcher mit integriertem Multiplayer (Build 202)
+SSNE-Native – normaler Launcher mit integriertem Multiplayer (Build 203)
 
 Start: SSNE-Native.exe
 Die vorhandene Spielruntime benoetigt einen Installationspfad ohne Umlaute
@@ -57,7 +57,7 @@ Spiel. Jeder Spieler benötigt sein eigenes Disc-Image und erstellt das Spiel
 über den Launcher selbst. game_data, persönliche Spielstände und die erzeugten
 Spiel-EXE-Dateien gehören nicht in ein weitergegebenes Paket.
 
-Runtime: Build 202, Protokoll 63. Launcher-Paket: Version 1.2.7.202.
+Runtime: Build 203, Protokoll 63. Launcher-Paket: Version 1.2.7.203.
 Die Integration ändert die Start-/Erstellen-Abläufe; sie ist keine erneute
 Abnahme der gesamten Koop-Kampagne.
 
@@ -68,3 +68,7 @@ Mehrspieler > Sitzungsoptionen:
 - Munition pro Pickup x1 bis x5; Verbrauch bleibt normal.
 Der Host legt die Regeln fest. Clients sehen diese Werte schreibgeschuetzt.
 Neue Faktoren wirken auf kuenftige Spawns/Pickups. Eigene Optionen bleiben gespeichert.
+
+Sprache umstellen: F12 > Sprache fuer Spiel und Menues.
+F12 wechselt sofort; die originalen PAL-Spielmenues uebernehmen die Auswahl
+nach einem Neustart. Automatisch verwendet die bisherige Spielsprache.

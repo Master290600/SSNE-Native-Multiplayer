@@ -27,6 +27,7 @@ constexpr unsigned result_connection=0x151,lobby_start=0x152,lobby_connection=0x
 enum class Page {Closed,Home,Host,Join,Connecting,Error,Bots,Connection,Rooms,Options};
 enum class Edit {None,Address,Pin,Port,Name};
 NativeFrontendServices services;
+std::atomic<int> startup_language_override{-1};
 MultiplayerOptions options;Page options_return=Page::Home;bool options_save_failed=false;
 void save_options(){
     if(services.options_path.empty())return;
@@ -237,6 +238,11 @@ void destroy(PPCContext& c){
     if(storage.empty() && registry.memory){mem_write32(c.r[13]-0x542c,registry.definitions);mem_write32(c.r[13]-0x5428,registry.count);const auto old=registry;registry={};call(c,0x801161EC,old.heap,old.memory);}
 }
 void language(PPCContext& c){
+    const auto preferred=startup_language_override.load(std::memory_order_relaxed);
+    // Preserve the original EN/DE/FR preload loop at return address 80161E64.
+    // Only override the OS restore and the later saved-setting application;
+    // their original callers perform the corresponding resource reload.
+    if(preferred>=0 && (c.lr==0x80161E94u || c.lr==0x8016406Cu))c.r[3]=uint32_t(preferred);
     if(getenv("SSNE_TEST_HIDDEN"))if(const auto value=getenv("SSNE_NATIVE_TEST_LANGUAGE")){const auto n=std::strtol(value,nullptr,10);if(n>=0 && n<3)c.r[3]=uint32_t(n);}
     ssne_call_original(c,0x801597BC,language_original);
 }
@@ -291,6 +297,7 @@ void join_lan(PPCContext& c,const FrontendRoom& room){
     setup_seen=false;main_idle_frames=0;show(c,Page::Connecting);
 }
 }
+void configure_native_startup_language(int language){startup_language_override.store(language>=-1 && language<=2?language:-1,std::memory_order_relaxed);}
 unsigned native_menu_language(){const auto language=mem_read32(0x802DB838);return language<3?language:0;}
 MultiplayerOptions native_frontend_options(){return options;}
 void configure_native_frontend(NativeFrontendServices value){services=std::move(value);

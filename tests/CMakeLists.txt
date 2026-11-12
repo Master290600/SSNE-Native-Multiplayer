@@ -141,3 +141,8 @@ add_test(NAME native_vehicle_input COMMAND native_vehicle_input_test)
 add_executable(ammo_rules_test ammo_rules_test.cpp ../runtime/src/ammo_rules.cpp)
 target_include_directories(ammo_rules_test PRIVATE ../runtime/include)
 add_test(NAME ammo_rules COMMAND ammo_rules_test)
+
+add_executable(settings_menu_language_test settings_menu_language_test.cpp)
+target_include_directories(settings_menu_language_test PRIVATE ../port/src)
+target_link_libraries(settings_menu_language_test PRIVATE imgui)
+add_test(NAME settings_menu_language COMMAND settings_menu_language_test)

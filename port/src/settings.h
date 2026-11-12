@@ -111,6 +111,7 @@ struct Settings {
     bool pause_unfocused = true;     // pause (and silence) the game while the window is in the background
     bool skip_intros = true;         // boot straight to the main menu (logos, videos and title screen skipped)
     int state_slot = 1;              // save state slot used by F5 / F9 (1..5)
+    int game_language = -1;          // next start: -1 saved game choice, 0 English, 1 German, 2 French
 
     Settings();
     void reset_graphics();
