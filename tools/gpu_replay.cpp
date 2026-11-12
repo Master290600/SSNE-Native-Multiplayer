@@ -44,6 +44,18 @@ static bool egl_init(std::string& err) {
     return true;
 }
 
+// Captures keep shared decoded textures alive, while retained texture-copy
+// frames have unique ownership. Replay each repetition with its own command
+// buffers and dependency chain instead of copying unique_ptr containers.
+static std::unique_ptr<ssne::gx::GpuFrame> clone_frame(const ssne::gx::GpuFrame& source) {
+    auto copy=std::make_unique<ssne::gx::GpuFrame>();
+    copy->local_camera=source.local_camera;copy->seq=source.seq;copy->wide=source.wide;
+    copy->cmds=source.cmds;copy->states=source.states;copy->vtx=source.vtx;copy->idx=source.idx;
+    copy->textures=source.textures;copy->kept=source.kept;
+    for(const auto& frame:source.prerequisites)copy->prerequisites.push_back(frame?clone_frame(*frame):nullptr);
+    return copy;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { puts("usage: gpu_replay <capture dir> <out dir> [--scale N] [--skip K] [--time] [--repeat R]"); return 1; }
     std::string in = argv[1], out = argv[2], tex_dir;
@@ -115,7 +127,7 @@ int main(int argc, char** argv) {
     std::vector<double> times;  // per frame, every repetition after the first (warm-up: uploads, shader compiles)
     for (int r = 0; r < repeat; r++)
         for (size_t i = 0; i < files.size(); i++) {
-            auto f = std::make_unique<ssne::gx::GpuFrame>(*loaded[i]);
+            auto f = clone_frame(*loaded[i]);
 #ifdef SSNE_GPU_CMD_HAS_ZSNAP
             if (r == 0)
                 for (const auto& c : f->cmds)
