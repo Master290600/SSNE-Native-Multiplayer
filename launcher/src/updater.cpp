@@ -152,7 +152,8 @@ bool validate_package(const std::string& base_dir, const std::string& incoming_d
             need(launcher::runtime_file_sha256(incoming/kLauncherName,why)==str("launcher_sha256"),"launcher does not match integration metadata");
             need(launcher::runtime_file_sha256(incoming/"build-kit/multiplayer/launcher-kit.json",why)==str("launcher_kit_sha256"),"native launcher kit does not match integration metadata");
             launcher::RuntimeKit kit;
-            need(launcher::load_runtime_kit(incoming_dir,S(base/"game_data"),kit,why,false),"incomplete native multiplayer update: "+why);
+            if(!launcher::load_runtime_kit(incoming_dir,S(base/"game_data"),kit,why,false))
+                throw std::runtime_error("incomplete native multiplayer update: "+why);
         }
         error.clear(); return true;
     } catch(const std::exception& exception) { error=exception.what(); return false; }
