@@ -1,5 +1,6 @@
 // A recorded GX frame for the GPU renderer (produced on the guest thread, executed on the render thread).
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>

@@ -290,7 +290,9 @@ def native_smoke(a,h,launch,report):
  assert same_path(launch['cwd'],h.base/'Multiplayer'),launch
  assert not any(value in argv for value in ('--coop-host','--coop-join','--net-host','--net-join','--memcard')),'Play must reach the ordinary native Main with preserved default save selection'
  report['actual_launch']={**launch,'queried_image_path':host.image_path(),'verified_ordinary_main_args':True}
- game_args=argparse.Namespace(exe=target,data=h.base/'game_data',card=h.base/'Multiplayer/saves/Host-MemoryCardA.EUR.raw',private_settings=SETTINGS,fps=60,port=a.port,language=1,client_language=2,test_env={'SSNE_TEST_DEVICE_INPUT':'1','SSNE_NATIVE_MOUSE_COMMAND':COMMAND_FILE},allow_start_key_fallback=False,case='lobby',continue_method='mouse')
+ selected_card=h.base/'Multiplayer/saves/Host-MemoryCardA.EUR.raw'
+ if not selected_card.exists():selected_card=h.base/'Multiplayer/saves/MemoryCardA.EUR.raw'
+ game_args=argparse.Namespace(exe=target,data=h.base/'game_data',card=selected_card,private_settings=SETTINGS,fps=60,port=a.port,language=1,client_language=2,test_env={'SSNE_TEST_DEVICE_INPUT':'1','SSNE_NATIVE_MOUSE_COMMAND':COMMAND_FILE},allow_start_key_fallback=False,case='lobby',continue_method='mouse')
  m=AttachedMenus(game_args,a.output/'native-peers',h.base/'Multiplayer',h,host);native={'steps':[]};pointer=Pointer(m,native)
  try:
   wait_main(m,pointer);report['native_main_observed']=True;pointer.command('host','cancel')
