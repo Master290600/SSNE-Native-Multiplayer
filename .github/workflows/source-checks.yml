@@ -13,7 +13,7 @@ jobs:
       - name: Audit tracked source
         run: python3 tools/audit_source.py --report "$RUNNER_TEMP/source-audit.json"
       - name: Install component build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev libxext-dev
       - name: Configure source-only tests
         run: cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Release -DSSNE_BUILD_LAUNCHER=OFF -DSSNE_BUILD_PORT=OFF -DSSNE_BUILD_TESTS=ON
       - name: Build components

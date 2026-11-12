@@ -175,7 +175,15 @@ class LauncherHarness:
   self.report.setdefault('ui_clicks',[]).append({'id':ident_value,'label':row['label'],'bounds':row['bounds'],'point':[x,y]})
  def shot(self,name):self.command('shot '+str(self.a.output/(name+'.ppm')))
  def start(self):
+  # A resumed private sandbox must not acknowledge clicks from a previous run.
+  for name in (LAUNCHER_COMMAND,LAUNCHER_STATE):
+   path=self.base/name
+   if path.exists():path.unlink()
   mp=self.base/'Multiplayer';mp.mkdir(exist_ok=True);(mp/'steps').mkdir(exist_ok=True);(mp/'input.txt').write_text('');(mp/'command.txt').write_text('')
+  (mp/COMMAND_FILE).write_text('')
+  for name in ('native-menu-state.json','native-menu-mouse-state.json','native-mouse-input-state.json','native-carousel-mouse-state.json','native-lobby-mouse-state.json'):
+   path=mp/name
+   if path.exists():path.unlink()
   env={key:value for key,value in os.environ.items() if not key.startswith('SSNE_')}
   env.update(SSNE_TEST_HIDDEN='1',SSNE_NO_UPDATE_CHECK='1',SSNE_LAUNCHER_TEST_COMMAND=str(self.base/LAUNCHER_COMMAND),SSNE_DEV_NATIVE_MENU='1',SSNE_TEST_DEVICE_INPUT='1',SSNE_NATIVE_MOUSE_COMMAND=COMMAND_FILE,SSNE_PAD_SCRIPT_FILE='input.txt',SSNE_NATIVE_MENU_COMMAND='command.txt',SSNE_TEST_SCREENSHOT_DIR='steps',SSNE_PERF_LOG='performance.jsonl',SSNE_NATIVE_TEST_LANGUAGE='1',SSNE_NATIVE_MENU_PORT=str(self.a.port),SSNE_NATIVE_MENU_DISCOVERY_PORT=str(self.a.port+1))
   assert 'SSNE_COOP_TEST_SKIP_DELAY_MS' not in env and 'SSNE_TEST_SKIP_FIRST_VOTE' not in env
@@ -263,6 +271,12 @@ def wait_main(m,p,role='host'):
   if '[port] Stopped:' in m.log(role):raise RuntimeError('Actual launcher child stopped: '+next(line for line in m.log(role).splitlines() if '[port] Stopped:' in line))
   if m.processes[role].poll() is not None:raise RuntimeError('Actual launcher child exited before native Main: '+str(m.processes[role].returncode))
   if time.monotonic()>deadline:raise TimeoutError('Actual launcher child did not reach native Main: '+str(m.state(role)))
+  if any(ident(surface['root'])==0xb7 for surface in p.observe(role).get('surfaces',[])):
+   # An empty native card first opens the game's original language selector.
+   # Choose the test's German language through its real native mouse widget.
+   m.wait(lambda:p.ack(role).get('active'),15);m.press(role,'UISHOT')
+   p.click(0xba,role,root=0xb7)
+   p.report.setdefault('fresh_card_setup',[]).append({'role':role,'original_root':0xb7,'language_widget':0xba,'method':'native mouse'})
   if m.state(role).get('scene')==2:m.press(role,'B') # Qualified initial game boot only; independent of launcher UI proof.
   m.delay(.1)
  m.wait(lambda:p.ack(role).get('active'),15);m.press(role,'UISHOT')
