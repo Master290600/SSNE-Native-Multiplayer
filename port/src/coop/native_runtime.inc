@@ -32,6 +32,7 @@ void snapshot_native_setup(){
 void activate_native_session(){
     const auto status=g_coop_host?g_coop_server->status():g_coop_peer->status();
     g_coop_local_player=status.player.slot;g_coop_capacity=status.capacity;
+    ssne::set_cheat_host(g_coop_host);
     ssne::netplay_set_roster(status.capacity);ssne::netplay_set_local_player(int(status.player.slot));ssne::mod_netplay_player(int(status.player.slot));
     if(g_coop_host)g_coop_engine=std::make_unique<port::coop::NativeSession>(*g_coop_server,status.capacity,"lobby",log_line);
     else g_coop_engine=std::make_unique<port::coop::NativeSession>(*g_coop_peer,log_line);
@@ -52,6 +53,7 @@ void stop_native_session(PPCContext& c){
     const bool in_menu=mem_read32(ssne::game_address(0x802DB0E0))==3 && mem_read32(ssne::game_address(0x802DB0E4))!=4;
     native_advertisement.stop();native_browser.stop();
     g_coop_engine_ready=false;g_coop_host=false;g_coop_client=false;native_connecting=false;native_lan_join=false;
+    ssne::set_cheat_host(false);
     port::coop::deactivate_native_lobby();
     if(g_coop_peer)g_coop_peer->stop();if(g_coop_server)g_coop_server->stop();
     g_coop_engine.reset();g_coop_peer.reset();g_coop_server.reset();

@@ -111,6 +111,7 @@ class CrosshairMenus(MultiplayerMenus):
                    SSNE_NATIVE_TEST_LANGUAGE=str(language))
         if role == 'host':
             env.update(SSNE_COOP_CAMPAIGN_VERIFY='1', SSNE_COOP_CAMPAIGN_COMMAND='campaign-command.txt')
+        env.update(getattr(self.a, 'test_env', {}))
         direct = self.a.case == 'host-client-direct'
         if direct:
             env.update(SSNE_COOP_TEST_SKIP_DELAY_MS='1500', SSNE_TEST_SKIP_FIRST_VOTE='1')

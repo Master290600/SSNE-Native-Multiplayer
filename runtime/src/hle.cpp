@@ -556,7 +556,7 @@ int64_t g_port_player_ms[4] = {};
 
 void hle_player_update(PPCContext& ctx) {
     uint32_t player = ctx.r[3];
-    bool valid = player >= 0x80000000u && player < 0x81800000u;
+    bool valid = player >= 0x80000000u && player <= guest_ram_end()-0x790u && mem_read32(player+0x48)==game_address(0x80212268u);
     if (valid) { g_port_player[player_port(player)] = player; g_port_player_ms[player_port(player)] = now_ms(); }
     // A physics step runs in this update (see latch_jump) unless its accumulator ends up at exactly its old value
     // plus the frame time (fixed-step mode without a whole step; the variable-step mode always steps).
@@ -566,7 +566,7 @@ void hle_player_update(PPCContext& ctx) {
     float step = 0;
     if (valid) {
         uint32_t step_src = mem_read32(player + 0x23C);
-        if (step_src >= 0x80000000u && step_src < 0x81800000u) step = u2f(mem_read32(step_src + 0x24));
+        if (step_src >= 0x80000000u && step_src <= guest_ram_end()-0x28u) step = u2f(mem_read32(step_src + 0x24));
         if (!(step > 0 && step < 0.1f)) step = 0;
     }
     if (g_switch_boost[port] > 0 && step > 0) {  // the frames after a controller switch step like 60 fps frames (below)
@@ -1908,8 +1908,9 @@ std::unordered_map<uint32_t, DamageMode> g_damage_modes;
 constexpr uint32_t kDamageFields[3] = {0x10, 0x14, 0x28};
 // Flying: the game's own debug flight (800BEEC8): with PuzzleConfig.AllowFlyCheat (entry at player+0x358, value at
 // +0x1C) on, player+0x35C set and flags 0xC000 at player+0x1C (no gravity, no collision), the sticks fly Sam.
-uint32_t g_fly_player = 0, g_fly_saved_allow = 0;
+uint32_t g_fly_player = 0, g_fly_saved_allow = 0, g_fly_saved_flags = 0, g_fly_saved_active = 0, g_fly_allow_entry = 0;
 std::atomic<bool> g_flying{false};
+std::atomic<bool> g_cheat_host{false};
 std::atomic<uint32_t> g_cheat_bits{0};  // 1 invulnerable, 2 infinite ammo, 4 all weapons, 8 unlock all, 16 fly
 std::atomic<float> g_cheat_speed{1}, g_cheat_jump{1}, g_cheat_damage{1};
 std::atomic<bool> g_cheats_ok{false}, g_cheats_on{false};
@@ -1920,12 +1921,30 @@ bool g_cheat_forced[3] = {};
 uint32_t g_cheat_saved[3] = {};
 bool g_scaled_forced = false;
 
-bool cheat_mode_allowed() { return !g_netplay_active && mem_read32(game_address(kGameMode)) == 0; }  // single player
+bool cheat_mode_allowed() {
+    if(g_netplay_active)return g_cheat_host.load() && g_authoritative_gameplay && !replica_simulation() && mem_read32(game_address(0x802DB0E0u))==4;
+    return mem_read32(game_address(kGameMode))==0;
+}
+bool cheat_player_valid(uint32_t player) {
+    return player>=0x80000000u && player<=guest_ram_end()-0x790u && mem_read32(player+0x48)==game_address(0x80212268u);
+}
+uint32_t current_cheat_player() {
+    if(g_netplay_active) {
+        const auto slot=g_netplay_local_player.load();
+        const auto actor=slot>=0 && unsigned(slot)<native_party_capacity()?mem_read32(native_party_registry()+unsigned(slot)*4):0;
+        return cheat_player_valid(actor)?actor:0;
+    }
+    const auto preferred=std::clamp(g_kbm_port.load(),0,3);
+    if(cheat_player_valid(g_port_player[preferred]) && now_ms()-g_port_player_ms[preferred]<=1000)return g_port_player[preferred];
+    for(int p=0;p<4;++p)if(cheat_player_valid(g_port_player[p]) && now_ms()-g_port_player_ms[p]<=1000)return g_port_player[p];
+    return 0;
+}
 
 // Sets the cheats in effect (lift = false) or gives the game back its own values (lift = true). Game thread.
 void cheats_frame(bool lift) {
     if (!g_cheats_ok.load()) return;
     uint32_t bits = g_cheat_bits.load();
+    if(g_netplay_active)bits&=~7u;  // party switches are owned only by ModOptions
     bool allowed = !lift && cheat_mode_allowed();
     for (int i = 0; i < 3; i++) {
         bool want = allowed && (bits >> i & 1);
@@ -1966,9 +1985,7 @@ void cheats_frame(bool lift) {
     }
     float speed = allowed ? g_cheat_speed.load() : 1.0f, jump = allowed ? g_cheat_jump.load() : 1.0f;
     float damage = allowed ? g_cheat_damage.load() : 1.0f;
-    uint32_t player = 0;
-    for (int p = 0; p < 4 && !player; p++)
-        if (g_port_player[p] && now_ms() - g_port_player_ms[p] <= 1000) player = g_port_player[p];
+    const uint32_t player = current_cheat_player();
     if ((speed != 1.0f || jump != 1.0f || g_scaled_forced) && player) {
         for (auto& st : g_scaled_settings) {
             uint32_t n = mem_read32(player + st.offset);
@@ -2005,29 +2022,37 @@ void cheats_frame(bool lift) {
         }
     }
     // flying
-    bool fly = allowed && (bits & 16) && player;
+    bool fly = allowed && (bits & 16) && player && !vehicle_actor_driving(player,g_netplay_active.load());
     if (g_fly_player && (!fly || g_fly_player != player)) {
         uint32_t fp = g_fly_player;
-        uint32_t allow = mem_read32(fp + 0x358);
-        if (mem_read32(fp + 0x35C) == 1) {
-            mem_write32(fp + 0x35C, 0);
-            mem_write32(fp + 0x1C, mem_read32(fp + 0x1C) & ~0xC000u);
+        if(cheat_player_valid(fp) && mem_read32(fp+0x358)==g_fly_allow_entry) {
+            uint32_t allow = mem_read32(fp + 0x358);
+            if (mem_read32(fp + 0x35C) == 1) mem_write32(fp + 0x35C, g_fly_saved_active);
+            mem_write32(fp + 0x1C, (mem_read32(fp + 0x1C) & ~0xC000u) | (g_fly_saved_flags & 0xC000u));
+            if (allow >= 0x80000000u && allow < (guest_ram_end() - 0x30u) && mem_read32(allow + 0x1C)==1)
+                mem_write32(allow + 0x1C, g_fly_saved_allow);
         }
-        if (allow >= 0x80000000u && allow < (guest_ram_end() - 0x30u)) mem_write32(allow + 0x1C, g_fly_saved_allow);
         g_fly_player = 0;
     }
     if (fly && !g_fly_player) {
         uint32_t allow = mem_read32(player + 0x358);
         if (allow >= 0x80000000u && allow < (guest_ram_end() - 0x30u)) {
+            g_fly_allow_entry = allow;
             g_fly_saved_allow = mem_read32(allow + 0x1C);
+            g_fly_saved_flags = mem_read32(player + 0x1C);
+            g_fly_saved_active = mem_read32(player + 0x35C);
             mem_write32(allow + 0x1C, 1);
             mem_write32(player + 0x35C, 1);
             mem_write32(player + 0x1C, mem_read32(player + 0x1C) | 0xC000u);
             g_fly_player = player;
         }
     }
-    g_flying = g_fly_player != 0;
-    g_cheats_on = allowed && ((bits & 31) || speed != 1.0f || jump != 1.0f || damage != 1.0f);
+    // The render thread samples input while the guest flip temporarily lifts
+    // overrides for checkpoints. Keep its L/R mapping stable across that lift.
+    if(!lift) {
+        g_flying = g_fly_player != 0;
+        g_cheats_on = allowed && ((bits & 31) || speed != 1.0f || jump != 1.0f || damage != 1.0f);
+    }
 }
 
 void hle_unlocked(PPCContext& ctx) {
@@ -2048,7 +2073,7 @@ void hle_player_cheats(PPCContext& ctx) {
 }
 
 void hle_damage(PPCContext& ctx) {
-    if (((g_cheat_bits.load() & 1) && cheat_mode_allowed()) || ((cheat_mode_allowed() || g_authoritative_gameplay) && !replica_simulation() && mod_current_options().god)) {
+    if (((g_cheat_bits.load() & 1) && !g_netplay_active && cheat_mode_allowed()) || ((cheat_mode_allowed() || g_authoritative_gameplay) && !replica_simulation() && mod_current_options().god)) {
         ctx.ps0[1] = ctx.ps1[1] = u2f(mem_read32(ctx.r[3] + 0xCC));
         return;
     }
@@ -2518,7 +2543,9 @@ void install_sdk_hooks() {
     sdk_hooks_ready=true;
 }
 
+void set_cheat_host(bool enabled) {g_cheat_host=enabled;}
 void set_cheats(const Cheats& c) {
+    g_cheat_host = c.authoritative_host;
     g_cheat_bits = uint32_t(c.invulnerable) | uint32_t(c.infinite_ammo) << 1 | uint32_t(c.all_weapons) << 2 |
                    uint32_t(c.unlock_all) << 3 | uint32_t(c.fly) << 4;
     g_cheat_speed = std::clamp(c.speed, 0.5f, 3.0f);

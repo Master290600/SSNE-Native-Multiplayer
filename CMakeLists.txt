@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(SSNERecomp LANGUAGES C CXX)
-set(SSNE_VERSION "1.2.7.203")  # release version (the launcher's self-update compares it with the latest GitHub release)
+set(SSNE_VERSION "1.2.7.204")  # release version (the launcher's self-update compares it with the latest GitHub release)
 
 set(SSNE_UPDATE_REPOSITORY "Master290600/SSNE-Native-Multiplayer" CACHE STRING "GitHub owner/repository for launcher releases")
 if(NOT SSNE_UPDATE_REPOSITORY MATCHES "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")

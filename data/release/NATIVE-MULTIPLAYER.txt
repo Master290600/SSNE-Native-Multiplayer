@@ -1,4 +1,4 @@
-SSNE-Native – normaler Launcher mit integriertem Multiplayer (Build 203)
+SSNE-Native – normaler Launcher mit integriertem Multiplayer (Build 204)
 
 Start: SSNE-Native.exe
 Die vorhandene Spielruntime benoetigt einen Installationspfad ohne Umlaute
@@ -57,7 +57,7 @@ Spiel. Jeder Spieler benötigt sein eigenes Disc-Image und erstellt das Spiel
 über den Launcher selbst. game_data, persönliche Spielstände und die erzeugten
 Spiel-EXE-Dateien gehören nicht in ein weitergegebenes Paket.
 
-Runtime: Build 203, Protokoll 63. Launcher-Paket: Version 1.2.7.203.
+Runtime: Build 204, Protokoll 63. Launcher-Paket: Version 1.2.7.204.
 Die Integration ändert die Start-/Erstellen-Abläufe; sie ist keine erneute
 Abnahme der gesamten Koop-Kampagne.
 
@@ -72,3 +72,9 @@ Neue Faktoren wirken auf kuenftige Spawns/Pickups. Eigene Optionen bleiben gespe
 Sprache umstellen: F12 > Sprache fuer Spiel und Menues.
 F12 wechselt sofort; die originalen PAL-Spielmenues uebernehmen die Auswahl
 nach einem Neustart. Automatisch verwendet die bisherige Spielsprache.
+
+Build204: F12-Cheats sind nun fuer den Host verfuegbar. Unverwundbarkeit,
+Munition und Waffen gelten fuer die Gruppe und bleiben mit Insert synchron.
+Fliegen betrifft den Host: Springen steigt, Feuer sinkt. Im Fahrzeug pausiert
+der Flugmodus. Bewegung/Sprunghoehe gelten fuer die Gruppe; Schaden fuer den Host.
+Clients koennen diese Host-Einstellungen ansehen, aber nicht aendern.

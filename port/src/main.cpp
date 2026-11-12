@@ -1156,8 +1156,8 @@ void update_input(float dt) {
         ssne::PadState ps = to_pad(players[p]);
         if (p == 0) apply_autopress(ps);
         // Flying (cheat): the game's debug flight goes down with L (jump) and up with R (fire); swapped, so jump
-        // flies up and fire down (cheats are single player only: port 0).
-        if (p == 0 && ssne::cheat_flying()) {
+        // flies up and fire down (single player or the authoritative host: port 0).
+        if (p == std::clamp(g_set.kbm_player-1,0,3) && ssne::cheat_flying()) {
             std::swap(ps.trigger_l, ps.trigger_r);
             uint16_t lr = ps.buttons & (ssne::PAD_L | ssne::PAD_R);
             ps.buttons &= uint16_t(~(ssne::PAD_L | ssne::PAD_R));
@@ -1623,9 +1623,11 @@ void apply_settings(SDL_Window* win) {
     if(getenv("SSNE_TEST_HIDDEN")){g_set.fullscreen=false;g_set.display=-1;}
     {
         ssne::Cheats c;
-        c.invulnerable = g_set.cheat_invulnerable;
-        c.infinite_ammo = g_set.cheat_infinite_ammo;
-        c.all_weapons = g_set.cheat_all_weapons;
+        // Host party-wide switches have one owner, shared with the Insert menu.
+        c.invulnerable = !network_game() && g_set.cheat_invulnerable;
+        c.infinite_ammo = !network_game() && g_set.cheat_infinite_ammo;
+        c.all_weapons = !network_game() && g_set.cheat_all_weapons;
+        c.authoritative_host = g_coop_host;
         c.unlock_all = g_set.cheat_unlock_all;
         c.speed = g_set.cheat_speed / 100.0f;
         c.fly = g_set.cheat_fly;
@@ -2214,8 +2216,18 @@ int main(int argc, char** argv) {
                 mi.displays.push_back(std::string(n ? n : "Display") + "  (" + std::to_string(m.w) + "x" + std::to_string(m.h) + ")");
             }
             fill_state_slots(mi);
+            if(mi.network) {
+                const auto shared=ssne::mod_current_options();
+                g_set.cheat_invulnerable=shared.god;g_set.cheat_infinite_ammo=shared.ammo;g_set.cheat_all_weapons=shared.weapons;
+            }
+            const std::array<bool,3> shared_before{g_set.cheat_invulnerable,g_set.cheat_infinite_ammo,g_set.cheat_all_weapons};
             bool was_open = port::menu_open();
             changed |= port::draw_menu(g_set, mi);
+            if(mi.network_host && shared_before!=std::array<bool,3>{g_set.cheat_invulnerable,g_set.cheat_infinite_ammo,g_set.cheat_all_weapons}) {
+                auto shared=ssne::mod_current_options();
+                shared.god=g_set.cheat_invulnerable;shared.ammo=g_set.cheat_infinite_ammo;shared.weapons=g_set.cheat_all_weapons;
+                apply_menu_mods(shared);
+            }
             crosshair_reload|=port::menu_take_crosshair_reload();
             if (port::menu_take_exit_request()) quit = true;
             { int slot; bool save; if (port::menu_take_state_request(slot, save)) request_state(save, slot); }

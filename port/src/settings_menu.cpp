@@ -56,6 +56,7 @@ void write_crosshair_ui_trace(const Settings& settings) {
     std::ostringstream out;auto rect=[&](ImVec2 a,ImVec2 b){out<<'['<<a.x<<','<<a.y<<','<<b.x<<','<<b.y<<']';};
     out<<"{\"menu_open\":"<<(g_open?"true":"false")<<",\"frame\":"<<ImGui::GetFrameCount()<<",\"window\":";rect(g_crosshair_ui_window_a,g_crosshair_ui_window_b);
     out<<",\"clip\":";rect(g_crosshair_ui_clip_a,g_crosshair_ui_clip_b);
+    out<<",\"cheats\":{\"god\":"<<settings.cheat_invulnerable<<",\"ammo\":"<<settings.cheat_infinite_ammo<<",\"weapons\":"<<settings.cheat_all_weapons<<",\"fly\":"<<settings.cheat_fly<<",\"flying\":"<<ssne::cheat_flying()<<"}";
     out<<",\"language\":"<<menu_ui::current_language<<",\"language_preference\":"<<settings.game_language<<",\"enabled\":"<<(settings.crosshair_enabled?"true":"false")<<",\"file\":"<<trace_json_string(settings.crosshair_file)<<",\"size\":"<<settings.crosshair_size<<",\"opacity\":"<<settings.crosshair_opacity<<",\"native_color\":"<<(settings.crosshair_native_color?"true":"false")<<",\"widgets\":[";
     bool comma=false;for(const auto& w:g_crosshair_ui_widgets){if(comma)out<<',';comma=true;out<<"{\"id\":"<<trace_json_string(w.id)<<",\"rect\":";rect(w.a,w.b);out<<",\"clip\":";rect(w.clip_a,w.clip_b);out<<",\"visible\":"<<(w.visible?"true":"false")<<",\"enabled\":"<<(w.enabled?"true":"false")<<'}';}out<<"]}";
     std::ofstream file("crosshair-ui-state.json.pending",std::ios::binary|std::ios::trunc);file<<out.str();file.close();
@@ -476,18 +477,22 @@ bool tab_cheats(Settings& s, const MenuInfo& info) {
     bool ch = false;
     menu_ui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "Cheats are highly experimental and not fully tested: they can break the game (levels, scripts,");
     menu_ui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "progress). They will stay that way: the game is meant to be played without them. Use at your own risk.");
-    menu_ui::TextColored(kDim, "For single player only: they are off in co-op and the other multiplayer modes.");
+    menu_ui::TextColored(kDim, info.network ? (info.network_host ? "Host controls: invulnerability, ammo, weapons and movement apply to the party; flying and damage affect the host." : "Only the host can change gameplay cheats.") : "Cheats apply to the current single-player game.");
     menu_ui::TextColored(kDim, "They work at once, also in a running level, and \"cheats\" shows in the info bar while one is on.");
-    if (info.network) menu_ui::TextColored(kDim,"Shared cheats and spawns are controlled by the host in the mod menu (Insert).");
+    if (info.network) menu_ui::TextColored(kDim,"Shared switches stay synchronized with the mod menu (Insert).");
     else if (!info.cheats_available)
         menu_ui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "Cheat hooks are unavailable for this disc revision.");
-    ImGui::BeginDisabled(info.network || !info.cheats_available);
+    const bool cheats_enabled=(!info.network || info.network_host) && info.cheats_available;
+    ImGui::BeginDisabled(!cheats_enabled);
     menu_ui::SeparatorText("Player");
     ch |= menu_ui::Checkbox("Invulnerable", &s.cheat_invulnerable);
+    trace_crosshair_widget("cheat_god",cheats_enabled);
     help("Nothing hurts Sam: health and armor stay where they are (enemies, falls, lava, drowning).");
     ch |= menu_ui::Checkbox("Infinite ammo", &s.cheat_infinite_ammo);
+    trace_crosshair_widget("cheat_ammo",cheats_enabled);
     help("Every weapon fires without using ammo (fills the ammo once when turned on).");
     ch |= menu_ui::Checkbox("All weapons", &s.cheat_all_weapons);
+    trace_crosshair_widget("cheat_weapons",cheats_enabled);
     help("Every weapon, with full ammo for all of them (filled when turned on and at each level start).");
     ImGui::SetNextItemWidth(300);
     ch |= menu_ui::SliderInt("Movement speed", &s.cheat_speed, 100, 300, "%d%%");
@@ -496,6 +501,7 @@ bool tab_cheats(Settings& s, const MenuInfo& info) {
     ch |= menu_ui::SliderInt("Jump height", &s.cheat_jump, 100, 500, "%d%%");
     help("How high Sam jumps. 100% is the game's own height.");
     ch |= menu_ui::Checkbox("Flying", &s.cheat_fly);
+    trace_crosshair_widget("cheat_fly",cheats_enabled);
     help("The game's own debug flight: no gravity, and Sam passes through walls and floors (it's easy to\n"
          "leave the level: turn it off above solid ground). Move and look as usual; hold jump to fly up and\n"
          "fire to fly down.");
@@ -505,11 +511,13 @@ bool tab_cheats(Settings& s, const MenuInfo& info) {
     help("How much damage Sam's weapons do. 100% is the game's own damage.");
     menu_ui::SeparatorText("Game");
     ch |= menu_ui::Checkbox("Unlock everything", &s.cheat_unlock_all);
+    trace_crosshair_widget("cheat_unlock",cheats_enabled);
     help("The 10 lost levels, the gallery and the game's own treasure cheats, as if all the treasure had\n"
          "been collected. Nothing is written to the memory card: turned off, they are locked again.");
-    ImGui::EndDisabled();
     ImGui::Spacing();
     if (menu_ui::Button("Turn all cheats off")) { s.reset_cheats(); ch = true; }
+    trace_crosshair_widget("cheat_off",cheats_enabled);
+    ImGui::EndDisabled();
     ImGui::PopTextWrapPos();
     return ch;
 }
@@ -745,7 +753,9 @@ bool draw_menu(Settings& s, const MenuInfo& info) {
         if (menu_ui::BeginTabItem("Keyboard & Mouse", nullptr, g_select_tab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##k"); ch |= tab_keyboard(s); ImGui::EndChild(); ImGui::EndTabItem(); }
         if (menu_ui::BeginTabItem("Gamepad", nullptr, g_select_tab == 3 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##p"); ch |= tab_gamepad(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
         if (menu_ui::BeginTabItem("Players", nullptr, g_select_tab == 6 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##pl"); ch |= tab_players(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
-        if (menu_ui::BeginTabItem("Cheats", nullptr, g_select_tab == 7 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##c"); ch |= tab_cheats(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
+        const bool cheats_tab=menu_ui::BeginTabItem("Cheats", nullptr, g_select_tab == 7 ? ImGuiTabItemFlags_SetSelected : 0);
+        trace_crosshair_widget("tab_cheats");
+        if (cheats_tab) { ImGui::BeginChild("##c"); ch |= tab_cheats(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
         if (menu_ui::BeginTabItem("Save states", nullptr, g_select_tab == 5 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##s"); ch |= tab_states(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
         if (menu_ui::BeginTabItem("Hotkeys", nullptr, g_select_tab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##h"); tab_hotkeys(); ImGui::EndChild(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();

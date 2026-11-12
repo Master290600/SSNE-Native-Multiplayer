@@ -15,7 +15,7 @@ game locally from your own supported GameCube disc image.
    downloaded automatically from its official, checksum-pinned release. No Python
    installation or separate multiplayer CMD is required for players.
 5. In the original game menu choose **Mehrspieler / Multiplayer** to host or join.
-   Both players need the same runtime build. The current package uses **build 203,
+   Both players need the same runtime build. The current package uses **build 204,
    protocol 63**.
 
 The release contains the launcher, tools, native runtime/build kit, patch recipe,
@@ -24,7 +24,7 @@ translations, built game executables and personal saves are created locally.
 
 This is an experimental multiplayer build. Component tests and focused host/client
 checks do not certify every campaign level or every network condition. See
-[release notes](docs/RELEASE-NOTES-203.md) for the tested scope and limitations.
+[release notes](docs/RELEASE-NOTES-204.md) for the tested scope and limitations.
 
 Use **F12 > Game and menu language** to choose English, German or French.
 F12 changes immediately; the original PAL game menus apply the choice after
@@ -188,10 +188,12 @@ F12 â€º Gamepad has a "GameCube layout" button, rumble settings and the on-s
 - **Widescreen** (16:9 / 21:9 / automatic, which follows the window's shape; F8) applies in gameplay; menus (also pause, NETRICSA and briefings) and cutscenes
   stay 4:3, because the game places 3D models into 2D menu layouts. A blurred copy of the picture fills the sides
   (F12 â€º Graphics â€º Fill the sides of 4:3 screens). The HUD moves out to the screen edges (F12 â€º Graphics).
-- **Cheats** (single player, F12 â€º Cheats; experimental, they can break the game): invulnerable, infinite ammo, all
+- **Cheats** (single player or multiplayer host, F12 â€º Cheats; experimental, they can break the game): invulnerable, infinite ammo, all
   weapons with full ammo, faster movement (up to 300%), higher jumps (up to 500%), flying, more weapon damage (up to
   1000%) and unlock everything (the 10 lost levels, the gallery and the game's treasure cheats, without
   collecting the treasure; nothing is written to the memory card). They work at once, also in a running level.
+  Hosts control shared invulnerability, ammo, weapons and movement. Flight and weapon damage affect the host;
+  clients can view these settings. Jump raises the flying player; fire lowers them.
 - **Local multiplayer** (split screen for 2-4 players): plug in a controller per player and choose MultiPlayer;
   every player presses A to join. Co-operative is for 2 players, Deathmatch, Hold the Flag and Pass the Bomb for up
   to 4. F12 â€º Players sets who plays which player (keyboard & mouse, controllers 1-4) and how two players share the

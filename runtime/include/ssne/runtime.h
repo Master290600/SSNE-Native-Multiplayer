@@ -148,8 +148,10 @@ double game_time();               // seconds of frame time the game has advanced
 struct Cheats {
     bool invulnerable = false, infinite_ammo = false, all_weapons = false, unlock_all = false, fly = false;
     float speed = 1, jump = 1, damage = 1;  // movement speed, jump height and weapon damage factors
+    bool authoritative_host = false;  // local movement/damage only; shared cheats use ModOptions
 };
 void set_cheats(const Cheats& c);
+void set_cheat_host(bool enabled);  // session role changes, before the next guest update
 bool cheats_available();  // the game's cheat code was found (USA Rev 1)
 bool cheats_active();     // a cheat is in effect right now
 bool cheat_flying();      // flying: the game flies down with L (jump) and up with R (fire)
