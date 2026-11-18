@@ -1,4 +1,4 @@
-# SSNE-RECOOP-Native
+# SSNE-RECOOP-Native IT ONLY WORKS WITH EU/PAL VERSION RIGHT NOW! Supports ENGLISH/GERMAN/FRANCE LANGUAGE
 
 Unofficial Windows native port of **Serious Sam: Next Encounter** with integrated
 multiplayer. Based on Silly ReEncounter and SSNE-Native. The launcher builds the
