@@ -1,8 +1,11 @@
 #pragma once
 #include "world_state.h"
+#include "chat.h"
+#include "tactical_ping.h"
 #include "native_event_journal.h"
 #include "client_presentation.h"
 #include "lan_discovery.h"
+#include "custom_map_transfer.h"
 #include "ssne/input.h"
 #include <memory>
 #include <functional>
@@ -22,6 +25,7 @@ struct PlayerControl {
     bool ready=false,afk=false;
     uint64_t sequence=0;
     ControlInput input;
+    bool spectator=false; // effective voluntary or server-forced round lock
 };
 struct ConnectionEvent { enum class Kind { Joined,Left }; Kind kind; PlayerId player; };
 struct LobbySkinChoice {PlayerId player{};uint8_t model=255;};
@@ -35,6 +39,15 @@ struct NetworkStatus {
     unsigned ping_ms=0;
     std::string message;
 };
+// One coherent guest-thread query. TCP sockets count from accept through close,
+// including unassigned/rejected peers; local host and in-process bots do not.
+struct HostPublicationDemand {
+    unsigned tcp_peers=0;
+    uint64_t serial=0;
+    bool all_ready=false;
+    PlayerId host{};
+    std::array<PlayerId,max_players> owners{};
+};
 class AuthoritativeServer {
 public:
     class PreparedResume {
@@ -47,6 +60,9 @@ public:
     ~AuthoritativeServer();
     bool start(uint16_t port,const std::string& pin,uint64_t fingerprint,const std::string& host_name="Host",unsigned skin=255);
     std::string lan_session_id() const;
+    // Password-protected hosts keep discovery visible but issue no automatic
+    // LAN access tokens. Disabling also revokes previously issued tokens.
+    void set_lan_join_enabled(bool);
     LanJoinGrant issue_lan_join_ticket(const std::string& peer,uint32_t nonce,uint32_t lifetime_ms=60000);
     std::array<LobbySkinChoice,max_players> requested_skins() const;
     bool set_match_player_limit(unsigned);
@@ -55,15 +71,37 @@ public:
     uint8_t bot_mask() const;
     unsigned bot_skill(unsigned slot) const;
     NetworkStatus status() const;
+    HostPublicationDemand publication_demand() const;
     std::shared_ptr<const WorldState> latest_world() const;
+    // Call from an I/O job after validating payload hashes. Network scheduling
+    // retains this immutable offer; no disk access occurs on simulation threads.
+    bool set_custom_map_package(uint64_t epoch,std::shared_ptr<const CustomMapPackage>,std::string& error);
+    void clear_custom_map_package();
+    void fail_custom_map_package(uint64_t epoch,const std::string& alias,const std::string& error);
+    bool send_chat(const std::string& text);
+    std::vector<ChatMessage> chat_messages() const;
+    bool send_ping(const TacticalPingRequest&);
+    // Guest-safe local host view only; never accepted through a wire message.
+    // The idle host has no reason to publish an entire world just for a marker.
+    bool send_ping(const TacticalPingRequest&,const WorldState& current_local_view);
+    bool update_local_ping_view(const WorldState& current_local_view);
+    std::vector<TacticalPing> pings() const;
+    std::array<PlayerLatency,max_players> player_latencies() const;
     void lobby_ready(bool);
+    // Confirmed map/mode/rule changes invalidate human confirmations. Bots
+    // remain ready; delayed requests carry the previous opaque lobby token.
+    void reset_lobby_readiness();
     bool begin_lobby_game();
+    // Roll back only a failed menu-side bind/queue before loading begins.
+    bool cancel_lobby_game();
     std::vector<ConnectionEvent> take_events();
     // Loading/result screens release character bindings and input readiness atomically.
     bool publish(WorldState world,std::string& error,bool loading=false,std::span<const WorldState> native_batches={});
     bool attach_character(PlayerId,EntityId);
     bool ready_host();
-    std::array<PlayerControl,max_players> take_controls();
+    // Optional local-host AFK menu snapshot, captured before pressed edges
+    // drain under the same lock. Ordinary/remote gameplay sanitation is unchanged.
+    std::array<PlayerControl,max_players> take_controls(ControlInput* host_ui=nullptr);
     std::array<Participant,max_players> participants() const;
     // Keep this guest-thread lease alive over the whole runtime transaction.
     // It freezes membership, commands and votes while nested calls remain legal.
@@ -80,6 +118,15 @@ public:
     CommandResult host_afk(uint64_t sequence,bool);
     CommandResult host_skip(uint64_t sequence,uint64_t cutscene);
     void submit_host_input(ControlInput);
+    // Bots are not a replacement for another connected human when the host
+    // voluntarily leaves gameplay. Forced round elimination is independent.
+    bool host_spectator_available()const;
+    CommandResult host_spectator(uint64_t sequence,bool spectator);
+    // Authority guest-thread rollback after a checked native watch activation fails.
+    // Preserves command sequence floors. Forced round elimination is never canceled.
+    bool cancel_spectator_activation(PlayerId);
+    bool set_spectator_lock(uint8_t mask);
+    uint8_t voluntary_spectator_mask()const;
     void disconnect(PlayerId);
     void stop();
 private:
@@ -96,8 +143,17 @@ public:
     AuthoritativeClient();~AuthoritativeClient();
     bool start(const std::string& address,uint16_t port,const std::string& pin,uint64_t fingerprint,const std::string& name,unsigned skin=255);
     bool start_lan(const std::string& address,uint16_t port,const std::string& ticket,uint64_t fingerprint,const std::string& name,unsigned skin=255);
+    bool request_custom_map(const CustomMapRequest&,std::string& error);
+    CustomMapTransferStatus custom_map_transfer_status() const;
+    std::optional<CustomMapDownload> take_custom_map_package();
+    void cancel_custom_map(const std::string& reason={});
     NetworkStatus status() const;
     std::shared_ptr<const WorldState> latest_world() const;
+    bool send_chat(const std::string& text);
+    std::vector<ChatMessage> chat_messages() const;
+    bool send_ping(const TacticalPingRequest&);
+    std::vector<TacticalPing> pings() const;
+    std::array<PlayerLatency,max_players> player_latencies() const;
     WorldSample world_sample() const;
     std::vector<WorldSample> motion_samples(uint64_t after,uint64_t through) const;
     PredictedLook predicted_look(uint64_t epoch,uint64_t confirmed_input);
@@ -106,6 +162,7 @@ public:
     void lobby_ready(bool);
     void submit_input(ControlInput);
     void set_afk(bool);
+    void set_spectator(bool);
     void vote_skip(uint64_t cutscene);
     void request_snapshot();
     void acknowledge_native_events(uint64_t epoch,const NativeEventCursors& consumed);

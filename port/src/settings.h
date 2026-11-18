@@ -37,6 +37,11 @@ constexpr int kFirstButtonAction = ACT_A;  // gamepad bindings exist for ACT_A..
 const char* action_name(int a);   // "Move forward", "A (jump / select)", ...
 const char* action_id(int a);     // ini key suffix: "move_up", "a", ...
 
+// Local multiplayer shortcuts are separate from emulated GameCube controls.
+enum MultiplayerAction : int { MP_CHAT, MP_PING, MP_ROSTER, MP_AFK, MP_COUNT };
+const char* multiplayer_action_name(int a);
+const char* multiplayer_action_id(int a);
+
 // Lowest frame rate limit: below 40 fps the game's ground checks can report a hurting surface under the player,
 // who then takes extra damage (the original game's collision at that frame time).
 constexpr int kMinFpsLimit = 40;
@@ -78,6 +83,9 @@ struct Settings {
     // Keyboard / mouse
     static constexpr int kKbSlots = 3;  // bindings per control
     Bind kb[ACT_COUNT][kKbSlots];
+    static constexpr int kMpSlots = 2;
+    Bind multiplayer[MP_COUNT][kMpSlots];  // keyboard or mouse buttons; roster is held
+    bool team_hud = false;                // compact teammate health, armor and distance
     bool mouse_look = true;        // captured mouse turns the view
     bool mouse_aim = true;         // direct 1:1 aim in gameplay (off: the mouse emulates the C-stick)
     float mouse_sens = 1.0f;
@@ -119,6 +127,7 @@ struct Settings {
     void graphics_preset(int level);
     void reset_audio();
     void reset_keyboard();
+    void reset_multiplayer();             // T chat, G / middle mouse ping, H roster; AFK unbound
     void reset_gamepad();                // Xbox layout + default stick/trigger/rumble settings
     void pad_preset_xbox();              // A jump (L), X use (A), B back, Y Z, LB/RB weapons (Y/X), RT fire (R)
     void pad_preset_gamecube();          // same buttons as the GameCube controller: A = A, LT jump (L), RT fire (R)
@@ -133,5 +142,12 @@ bool save_settings(const Settings& s, const std::string& path);
 std::string bind_name(const Bind& b);   // "Space", "Mouse Left", "Pad A", "Pad Right Trigger", "-" for none
 std::string bind_to_string(const Bind& b);  // ini form: "key:Space", "mouse:1", "button:a", "axis:righttrigger"
 Bind bind_from_string(const std::string& s);
+
+enum class MultiplayerBindConflict { None, Unsupported, Reserved, Gameplay, Multiplayer };
+bool valid_multiplayer_bind(const Bind& b);
+bool multiplayer_bind_in_use(const Settings& s, const Bind& b);
+MultiplayerBindConflict multiplayer_bind_conflict(const Settings& s, int action, int slot, const Bind& b);
+// Rejected assignments leave every binding unchanged.
+bool assign_multiplayer_bind(Settings& s, int action, int slot, const Bind& b);
 
 } // namespace port

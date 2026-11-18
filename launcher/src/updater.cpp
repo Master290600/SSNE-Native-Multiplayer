@@ -36,10 +36,10 @@ std::string S(const fs::path& p) {
 const char* kLatestUrl = "https://api.github.com/repos/" SSNE_UPDATE_REPOSITORY "/releases/latest";
 #ifdef _WIN32
 const char* kAssetSuffix = "-Windows-x64.zip";
-const char* kLauncherName = "SSNE-Native.exe";
+const char* kLauncherName = "SSNE-RECOOP-Native.exe";
 #else
 const char* kAssetSuffix = "-Linux-x86_64.tar.gz";
-const char* kLauncherName = "SSNE-Native";
+const char* kLauncherName = "SSNE-RECOOP-Native";
 #endif
 const char* kLeftovers = "update-leftovers.txt";
 
@@ -168,7 +168,7 @@ bool install(const Release& r, const std::string& base_dir,
     if (ec) { error = "cannot create " + S(dir) + ": " + ec.message(); return false; }
     fs::path pkg = dir / P(r.asset_name), part = pkg;
     part += ".part";
-    std::string label = "Downloading SSNE-Native " + r.version;
+    std::string label = "Downloading SSNE-RECOOP-Native " + r.version;
     if (!platform::download(r.asset_url, S(part), [&](uint64_t d, uint64_t t) {
             char buf[64];
             snprintf(buf, sizeof(buf), "  %.1f MB", d / 1048576.0);
@@ -194,7 +194,7 @@ bool install(const Release& r, const std::string& base_dir,
         if (code != 0) { error = "unpacking failed (tar exit " + std::to_string(code) + ")"; return false; }
     }
 #endif
-    // The package has one top folder (SSNE-Native-<version>-<os>/).
+    // The package has one top folder (SSNE-RECOOP-Native-<version>-<os>/).
     fs::path root = files;
     {
         int n = 0;

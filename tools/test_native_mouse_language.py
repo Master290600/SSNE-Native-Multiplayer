@@ -65,7 +65,7 @@ def continue_original_boot(p):
   p.m.delay(.1)
  p.report['boot_pointer_continue_attempts']=attempts;p.report['title_pointer_actions']=title_actions
  p.report['title_pointer_continue_supported']=True if title_actions else None
- p.report['title_pointer_scope']='This language case requires actual Main and native language/localized Multiplayer Home. A brief observed scene2 is not assumed to be an interactive Title; accepted presentation actions are recorded separately, and reaching Main without one carries no Title mouse-support claim. No keyboard fallback or forced scene is used.'
+ p.report['title_pointer_scope']='This language case requires actual Main and native language/localized Online Home. A brief observed scene2 is not assumed to be an interactive Title; accepted presentation actions are recorded separately, and reaching Main without one carries no Title mouse-support claim. No keyboard fallback or forced scene is used.'
 
 
 def main():
@@ -89,13 +89,14 @@ def main():
   continue_original_boot(p);m.delay(.5);m.press('host','UISHOT');assert m.state().get('language')==a.language
   report['main_root']=m.state().get('native_root');report['main_language']=m.state().get('language');assert report['main_root']==0x3d
   inventory=original_inventory(a.data,a.language);report['main_multiplayer_label_expected']=inventory['widgets'][0x3f].get('label')
-  p.click(0x3f,root=0x3d);m.wait(lambda:m.state().get('page')==1,15);m.delay(.4);m.press('host','UISHOT')
+  report['main_online_label_expected']=('Online','Online','En ligne')[a.language]
+  p.click(0x15c,root=0x3d);m.wait(lambda:m.state().get('page')==1,15);m.delay(.4);m.press('host','UISHOT')
   assert m.state().get('language')==a.language
   assert '[native-network-menu] page=1 language='+str(a.language) in m.log('host')
   report['mp_home_page']=m.state()['page'];report['mp_home_language']=m.state()['language'];report['localization_proof_scope']='Original selected native language, original resource/source path and native Main/Home screenshots; no OCR claim.'
   card=a.output/'host/card.raw';report['fresh_card_created']=card.exists() and card.stat().st_size>0 and '[exi] created memory card A:' in (a.output/'host/console.log').read_text(encoding='utf8',errors='replace')
   assert report['fresh_card_created'],'Original EXI did not create a new formatted private card'
-  p.click(0x14d);p.expect_root(0x3d);report['passed']=True
+  p.back();p.expect_root(0x3d);report['passed']=True
  except Exception:
   report['error']=traceback.format_exc();print(report['error'],flush=True)
   if m.processes.get('host') and m.processes['host'].poll() is None:

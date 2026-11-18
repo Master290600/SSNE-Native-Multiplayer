@@ -92,7 +92,7 @@ hardware with native code, mostly at the **SDK-function level** (HLE) instead of
 - [x] Launcher: native **RVZ / WIA / GCZ / CISO** support with built-in decoders (zstd, LZMA, LZMA2, bzip2, zlib,
       purge; RVZ junk-data regeneration), so users don't need to convert
 - [x] Public release model: players build the game on their own PC. The launcher downloads LLVM-MinGW from its
-      official release, runs ssne-recomp on their main.dol, compiles and links with the prebuilt port (build kit).
+      official release, runs SSNE-RECOOP-Native on their main.dol, compiles and links with the prebuilt port (build kit).
       Verified on Linux with the cross toolchain: the result matches the private build (same .text size).
       Project code released into the public domain (Unlicense)
 - [x] PAL (G3BP9G, FINAL.113): symbol map derived by function matching, per-version hook addresses, launcher/kit

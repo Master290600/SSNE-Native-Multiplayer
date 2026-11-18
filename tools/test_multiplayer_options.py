@@ -20,28 +20,33 @@ def main():
  report={'passed':False,'steps':[]};m=MultiplayerMenus(a,'',a.output/'peers');p=Pointer(m,report)
  protected={key:sha(path) for key,path in {'card':a.card,'exe':a.exe,'dol':a.data/'sys/main.dol'}.items()}
  def options(role):p.click(0x155,role,root=0x148);page(p,9,role)
- def name(role,value):
-  p.click(0x14a,role,root=0x148);m.wait(lambda:m.state(role).get('editing')==4,10)
-  m.command(role,'text '+value);m.command(role,'key 1');m.wait(lambda:m.state(role).get('editing')==0,10)
+ def setup_names(role,value,host_name=None):
+  p.click(0x14c,role,root=0x148);page(p,14,role)
+  for widget,editing,text in [(0x163,4,value)]+([(0x164,6,host_name)] if host_name is not None else []):
+   p.click(widget,role,root=0x148);m.wait(lambda:m.state(role).get('editing')==editing,10)
+   m.command(role,'text '+text);m.command(role,'key 1');m.wait(lambda:m.state(role).get('editing')==0,10)
   assert m.state(role)['name_bytes']==len(value.encode('latin1'))
- def back(role):p.click(0x155,role,root=0x148);page(p,1,role)
+  saved=(m.folder/role/'settings.ini.multiplayer').read_text(encoding='latin1')
+  assert saved.startswith('SSNE-MP-2\n') and '"'+value+'"' in saved
+  if host_name is not None:assert '"'+host_name+'"' in saved
+  p.back(role);page(p,1,role)
+ def host_rules():
+  p.back();p.expect_root(0x3d);host_create(p)
+  p.click(0x154,root=0x9a);page(p,15)
  try:
   m.start_role('host',a.language);m.wait(lambda:m.mouse().get('surfaces') and m.mouse_ack().get('image_rect'),20)
-  p.command('host','cancel');p.click(0x3f,root=0x3d);page(p,1);options('host');name('host','Joerg Host')
+  p.command('host','cancel');p.click(0x15c,root=0x3d);page(p,1);setup_names('host','Joerg Host','Joerg Coop');host_rules()
   # Cycle every factor, not just the two end points. Capacity keeps native max last.
-  for widget,key,expected in ((0x14b,'enemy_factor',[2,3,4,5]),(0x14c,'ammo_capacity',[1,3,4,5,2,0,1,3,4,5]),(0x14d,'pickup_factor',[2,3,4,5])):
+  for widget,key,expected in ((0x14a,'enemy_factor',[2,3,4,5]),(0x14b,'ammo_capacity',[1,3,4,5,2,0,1,3,4,5]),(0x14c,'pickup_factor',[2,3,4,5])):
    for value in expected:p.click(widget,root=0x148);m.wait(lambda:m.state().get(key)==value,5)
-  m.press('host','UISHOT');m.delay(.3);report['configured_host']=dict(m.state());back('host')
-  # Full keyboard route reaches the extra original footer button and returns.
-  p.move([.95,.05]);m.press('host','DOWN')
-  for _ in range(4):m.press('host','DOWN')
+  m.press('host','UISHOT');m.delay(.3);report['configured_host']=dict(m.state())
+  # Bots is between the last rule and the native Back footer.
+  p.move([.95,.05]);m.press('host','DOWN');m.press('host','DOWN')
   assert m.state()['focus']==4 and m.state()['native_focus']==0x155,m.state()
-  m.press('host','KEY_ENTER');page(p,9);m.press('host','START');page(p,1)
-  p.click(0x14d,root=0x148);m.wait(lambda:m.state().get('native_root')==0x3d,12)
-  host_create(p)
+  m.press('host','KEY_ENTER');wait_lobby(p)
   m.start_role('client',a.client_language);m.wait(lambda:m.mouse('client').get('surfaces') and m.mouse_ack('client').get('image_rect'),20)
-  p.command('client','cancel');p.click(0x3f,'client',root=0x3d);page(p,1,'client');options('client');name('client','Client Test');back('client')
-  p.click(0x14b,'client');page(p,3,'client');p.click(0x14d,'client');page(p,8,'client');m.wait(lambda:m.state('client').get('rooms')==1,20);p.click(0x14a,'client')
+  p.command('client','cancel');p.click(0x15c,'client',root=0x3d);page(p,1,'client');setup_names('client','Client Test')
+  p.click(0x14a,'client');page(p,3,'client');p.click(0x14b,'client');page(p,8,'client');m.wait(lambda:m.state('client').get('rooms')==1,20);p.click(0x14a,'client')
   m.wait(lambda:m.state('client').get('active') and m.state().get('players')==2,40);wait_lobby(p,'host');wait_lobby(p,'client')
   begin_campaign(p,exercise_neighbors=False)
   expected={'shared_enemies':5,'shared_capacity':5,'shared_pickups':5}
@@ -49,9 +54,10 @@ def main():
   report['replicated_rules']={r:{k:m.state(r).get(k) for k in expected} for r in ('host','client')}
   open_pause(p,'client');connection(p,'client');options('client');m.press('client','UISHOT');m.delay(.3)
   # All host rule controls and the active name field must be read-only on a client.
-  for widget in (0x14a,0x14b,0x14c,0x14d):
-   w=p.widget(widget,'client',root=0x148,allowed=False)
-   assert not w.get('allowed'),('Client can edit shared host rule',w)
+  w=p.widget(0x14a,'client',root=0x148,allowed=False)
+  assert not w.get('allowed'),('Active client can edit its locked name',w)
+  rules=[w for s in p.observe('client').get('surfaces',[]) for w in s.get('widgets',[]) if w.get('id') in (0x14b,0x14c,0x14d)]
+  assert not any(w.get('allowed') and w.get('selectable') for w in rules),('Client can edit shared host rules',rules)
   p.click(0x155,'client');page(p,7,'client');p.click(0x14a,'client');p.expect_root(0x129,'client');m.press('client','START')
   report['campaign_sample']={r:m.performance(r) for r in ('host','client')}
   report['host_player_sample']=[o for o in m.campaign().get('objects',[]) if o.get('kind')==0]

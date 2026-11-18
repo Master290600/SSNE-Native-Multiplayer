@@ -20,9 +20,11 @@
 
 #include "gx_gl.h"
 #include "gx_gpu_frame.h"
+#include "ssne/movie_presentation.h"
 #include "gx_view_overlay.h"
 #include "ssne/gx_gpu.h"
 #include "ssne/runtime.h"
+#include "ssne/performance_detail.h"
 
 namespace ssne::gl {
 #define SSNE_GL_DEFINE(ret, name, args) PFN_##name name = nullptr;
@@ -65,6 +67,11 @@ using gx::Texture;
 namespace {
 std::atomic<bool> g_player_views{false};
 bool g_frame_local_camera=false;
+// Diagnostic A/B reference: preserve the complete old binding path when requested.
+bool g_legacy_texture_bindings=[] {
+    const auto* mode=std::getenv("SSNE_GPU_TEXTURE_BINDINGS");
+    return mode && std::strcmp(mode,"legacy")==0;
+}();
 
 constexpr int EFB_W = gx::EFB_W, EFB_H = gx::EFB_H;
 
@@ -75,6 +82,7 @@ int g_scale = 2;
 // height of the 448-line image) h / 448 vertically and h / 480 horizontally: the GameCube's pixels aren't square
 // (640x448 fill a 4:3 screen), so each EFB pixel then maps to whole display pixels' worth in both directions.
 int g_native_h = 0;
+bool g_movie_frame = false;
 double g_sx = 2, g_sy = 2;
 float g_wide = 1.0f;  // widescreen: the EFB is rendered this much wider (anamorphic), the display stretches it back
 // EFB pixel coordinate -> internal framebuffer coordinate
@@ -83,6 +91,12 @@ inline int SY(int y) { return int(std::lround(double(y) * g_sy)); }
 void update_scale_factors() {
     if (g_native_h > 0) { g_sy = g_native_h / 448.0; g_sx = g_native_h / 480.0; }
     else g_sx = g_sy = g_scale;
+    // The source movie is 640 pixels wide. Keep headroom for the separate
+    // subtitle/UI pass without resolving an 8x world-sized EFB for every flip.
+    if (g_movie_frame && g_sy > 2.) {
+        g_sx *= 2. / g_sy;
+        g_sy = 2.;
+    }
 }
 std::string g_info;
 bool g_trace = getenv("SSNE_GPU_TRACE") != nullptr;
@@ -577,6 +591,34 @@ GLuint texture_for(const Texture* t) {
         g_phase = "draw";
         return out.tex;
     }
+    if (t->id & movie_presentation::streaming_texture_bit) {
+        // The GPU may still sample the preceding image when the next one
+        // arrives. Rotate storage and retain a frame ID for repeated draws.
+        struct MovieSlot { uint64_t id = 0; GLuint texture = 0; int w = 0, h = 0; };
+        static MovieSlot slots[3];
+        static unsigned next = 0;
+        for (const auto& slot : slots) if (slot.id == t->id) return slot.texture;
+        auto& slot = slots[next];
+        next = (next + 1) % 3;
+        if (!slot.texture) {
+            slot.texture = make_tex(t->w, t->h, RGBA8, RGBA, UNSIGNED_BYTE, t->rgba.data());
+        } else {
+            sc_active(0);
+            sc_texture(0, slot.texture);
+            PixelStorei(UNPACK_ALIGNMENT, 4);
+            if (slot.w == t->w && slot.h == t->h && TexSubImage2D)
+                TexSubImage2D(TEXTURE_2D, 0, 0, 0, t->w, t->h, RGBA, UNSIGNED_BYTE, t->rgba.data());
+            else {
+                TexImage2D(TEXTURE_2D, 0, GLint(RGBA8), t->w, t->h, 0, RGBA, UNSIGNED_BYTE, t->rgba.data());
+                TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, 0);
+            }
+        }
+        slot.w = t->w;
+        slot.h = t->h;
+        slot.id = t->id;
+        g_stats.uploads++;
+        return slot.texture;
+    }
     auto it = g_textures.find(t->id);
     if (it != g_textures.end()) { it->second.last_used = g_frame_no; return it->second.tex; }
     const char* prev_phase = g_phase;
@@ -626,6 +668,7 @@ struct UniformShadow {
 struct Program {
     GLuint prog = 0;
     bool pending = false;  // being compiled in the background (draws skipped meanwhile)
+    uint8_t used_texture_mask = 0;  // fixed by the same TEV/indirect inputs as the program key
     GLint u_vp0, u_vp1, u_efb, u_reg, u_konst, u_aref, u_stscale, u_calpha, u_zrange, u_fog, u_fogcolor;
     GLint u_indmtx, u_texsz, u_su;
     GLint u_tm, u_pm, u_mat, u_amb, u_lpos, u_ldir, u_lcol, u_latt, u_lmask;  // GPU vertex processing (-1 in mode 0)
@@ -1333,6 +1376,12 @@ GLuint start_link(const std::string& vs, const std::string& fs) {
 // meanwhile), or compiling now. Returns the program once it can be drawn with, else nullptr.
 Program* make_program(const std::string& key, const DrawCfg& c, int ntex, bool zsnap, const GpuVcfg& vc, bool async) {
     Program p;
+    for (int m = 0; m < 8; m++) {
+        bool used = false;
+        for (int s = 0; s < c.stages; s++) used |= c.st[s].tex_enabled && c.st[s].texmap == m;
+        for (int i = 0; i < c.nind; i++) used |= c.ind_map[i] == m;
+        if (used) p.used_texture_mask |= uint8_t(1u << m);
+    }
     const char* prev_phase = g_phase;
     g_phase = "compile shader";
     auto t0 = std::chrono::steady_clock::now();
@@ -1601,7 +1650,7 @@ void apply_state(const GpuState& st) {
     if (x1 < x0 || y1 < y0) sc_scissor(0, 0, 0, 0);
     else {
         int sx0 = SX(x0), sx1 = SX(x1 + 1);
-        if (st.local_ui && !g_frame_local_camera && g_wide > 1.001f && (x0 > 0 || x1 < EFB_W - 1)) {
+        if ((st.canvas_fitted || (st.local_ui && !g_frame_local_camera)) && g_wide > 1.001f && (x0 > 0 || x1 < EFB_W - 1)) {
             // Partial native menu clips follow the same centered 4:3 canvas
             // as their glyphs/widgets. Full-width clips still cover the background.
             const double offset = double(EFB_W) * .5 * (double(g_wide) - 1.);
@@ -1640,6 +1689,7 @@ double flat_plane_depth(const GpuFrame& f, const GpuCmd& cmd, const GpuState& st
 }
 
 void run_draw(const GpuFrame& f, const GpuCmd& cmd) {
+    perf::detail::Scope draw_scope(perf::detail::DriverDraw);
     const GpuState& st = f.states[cmd.state];
     const DrawCfg& c = st.cfg;
     int ntex = int(cmd.ntex);
@@ -1649,39 +1699,54 @@ void run_draw(const GpuFrame& f, const GpuCmd& cmd) {
     float zr[2];
     plane_depths(st, zr);
     double flat_z = cmd.zsnap && !always_fragdepth ? flat_plane_depth(f, cmd, st, zr) : -1;
-    Program* p = program_for(c, ntex, (cmd.zsnap && flat_z < 0) || always_fragdepth, st.vcfg);
-    if (!p) return;
-    // Textures first (reinterpretation passes change GL state).
-    GLuint tex[8];
-    for (int m = 0; m < 8; m++) {
-        bool used = false;
-        for (int s = 0; s < c.stages; s++) used |= c.st[s].tex_enabled && c.st[s].texmap == m;
-        for (int i = 0; i < c.nind; i++) used |= c.ind_map[i] == m;
-        tex[m] = used ? texture_for(c.tex[m]) : g_white;
+    Program* p;
+    {
+        perf::detail::Scope lookup_scope(perf::detail::ShaderLookup);
+        p = program_for(c, ntex, (cmd.zsnap && flat_z < 0) || always_fragdepth, st.vcfg);
     }
-    sc_program(p->prog);
-    apply_state(st);
-    for (int m = 0; m < 8; m++) {
-        sc_texture(m, tex[m]);
-        uint32_t ws = std::min<uint32_t>(c.wrap_s[m], 2), wt = std::min<uint32_t>(c.wrap_t[m], 2);
-        const Texture* tx = c.tex[m];
-        bool aniso_ok = g_aniso > 1 && tx && tx->efb_copy < 0 && !tx->mips.empty() && c.linear[m] &&
-                        (c.min_filter[m] == 5 || c.min_filter[m] == 6);
-        sc_sampler(m, sampler_for(c.min_filter[m], c.linear[m], ws, wt, aniso_ok ? g_aniso : 1));
+    if (!p) return;
+    {
+        perf::detail::Scope bindings_scope(perf::detail::TextureBindings);
+        // Resolve all used textures before binding: reinterpretation passes change GL state.
+        // The program key fixes texture usage. Unused units cannot be sampled by this program,
+        // so leave their state alone rather than binding white and looking up eight samplers.
+        GLuint tex[8];
+        for (int m = 0; m < 8; m++) {
+            if (g_legacy_texture_bindings) {
+                bool used = false;
+                for (int s = 0; s < c.stages; s++) used |= c.st[s].tex_enabled && c.st[s].texmap == m;
+                for (int i = 0; i < c.nind; i++) used |= c.ind_map[i] == m;
+                tex[m] = used ? texture_for(c.tex[m]) : g_white;
+            } else if (p->used_texture_mask & (1u << m)) {
+                tex[m] = texture_for(c.tex[m]);
+            }
+        }
+        sc_program(p->prog);
+        apply_state(st);
+        for (int m = 0; m < 8; m++) {
+            if (!g_legacy_texture_bindings && !(p->used_texture_mask & (1u << m))) continue;
+            sc_texture(m, tex[m]);
+            uint32_t ws = std::min<uint32_t>(c.wrap_s[m], 2), wt = std::min<uint32_t>(c.wrap_t[m], 2);
+            const Texture* tx = c.tex[m];
+            bool aniso_ok = g_aniso > 1 && tx && tx->efb_copy < 0 && !tx->mips.empty() && c.linear[m] &&
+                            (c.min_filter[m] == 5 || c.min_filter[m] == 6);
+            sc_sampler(m, sampler_for(c.min_filter[m], c.linear[m], ws, wt, aniso_ok ? g_aniso : 1));
+        }
     }
     bool first = !p->shadow;
     if (first) p->shadow = std::make_shared<UniformShadow>();
     UniformShadow& sh = *p->shadow;
     float vp0[4] = {st.vp[0], st.vp[1], st.vp[2], 0}, vp1[4] = {st.vp[3] - 342.f - c.xoff, st.vp[4] - 342.f - c.yoff, st.vp[5], 0};
-    if(g_player_views && g_frame_local_camera && st.perspective && !st.local_ui){
+    if(g_player_views && g_frame_local_camera && st.perspective && !st.local_ui && !st.canvas_fitted){
         vp0[0]/=g_wide;
         if(st.vp[5]>=.2f*16777216.f && fov()>0.f){
             const float k=std::tan(63.f*.00872664626f)/std::tan(fov()*.00872664626f);vp0[0]*=k;vp0[1]*=k;
         }
     }
-    if(g_frame_local_camera && st.local_ui && !gx::full_view_overlay(f,cmd))vp0[0]/=g_wide;
-    if(st.local_ui && st.perspective){
-        if(!g_frame_local_camera)vp0[0]/=g_wide;
+    // Explicit canvas draws already carry the horizontal correction in their clip positions.
+    if(!st.canvas_fitted && g_frame_local_camera && st.local_ui && !gx::full_view_overlay(f,cmd))vp0[0]/=g_wide;
+    if(st.perspective && (st.local_ui || st.canvas_fitted)){
+        if(!g_frame_local_camera && !st.canvas_fitted)vp0[0]/=g_wide;
         vp1[0]=EFB_W*.5f+(vp1[0]-EFB_W*.5f)/g_wide;
     }
     if (changed(sh.vp0, vp0, first)) Uniform4fv(p->u_vp0, 1, vp0);
@@ -1782,8 +1847,12 @@ void run_draw(const GpuFrame& f, const GpuCmd& cmd) {
         for (int i = 11; i < 16; i++) sc_attrib(i, false);
     }
     if (flat_z >= 0) DepthRange(flat_z, flat_z);
-    DrawElements(TRIANGLES, GLsizei(cmd.idx_count), UNSIGNED_INT,
-                 reinterpret_cast<const void*>(uintptr_t(cmd.idx_first) * 4));
+    {
+        perf::detail::Scope submission_scope(perf::detail::DrawSubmission);
+        DrawElements(TRIANGLES, GLsizei(cmd.idx_count), UNSIGNED_INT,
+                     reinterpret_cast<const void*>(uintptr_t(cmd.idx_first) * 4));
+    }
+    perf::detail::count(perf::detail::Draws);
     if (flat_z >= 0) DepthRange(0, 1);
     g_stats.draws++;
     g_stats.triangles += cmd.idx_count / 3;
@@ -2003,13 +2072,20 @@ void prof_frame(const GpuFrame& f) {
 void execute(GpuFrame& f) {
     for(auto& dependency:f.prerequisites)execute(*dependency);
     f.prerequisites.clear();
+    perf::detail::Scope execute_scope(perf::detail::Execute);
+    perf::detail::count(perf::detail::Commands,f.cmds.size());
     g_frame_local_camera=g_player_views && f.local_camera;
     auto t0 = std::chrono::steady_clock::now();
     sc_invalidate();  // the port's UI used the context since the last frame
     poll_timer_queries();
     bool timed = g_tq_ok && g_tq_pending < kTimerQueries;
     if (timed) BeginQuery(TIME_ELAPSED, g_tq[(g_tq_first + g_tq_pending) % kTimerQueries]);
-    if (f.wide != g_wide) { g_wide = f.wide; create_efb(); }  // gameplay <-> front end: anamorphic EFB width
+    const bool aspect_changed = f.wide != g_wide;
+    const double previous_sx = g_sx, previous_sy = g_sy;
+    g_wide = f.wide;
+    g_movie_frame = f.movie != 0;
+    update_scale_factors();
+    if (aspect_changed || g_sx != previous_sx || g_sy != previous_sy) create_efb();
     g_frame_no++;
     g_phase_frame = g_frame_no;
     g_phase_ncmds = uint32_t(f.cmds.size());
@@ -2019,10 +2095,15 @@ void execute(GpuFrame& f) {
     sc_cap(DEPTH_CLAMP, true);
     sc_cap(CLIP_DISTANCE0, true); sc_cap(CLIP_DISTANCE1, true); sc_cap(GLenum(CLIP_DISTANCE0 + 2), true);
     BindVertexArray(g_vao);
-    BindBuffer(ARRAY_BUFFER, g_vbo);
-    BufferData(ARRAY_BUFFER, GLsizeiptr(f.vtx.size()), f.vtx.data(), STREAM_DRAW);
-    BindBuffer(ELEMENT_ARRAY_BUFFER, g_ibo);
-    BufferData(ELEMENT_ARRAY_BUFFER, GLsizeiptr(f.idx.size() * 4), f.idx.data(), STREAM_DRAW);
+    {
+        perf::detail::Scope upload_scope(perf::detail::VertexUpload);
+        perf::detail::count(perf::detail::VertexBytes,f.vtx.size());
+        perf::detail::count(perf::detail::IndexBytes,f.idx.size()*4);
+        BindBuffer(ARRAY_BUFFER, g_vbo);
+        BufferData(ARRAY_BUFFER, GLsizeiptr(f.vtx.size()), f.vtx.data(), STREAM_DRAW);
+        BindBuffer(ELEMENT_ARRAY_BUFFER, g_ibo);
+        BufferData(ELEMENT_ARRAY_BUFFER, GLsizeiptr(f.idx.size() * 4), f.idx.data(), STREAM_DRAW);
+    }
     sc_attrib(0, true); sc_attrib(1, true); sc_attrib(2, true);
     static const long dump_frame = getenv("SSNE_GPU_DUMP_FRAME") ? atol(getenv("SSNE_GPU_DUMP_FRAME")) : -1;
     bool has_copy = false;
@@ -2092,6 +2173,7 @@ void execute(GpuFrame& f) {
             break;
         case GpuCmd::COPY_XFB:
             run_copy_xfb(c);
+            movie_presentation::displayed_gpu = f.movie;
             if (g_dumping) { dump_fbo(g_out_fbo, g_out_w, g_out_h, "output"); BindFramebuffer(FRAMEBUFFER, g_efb_fbo); }
             break;
         }
@@ -2222,11 +2304,13 @@ bool gpu_renderer_init(void* (*getproc)(const char*), int scale, std::string& er
     BindFramebuffer(FRAMEBUFFER, 0);
     g_ready = true;
     fprintf(stdout, "[gpu] renderer: %s, internal resolution %dx (%dx%d)\n", g_info.c_str(), gpu_renderer_scale(), SX(EFB_W), SY(EFB_H));
+    fprintf(stdout, "[gpu] texture bindings: %s\n", g_legacy_texture_bindings ? "legacy" : "used-units");
     return true;
 }
 
 bool gpu_renderer_run(int max_frames) {
     if (!g_ready) return false;
+    perf::detail::Frame presentation_frame(perf::detail::Presentation);
     poll_pending();
     prewarm(g_parallel ? 2.0 : 4.0);
     uint64_t before = g_out_seq;
@@ -2262,7 +2346,7 @@ void gpu_renderer_set_native(int display_h) {
     create_efb();
     BindFramebuffer(FRAMEBUFFER, 0);
 }
-int gpu_renderer_scale() { return g_native_h > 0 ? std::max(1, int(std::lround(g_sy))) : g_scale; }
+int gpu_renderer_scale() { return g_native_h > 0 ? std::max(1, int(std::lround(g_native_h / 448.0))) : g_scale; }
 int gpu_renderer_native() { return g_native_h; }
 
 void gpu_renderer_set_widescreen(float) {}  // per frame now (GpuFrame::wide)

@@ -56,6 +56,7 @@ inline GpuVtxLayout gpu_vtx_layout(uint32_t attrs) {
 
 struct GpuState {
     bool perspective = false, local_ui = false;
+    bool canvas_fitted = false;  // clip X was already corrected while recording this UI draw
     DrawCfg cfg;       // TEV / blend / depth / scissor snapshot (padding zeroed: compared with memcmp)
     float vp[6];       // XF viewport: scale x, y, z, offset x, y, z
     uint32_t cull;     // GENMODE cull mode
@@ -101,6 +102,7 @@ template <class T> struct NoInitAlloc : std::allocator<T> {
 struct GpuFrame {
     std::vector<std::unique_ptr<GpuFrame>> prerequisites;
     bool local_camera = false;
+    uint32_t movie = 0;  // decoded movie rectangle in this display copy
     uint64_t seq = 0;
     float wide = 1.0f;  // widescreen factor this frame was rendered with
     std::vector<GpuCmd> cmds;

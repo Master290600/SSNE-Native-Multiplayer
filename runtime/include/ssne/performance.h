@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 #include "ssne/performance_detail.h"
 
 namespace ssne::perf {
@@ -20,9 +21,14 @@ inline constexpr std::array names={"tick","frame","render_begin","render_end","c
     "capture_bindings","preflight","creation","scalars","destructibles_hints","hud","markers_brushes",
     "player_resources","weapon_models_effects","skeletons","projectiles_retirement","gpu_submit","gpu_wait","swap","present_interval","update_interval","pacing","cpu_skinning","native_draw_mode","native_material_setup","native_visibility_setup","native_projection_setup","native_skinning_dispatch","ui_frame","events_input","gpu_backpressure","present_reused","gpu_run_empty","gpu_run_single","gpu_run_multiple","gpu_batch_last_age","ui_overlay","ui_settings","ui_mod_menu","ui_gl_begin","ui_sdl_begin","ui_imgui_begin","ui_game_view","ui_submit"};
 inline constexpr std::array<double,15> bounds={.25,.5,1,2,4,8,12,16.667,25,33.334,50,100,250,1000,1e9};
-struct Counter {std::mutex mutex;std::atomic<uint64_t> count{0},ns{0},max_ns{0},over33{0};std::array<std::atomic<uint64_t>,bounds.size()> histogram{};};
+struct Counter {std::mutex mutex;std::atomic<uint64_t> count{0},ns{0},max_ns{0},over33{0};std::array<std::atomic<uint64_t>,bounds.size()> histogram{};std::vector<uint64_t> durations;uint64_t raw_dropped=0;};
 inline std::array<Counter,names.size()> counters;
 inline std::atomic<bool> enabled{false};
+// Optional bounded raw timings for repeatable performance tests. Normal sessions
+// keep only the existing counters; no per-frame file writes are introduced.
+inline std::atomic<bool> raw_frames{false};
+// Hidden fixture acknowledgement: pause setup-only UI traces after arming.
+inline std::atomic<bool> fixture_quiet{false};
 inline Clock::time_point origin=Clock::now();
 inline std::atomic<double> snapshot_received{0};
 struct Context {uint64_t frame=0,epoch=0,entities=0;unsigned scene=0,ping_ms=0;uint64_t revision=0,bytes_received=0;double interpolation_ms=0;std::string level;std::array<float,3> position{};};
@@ -38,7 +44,10 @@ inline void record(unsigned stage,Clock::duration duration){
     {std::lock_guard lock(c.mutex);
     c.ns.fetch_add(n,std::memory_order_relaxed);c.count.fetch_add(1,std::memory_order_relaxed);
     auto old=c.max_ns.load(std::memory_order_relaxed);while(old<n && !c.max_ns.compare_exchange_weak(old,n,std::memory_order_relaxed)){}
-    const auto ms=n/1e6;unsigned b=0;while(b+1<bounds.size() && ms>bounds[b])++b;c.histogram[b].fetch_add(1,std::memory_order_relaxed);if(ms>33.334)c.over33.fetch_add(1,std::memory_order_relaxed);}
+    const auto ms=n/1e6;unsigned b=0;while(b+1<bounds.size() && ms>bounds[b])++b;c.histogram[b].fetch_add(1,std::memory_order_relaxed);if(ms>33.334)c.over33.fetch_add(1,std::memory_order_relaxed);
+    if(raw_frames.load(std::memory_order_relaxed) && (stage==index("present_interval") || stage==index("update_interval") || stage==index("gpu_submit"))){
+        if(c.durations.size()<4096)c.durations.push_back(n);else ++c.raw_dropped;
+    }}
     const auto ms=n/1e6;if(ms>33.334){std::lock_guard lock(context_mutex);
         Slow sample{stage,ms,std::chrono::duration<double>(Clock::now()-origin).count(),context.frame};
         if(slow_count<slow.size())slow[slow_count++]=sample;
@@ -55,7 +64,7 @@ struct Laps {
     void mark(std::string_view name){if(active){const auto now=Clock::now();record(index(name),now-at);at=now;}}
 };
 inline void set_context(Context c){if(!enabled.load(std::memory_order_relaxed))return;c.level.resize(std::min<size_t>(128,c.level.size()));for(auto& f:c.position)if(!std::isfinite(f))f=0;ssne::perf::detail::set_context({c.frame,c.scene,c.level,c.position});std::lock_guard lock(context_mutex);context=std::move(c);}
-struct Display {double render_fps=0,native_fps=0,updates=0,gpu_ms=0,gpu_cpu_ms=0;uint64_t dropped=0,draws=0,copies=0,uploads=0,shader_programs=0;unsigned pending=0,ready_players=0;int scale=0,width=0,height=0,limit=0;float fov=0;bool focused=false,minimized=false,vsync=false,paused=false,background=false,gpu_timer_valid=false,local_ready=false;};
+struct Display {double render_fps=0,native_fps=0,updates=0,gpu_ms=0,gpu_cpu_ms=0;uint64_t dropped=0,draws=0,copies=0,uploads=0,shader_programs=0;unsigned pending=0,ready_players=0;int scale=0,width=0,height=0,limit=0;float fov=0;bool focused=false,minimized=false,vsync=false,paused=false,background=false,gpu_timer_valid=false,local_ready=false,presentation_busy=false;};
 // One writer on the UI thread; hot scopes use bounded counters, never disk I/O.
 // Each session is bounded to two 8-MiB parts. Stage spans overlap: do not sum
 // time_step/frame/render/apply. GPU time is asynchronous, not a frame fence.
@@ -65,12 +74,15 @@ class Writer {
 public:
     bool due()const{return enabled.load(std::memory_order_relaxed) && Clock::now()-last_>=std::chrono::seconds(1);}
     bool open(std::string path,std::string role){if(file_.is_open())file_.close();file_.clear();path_=std::move(path);role_=std::move(role);file_.open(path_,std::ios::trunc|std::ios::binary);if(!file_)return false;origin=last_=Clock::now();enabled=true;detail::configure();
+        const auto raw=std::getenv("SSNE_PERF_RAW_FRAMES");raw_frames.store(raw && std::string_view(raw)=="1",std::memory_order_relaxed);
+        for(auto name:{"present_interval","update_interval","gpu_submit"}){auto& c=counters[index(name)];std::lock_guard lock(c.mutex);c.durations.clear();c.raw_dropped=0;if(raw_frames.load(std::memory_order_relaxed))c.durations.reserve(512);}
         header_="{\"type\":\"header\",\"schema\":2,\"role\":"+quote(role_)+",\"utc_epoch_s\":"+std::to_string(std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count())+",\"detail_sampling\":\"whole operations; default 1 in 16; self times partition a root\",\"thread_cpu_note\":\"Windows kernel+user thread time; wall minus CPU includes scheduling and waits, not GPU execution\",\"stage_spans_overlap\":true,\"histogram_percentiles_are_upper_bounds\":true,\"gpu_is_asynchronous\":true,\"max_bytes_per_part\":8388608,\"parts\":2}";write(header_);return true;}
     bool sample(const Display& d,bool force=false){const auto now=Clock::now();const auto seconds=std::chrono::duration<double>(now-last_).count();if(!enabled || (!force && seconds<1))return false;last_=now;
         Context ctx;std::array<Slow,32> events;unsigned count;{std::lock_guard lock(context_mutex);ctx=context;events=slow;count=slow_count;slow_count=0;}
         std::ostringstream s;s<<std::fixed<<std::setprecision(3)<<"{\"type\":\"sample\",\"elapsed_s\":"<<std::chrono::duration<double>(now-origin).count()<<",\"window_s\":"<<seconds<<",\"role\":"<<quote(role_)<<",\"frame\":"<<ctx.frame<<",\"epoch\":"<<ctx.epoch<<",\"scene\":"<<ctx.scene<<",\"level\":"<<quote(ctx.level)<<",\"revision\":"<<ctx.revision<<",\"ping_ms\":"<<ctx.ping_ms<<",\"bytes_received_total\":"<<ctx.bytes_received<<",\"interpolation_delay_ms\":"<<ctx.interpolation_ms<<",\"last_applied_motion_age_ms\":"<<(snapshot_received.load()>0?std::max(0.,(std::chrono::duration<double>(now.time_since_epoch()).count()-snapshot_received.load())*1000.):-1.)<<",\"entities\":"<<ctx.entities<<",\"position\":["<<ctx.position[0]<<','<<ctx.position[1]<<','<<ctx.position[2]<<"],\"render_fps\":"<<d.render_fps<<",\"native_fps\":"<<d.native_fps<<",\"updates_per_s\":"<<d.updates<<",\"background_mode\":"<<d.background<<",\"gpu_timer_valid\":"<<d.gpu_timer_valid<<",\"gpu_ms_async\":"<<d.gpu_ms<<",\"gpu_submit_cpu_last_ms\":"<<d.gpu_cpu_ms<<",\"gpu_pending\":"<<d.pending<<",\"dropped_total\":"<<d.dropped<<",\"draws_total\":"<<d.draws<<",\"copies_total\":"<<d.copies<<",\"uploads_total\":"<<d.uploads<<",\"shader_programs_total\":"<<d.shader_programs<<",\"scale\":"<<d.scale<<",\"output\":["<<d.width<<','<<d.height<<"],\"fps_limit\":"<<d.limit<<",\"fov\":"<<d.fov<<",\"focused\":"<<d.focused<<",\"minimized\":"<<d.minimized<<",\"vsync\":"<<d.vsync<<",\"paused\":"<<d.paused<<",\"stages\":{";
-        bool first=true;for(unsigned i=0;i<counters.size();++i){auto& c=counters[i];std::lock_guard lock(c.mutex);const auto calls=c.count.exchange(0),total=c.ns.exchange(0),max=c.max_ns.exchange(0),over=c.over33.exchange(0);uint64_t sum=0;double p95=0,p99=0;for(unsigned b=0;b<bounds.size();++b){sum+=c.histogram[b].exchange(0);if(!p95 && sum>=std::max<uint64_t>(1,(calls*95+99)/100))p95=bounds[b];if(!p99 && sum>=std::max<uint64_t>(1,(calls*99+99)/100))p99=bounds[b];}if(!calls)continue;if(!first)s<<',';first=false;s<<quote(names[i])<<":{\"calls\":"<<calls<<",\"avg_ms\":"<<total/1e6/calls<<",\"max_ms\":"<<max/1e6<<",\"p95_upper_ms\":"<<p95<<",\"p99_upper_ms\":"<<p99<<",\"over33ms\":"<<over<<'}';}
-        s<<"},\"worst_spans\":[";for(unsigned i=0;i<count;++i){if(i)s<<',';s<<"{\"stage\":"<<quote(names[events[i].stage])<<",\"ms\":"<<events[i].ms<<",\"at_s\":"<<events[i].at<<",\"guest_frame\":"<<events[i].frame<<'}';}s<<"]";detail::append_json(s,quote);s<<",\"local_ready\":"<<d.local_ready<<",\"ready_players\":"<<d.ready_players<<"}";write(s.str());return true;
+        bool first=true;for(unsigned i=0;i<counters.size();++i){auto& c=counters[i];std::lock_guard lock(c.mutex);const auto calls=c.count.exchange(0),total=c.ns.exchange(0),max=c.max_ns.exchange(0),over=c.over33.exchange(0);uint64_t sum=0;double p95=0,p99=0;for(unsigned b=0;b<bounds.size();++b){sum+=c.histogram[b].exchange(0);if(!p95 && sum>=std::max<uint64_t>(1,(calls*95+99)/100))p95=bounds[b];if(!p99 && sum>=std::max<uint64_t>(1,(calls*99+99)/100))p99=bounds[b];}if(!calls)continue;if(!first)s<<',';first=false;s<<quote(names[i])<<":{\"calls\":"<<calls<<",\"avg_ms\":"<<total/1e6/calls<<",\"max_ms\":"<<max/1e6<<",\"p95_upper_ms\":"<<p95<<",\"p99_upper_ms\":"<<p99<<",\"over33ms\":"<<over;
+            if(raw_frames.load(std::memory_order_relaxed) && (i==index("present_interval") || i==index("update_interval") || i==index("gpu_submit"))){s<<",\"durations_ms\":[";for(size_t n=0;n<c.durations.size();++n){if(n)s<<',';s<<c.durations[n]/1e6;}s<<"],\"raw_dropped\":"<<c.raw_dropped;c.durations.clear();c.raw_dropped=0;}s<<'}';}
+        s<<"},\"worst_spans\":[";for(unsigned i=0;i<count;++i){if(i)s<<',';s<<"{\"stage\":"<<quote(names[events[i].stage])<<",\"ms\":"<<events[i].ms<<",\"at_s\":"<<events[i].at<<",\"guest_frame\":"<<events[i].frame<<'}';}s<<"]";detail::append_json(s,quote);s<<",\"local_ready\":"<<d.local_ready<<",\"ready_players\":"<<d.ready_players<<",\"presentation_busy\":"<<d.presentation_busy<<"}";write(s.str());return true;
     }
 };
 }

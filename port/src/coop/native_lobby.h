@@ -12,6 +12,8 @@ inline ControlInput native_lobby_choice(const ssne::PadState& pad){
     return result;
 }
 bool native_lobby_visible();
+bool native_lobby_survival();
+void set_native_lobby_survival(bool);
 // Guest-thread ownership of independent roster GUIs: -2 main, -1 unknown.
 int native_lobby_mouse_owner(uint32_t gui);
 uint32_t native_lobby_mouse_main();
@@ -25,6 +27,12 @@ void suspend_native_lobby(PPCContext&);
 void resume_native_lobby(PPCContext&);
 bool apply_native_lobby_skin_choices(PPCContext&,std::string& error);
 bool open_native_lobby_level_selection(PPCContext&,std::string& error);
+bool native_lobby_has_level();
+bool native_lobby_ready();
+bool native_lobby_can_ready();
+bool native_lobby_can_start();
+void toggle_native_lobby_ready();
+bool start_native_lobby_level(std::string& error);
 std::optional<NativeLobbyLevel> take_native_lobby_level();
 void cancel_native_lobby_level_selection();
 uint16_t filter_native_lobby_confirmation(uint16_t buttons);

@@ -122,7 +122,7 @@ class CrosshairMenus(MultiplayerMenus):
         argv = [str(folder / 'game.exe'), '--data', str(self.a.data), '--memcard',
                 str(folder / 'card.raw'), '--mute', '--fps', str(self.a.fps)]
         if direct:
-            argv += ['--lan-port', str(self.a.port), '--lan-pin', '123456', '--player-name', role]
+            argv += ['--lan-port', str(self.a.port), '--lan-pin', '123456', '--player-name', getattr(self.a, 'player_names', {}).get(role, role)]
             argv += ['--coop-host', '--coop-capacity', '8', '--coop-level', 'Rlevel1_1'] if role == 'host' else ['--coop-join', '127.0.0.1']
         child = subprocess.Popen(argv, cwd=folder, env=env, stdout=stream, stderr=stream, startupinfo=startup,
                                  creationflags=subprocess.BELOW_NORMAL_PRIORITY_CLASS)

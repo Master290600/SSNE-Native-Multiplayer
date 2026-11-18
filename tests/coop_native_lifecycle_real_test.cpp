@@ -3,6 +3,7 @@
 #include "ssne/native_entity.h"
 #include "ssne/native_effect.h"
 #include "ssne/native_party.h"
+#include "ssne/native_survival.h"
 #include "ssne/recomp_hooks.h"
 #include <algorithm>
 #include <set>
@@ -60,14 +61,38 @@ void weapon_loop_switch_regression(PPCContext& context){
     }
     std::cout<<"Real native Uzi/Minigun selection: matching host stop, scoped replica retirement, stale/origin/foreign safety and one-shot preservation passed.\n"<<std::flush;
 }
+void survival_rule_regression(const PPCContext& context){
+    require(mem_read32(0x802DB8CCu)==1,"Survival rules need a real Coop fixture; this test never changes the native mode");
+    auto getter=[&](uint32_t address){auto call=context;ssne_call(call,address);return call.r[3];};
+    const auto original_weapons=getter(0x80167360u),original_powerups=getter(0x801673BCu);std::string error;
+    ssne::configure_native_survival(true);
+    std::array<uint32_t,20> first_remap{};bool remapping_changed=false;
+    for(unsigned choice=0;choice<=10;++choice){
+        require(configure_native_survival_rules(true,choice,true,error),error);
+        require(getter(0x80167360u)==choice && getter(0x801673BCu)==0,"Native Survival getter ignored selected weapon set or inverted powerup policy");
+        // This is the original pickup factory's exact remapper, reached from
+        // 8010CEB8 after its WeaponSet getter. It only reads the authored table.
+        for(unsigned item=0;item<20;++item){auto call=context;call.r[3]=getter(0x80167360u);call.r[4]=57+item;ssne_call(call,0x8010E274u);
+            if(!choice)first_remap[item]=call.r[3];else remapping_changed|=first_remap[item]!=call.r[3];}
+    }
+    require(remapping_changed,"Different Survival weapon sets did not change original map pickup definitions");
+    require(!configure_native_survival_rules(true,11,true,error) && !error.empty() && getter(0x80167360u)==10,"Invalid weapon set changed accepted native rules");error.clear();
+    require(configure_native_survival_rules(true,0,false,error) && getter(0x801673BCu)==1,"Disabled powerups did not return the original factory's disallow flag");
+    require(configure_native_survival_rules(false,0,true,error),error);
+    require(getter(0x80167360u)==original_weapons && getter(0x801673BCu)==original_powerups,"Leaving Survival did not restore original Coop getters");
+    ssne::configure_native_survival(false);
+    std::cout<<"Real PAL Survival: 11 weapon sets, original pickup remapping, powerup inversion, invalid-range rejection and original getter fallback passed without native mode changes.\n"<<std::flush;
+}
 int main(int argc,char** argv) {
-    require(argc==3 || (argc==5 && std::string(argv[3])=="weapon-loop-switch"),"Pass game_data and the captured 64-MiB native level directory [weapon-loop-switch matching-party-checkpoint.bin]");
+    const bool survival_rules=argc==4 && std::string(argv[3])=="survival-rules";
+    require(argc==3 || survival_rules || (argc==5 && std::string(argv[3])=="weapon-loop-switch"),"Pass game_data and the captured 64-MiB native level directory [survival-rules | weapon-loop-switch matching-party-checkpoint.bin]");
     // This fixture always contains 64 MiB; allocate that before boot/copy.
     ssne::native_party_extended_memory(true);
     PPCContext context;std::string error;require(ssne::boot(context,argv[1],error)!=0,error);
     std::ifstream input(std::string(argv[2])+"/native-capture.ram",std::ios::binary);
     std::vector<uint8_t> ram((std::istreambuf_iterator<char>(input)),{});require(ram.size()==0x04000000,"Expected real 64-MiB native level fixture");
     memcpy(ssne::g_ram,ram.data(),ram.size());context.r[2]=0x802F22A0;context.r[13]=0x802E22A0;context.r[1]=ssne::guest_ram_end()-0x40000;context.msr&=~0x8000u;
+    if(survival_rules){survival_rule_regression(context);std::_Exit(0);}
     if(argc==5){
         // RAM alone cannot restore relocated eight-player registry/arena state.
         // Require the matching safe-point component instead of guessing it from

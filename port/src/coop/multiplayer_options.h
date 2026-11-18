@@ -8,11 +8,19 @@ namespace port::coop {
 struct MultiplayerOptions {
     std::string name; // Native Latin-1, empty means the selected game profile.
     unsigned enemies=1,capacity=0,pickups=1;
+    std::string host_name; // Native Latin-1, empty means the host's player name.
+    std::string pin="123456";
+    bool use_password=false; // Require the PIN instead of issuing LAN join tickets.
+    unsigned skin=255; // 255 follows the selected profile; runtime checks the installed catalog.
 };
 inline bool valid_multiplayer_options(const MultiplayerOptions& o){
+    const auto valid_label=[](const std::string& value,unsigned limit){
+        return value.size()<=limit && (value.empty() || value.find_first_not_of(' ')!=std::string::npos) &&
+            std::none_of(value.begin(),value.end(),[](unsigned char c){return c<32 || (c>=127 && c<160);});
+    };
     return o.enemies>=1 && o.enemies<=5 && o.capacity<=5 && o.pickups>=1 && o.pickups<=5 &&
-        o.name.size()<=24 && (o.name.empty() || o.name.find_first_not_of(' ')!=std::string::npos) &&
-        std::none_of(o.name.begin(),o.name.end(),[](unsigned char c){return c<32 || (c>=127 && c<160);});
+        valid_label(o.name,24) && valid_label(o.host_name,32) && o.skin<=255 && o.pin.size()==6 &&
+        std::all_of(o.pin.begin(),o.pin.end(),[](char c){return c>='0' && c<='9';});
 }
 inline unsigned next_ammo_capacity(unsigned code){return code==0?1:code==1?3:code==5?2:code==2?0:code+1;}
 inline std::string native_name_utf8(std::string_view name){

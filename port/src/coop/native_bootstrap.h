@@ -9,6 +9,11 @@ struct NativeBootstrapRequest {
 inline const char* native_rules_prefix(uint32_t mode) {
     switch(mode){case 1:return "GameSetup.RulesCoop";case 2:return "GameSetup.RulesFragmatch";case 3:return "GameSetup.RulesHoldTheFlag";case 4:return "GameSetup.RulesPassTheBomb";default:return nullptr;}
 }
+// Session metadata stays in the synchronized setup envelope. Only original
+// GameSetup fields may enter the game's strictly scoped config writer.
+inline Properties native_game_setup_fields(const Properties& fields){
+    Properties setup;for(const auto& [key,value]:fields)if(key.starts_with("GameSetup."))setup.emplace(key,value);return setup;
+}
 // Queue the native game scene after validating/applying the host's level/rules.
 // Only the guest thread at a frame safe point may call this.
 std::optional<std::string> native_active_level();

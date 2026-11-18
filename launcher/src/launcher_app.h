@@ -7,6 +7,7 @@
 #include <imgui.h>
 
 #include "config.h"
+#include "map_editor.h"
 #include "game_builder.h"
 #include "gc/verify.h"
 #include "updater.h"
@@ -19,10 +20,11 @@ public:
     void on_file_dropped(const std::string& path);
     void frame();                     // draws the whole UI; call between ImGui::NewFrame/Render
     bool wants_quit() const { return quit_; }
+    bool editor_open() const { return editor_open_; }
     void save_test_state(const std::string& path, uint64_t sequence, uint64_t frame);
 
 private:
-    enum class Phase { Idle, Verifying, Extracting, Building, Updating };
+    enum class Phase { Idle, Verifying, Extracting, Building, Updating, Preparing };
 
     void select_rom(const std::string& path);
     void start_verify();
@@ -36,7 +38,7 @@ private:
     void start_update();           // download and install update_, then restart
     void draw_update(ImVec2 p0, ImVec2 p1);  // the update prompt / progress over the window
 
-    enum Item { ITEM_PLAY, ITEM_DISC, ITEM_INSTALL, ITEM_FULLSCREEN, ITEM_CLOSE, ITEM_QUIT, ITEM_COUNT };
+    enum Item { ITEM_PLAY, ITEM_DISC, ITEM_INSTALL, ITEM_FULLSCREEN, ITEM_CLOSE, ITEM_QUIT, ITEM_EDITOR, ITEM_COUNT };
     bool item_enabled(int item) const;
     void activate(int item);
     void browse();
@@ -50,6 +52,8 @@ private:
     std::string base_dir_, config_path_, data_dir_;
     bool kit_present_ = false;
     BuildKit base_kit_, kit_;
+    MapEditor editor_;
+    bool editor_open_ = false;
     bool target_valid_ = true, target_present_ = false, target_ready_ = false;
     std::string target_error_;
     std::atomic<bool> refresh_pending_{false}, launch_pending_{false}, verified_pending_{false}, installed_pending_{false};

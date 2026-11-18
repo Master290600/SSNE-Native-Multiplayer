@@ -795,6 +795,56 @@ bool update_native_pickup_ambient(PPCContext& context,float seconds,std::string&
     for(auto object:sparkles)run(0x800D20E8u,object);
     return true;
 }
+namespace {
+struct SceneParticleClass {uint32_t table,size,update,update_word,enable,enable_word;};
+constexpr std::array<SceneParticleClass,7> scene_particle_classes{{
+    {0x802156A8,0x2D8,0x800D20E8,0x9421FF50,0x800D2740,0x9421FF60},
+    {0x802157F8,0x158,0x800D111C,0x9421FFE8,0x800D13F8,0x9421FFF0},
+    {0x80215600,0x168,0x800D2EA0,0x9421FF30,0x800D376C,0x9421FFD8},
+    {0x80215750,0x158,0x800D1A08,0x9421FFE8,0x800D1CE4,0x9421FFF0},
+    {0x80215558,0x064,0x800D3EC0,0x9421FF28,0x800D457C,0x9421FFF0},
+    {0x802154B0,0x064,0x800D4BA0,0x9421FF30,0x800D52D0,0x9421FFF0},
+    {0x80215408,0x054,0x800D54A0,0x4E800020,0x800D5A38,0x9421FFF0},
+}};
+bool scene_particle_valid(uint32_t emitter,unsigned kind){
+    if(kind>=scene_particle_classes.size())return false;
+    const auto& t=scene_particle_classes[kind];
+    return readable(emitter,t.size) && mem_read32(emitter+0x1C)==t.table &&
+        mem_read32(emitter+0x18)==0 && mem_read32(t.table+0x34)==t.update &&
+        mem_read32(t.table+0x74)==t.enable && !mem_read16(t.table+0x30) &&
+        !mem_read16(t.table+0x70) && ssne_find_func(t.update) &&
+        ssne_find_func(t.enable) && mem_read32(t.update)==t.update_word &&
+        mem_read32(t.enable)==t.enable_word;
+}
+}
+bool update_native_scene_particle(PPCContext& context,uint32_t emitter,unsigned kind,float seconds,std::string& error){
+    if(!g_ram || !replica_simulation() || !context_ok(context) || kind==0 || kind==6 ||
+       !std::isfinite(seconds) || seconds<0 || seconds>.1f ||
+       !scene_particle_valid(emitter,kind)){error="Invalid native scene-particle presentation";return false;}
+    Scratch scratch(context);PresentationScope presentation;auto call=context;
+    call.msr&=~0x8000u;call.r[1]-=0x200;mem_write32(call.r[1],context.r[1]);
+    call.r[3]=emitter;call.ps0[1]=call.ps1[1]=seconds;
+    ssne_call(call,scene_particle_classes[kind].update);return true;
+}
+bool set_native_scene_particle_enabled(PPCContext& context,uint32_t holder,unsigned kind,bool enabled,std::string& error){
+    if(!g_ram){error="Native particle memory unavailable";return false;}
+    const auto config=readable(holder,0x64)?mem_read32(holder+0x54):0;
+    const auto emitter=readable(holder,0x64)?mem_read32(holder+0x60):0;
+    const uint32_t method=enabled?0x80081578u:0x800815D4u;
+    if(!g_ram || !replica_simulation() || !context_ok(context) ||
+       !readable(holder,0x64) || mem_read32(holder+0x48)!=0x80207320u ||
+       !readable(config,56) || mem_read16(config+2)!=kind ||
+       mem_read32(holder+0x58)>1 || !scene_particle_valid(emitter,kind) ||
+       mem_read32(0x80207320u+(enabled?0xAC:0xB4))!=method ||
+       mem_read16(0x80207320u+(enabled?0xA8:0xB0)) ||
+       !ssne_find_func(method) || mem_read32(method)!=0x9421FFF0u){error="Invalid native scene-particle activation";return false;}
+    if(bool(mem_read32(holder+0x58))==enabled)return true;
+    Scratch scratch(context);PresentationScope presentation;auto call=context;
+    call.msr&=~0x8000u;call.r[1]-=0x200;mem_write32(call.r[1],context.r[1]);call.r[3]=holder;
+    ssne_call(call,method);
+    if(bool(mem_read32(holder+0x58))!=enabled){error="Native particle activation did not change emission";return false;}
+    return true;
+}
 bool update_native_replica_effects(PPCContext& context,float seconds,std::string& error) {
     if(!context_ok(context) || !std::isfinite(seconds) || seconds<0 || seconds>.1f){error="Invalid native effect presentation timestep";return false;}
     if(!update_native_pickup_ambient(context,seconds,error) || !update_replica_bullet_trails(context,error))return false;

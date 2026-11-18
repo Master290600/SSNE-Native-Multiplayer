@@ -58,7 +58,15 @@ public:
     NativeWorld(const NativeWorld&)=delete;
     NativeWorld& operator=(const NativeWorld&)=delete;
     void set_player_owner(unsigned slot,PlayerId);
+    uint64_t current_epoch() const;
     NativeWorldSample capture(uint64_t tick) const;
+    // Host only: body/enemy poses are filled after their native evaluation.
+    // The caller must complete that preparation before publishing this sample.
+    NativeWorldSample capture_before_pose_preparation(uint64_t tick) const;
+    // Publication excludes reserved actors without a connection identity. A
+    // connected player is included before ready so late join can bind it.
+    // Full captures and local lifetime reconciliation retain every actor.
+    NativeWorldSample capture_for_publication(uint64_t tick,bool defer_actor_poses=false) const;
     // Local reconciliation only: lifetime/class/level identities, no bone,
     // camera, weapon or HUD snapshots. Never publish this as host world state.
     NativeWorldSample capture_bindings() const;
@@ -91,7 +99,7 @@ public:
     std::unique_ptr<PreparedLifetimes> prepare_lifetimes(const std::vector<uint8_t>&,uint64_t fresh_epoch,std::string& error);
     bool load_lifetimes(const std::vector<uint8_t>&,uint64_t fresh_epoch,std::string& error);
 private:
-    NativeWorldSample capture(uint64_t tick,bool bindings_only) const;
+    NativeWorldSample capture(uint64_t tick,bool bindings_only,bool defer_actor_poses=false,bool connected_players_only=false) const;
     struct Impl;std::shared_ptr<Impl> impl_;uint64_t subscription_=0;
 };
 }

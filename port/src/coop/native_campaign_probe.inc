@@ -6,7 +6,11 @@ bool campaign_probe(PPCContext& context,const NativeWorldSample& sample,NativeWo
     if(!getenv("SSNE_TEST_HIDDEN") || !path || sample.scene!=4)return false;
     auto readable=[](uint32_t p,unsigned n){return p>=0x80000000u && n<=ssne::guest_ram_size() && p<=ssne::guest_ram_end()-n;};
     auto text_at=[&](uint32_t p)->std::optional<std::string>{std::string s;for(unsigned i=0;i<65;++i){if(!readable(p+i,1))return {};const auto c=mem_read8(p+i);if(!c)return s;if(c<32 || c>126)return {};s+=char(c);}return {};};
-    if(sample.tick%60==0){
+    unsigned observer_frames=60;
+    const auto* hidden=getenv("SSNE_TEST_HIDDEN"),*observe=getenv("SSNE_TEST_CAMPAIGN_BOSS_OBSERVE"),*cadence=getenv("SSNE_TEST_BOSS_OBSERVE_FRAMES");
+    if(hidden && !strcmp(hidden,"1") && observe && !strcmp(observe,"1") && cadence)
+        observer_frames=unsigned(std::clamp(atoi(cadence),6,60));
+    if(sample.tick%observer_frames==0){
         std::ofstream out("campaign-state.json.pending");
         out<<"{\"level\":\""<<level<<"\",\"epoch\":"<<sample.epoch<<",\"tick\":"<<sample.tick<<",\"objects\":[";
         std::map<uint32_t,unsigned> spawn_definitions;
@@ -32,6 +36,14 @@ bool campaign_probe(PPCContext& context,const NativeWorldSample& sample,NativeWo
                 if(auto found=sample.entities.find(id);found!=sample.entities.end())for(const auto* key:{"weapon_owned_counts","ammo","ammo_maximum"}){
                     out<<",\""<<key<<"\":[";const auto& values=std::get<std::vector<int64_t>>(found->second.properties.at(key));for(unsigned i=0;i<values.size();++i){if(i)out<<',';out<<values[i];}out<<']';
                 }
+            }
+            if(kind==unsigned(EntityKind::Pickup)){
+                out<<",\"pickup_ownership\":[";
+                for(unsigned slot=0;slot<ssne::native_party_capacity();++slot){if(slot)out<<',';out<<ssne::native_party_pickup_value(object,slot);}out<<']';
+                const auto binding=native_render_binding(object,EntityKind::Pickup);const auto glow=native_pickup_glow_proxy(object);
+                out<<",\"pickup_view_mask\":"<<(binding && binding->model?mem_read32(binding->model+0x30):0)
+                   <<",\"pickup_glow_mask\":"<<(glow && *glow?mem_read32(*glow+0x30):0)
+                   <<",\"pickup_glow_visible\":"<<(glow && *glow?unsigned(mem_read8(*glow+0x2D)):0);
             }
             if(vt==0x80204E30u){const auto c=mem_read32(object+0x54);if(readable(c,0x18))if(auto found=spawn_definitions.find(mem_read32(c+0x14));found!=spawn_definitions.end())out<<",\"spawn_type\":"<<found->second;}
             if(vt==0x8020A750u){const auto c=mem_read32(object+0x54);if(readable(c,10)){const auto text=text_at(mem_read32(c+4));if(text)out<<",\"target\":\""<<*text<<"\",\"terminal\":"<<mem_read16(c+8);}}

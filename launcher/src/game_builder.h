@@ -28,6 +28,7 @@ struct BuildKit {
 
     bool compiler_present() const;
     std::string output_exe(const std::string& project_dir) const;
+    std::string play_exe(const std::string& project_dir) const;
     std::string working_directory(const std::string& project_dir) const;
     std::string target_fingerprint() const;
 };

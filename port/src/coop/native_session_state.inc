@@ -3,6 +3,10 @@
 void NativeSession::configure_saves(savefile::Identity identity) {
     std::lock_guard lock(save_mutex_);save_identity_=std::move(identity);
 }
+void NativeSession::configure_saves(std::filesystem::path data_root) {
+    std::lock_guard lock(save_mutex_);
+    save_data_root_=std::move(data_root);
+}
 void NativeSession::configure_startup_save(savefile::State state,int slot) {
     if(!server_ || queued_ || slot<1 || slot>5)throw std::runtime_error("Invalid startup save request");
     startup_save_=std::move(state);startup_slot_=slot;
@@ -10,17 +14,46 @@ void NativeSession::configure_startup_save(savefile::State state,int slot) {
 bool NativeSession::request_save(bool save,int slot,std::string path,std::string& error) {
     std::lock_guard lock(save_mutex_);
     if(!server_){error="Only the host can save or load the cooperative session";return false;}
-    if(!save_identity_){error="Cooperative saves are not initialized";return false;}
+    if(survival_enabled_){error=native_menu_language()==1?"Survival-Runden werden nicht gespeichert.":native_menu_language()==2?"Les manches de survie ne sont pas sauvegardees.":"Survival rounds cannot be saved or loaded.";return false;}
+    if(!save_identity_ && save_data_root_.empty()){error="Cooperative saves are not initialized";return false;}
     if(save_busy_){error="A cooperative save operation is already pending";return false;}
     if(slot<1 || slot>5 || path.empty()){error="Invalid cooperative save slot";return false;}
+    if(!save_identity_){
+        // The full EXE/data digest is used only by checkpoint files. Keep the
+        // guest rendering while it is computed for the first save or load.
+        try{
+            pending_save_identity_=std::async(std::launch::async,[root=save_data_root_,stop=&cancel_save_identity_]{
+                return savefile::identify(root,stop);
+            });
+        }catch(const std::exception& e){error=e.what();return false;}
+    }
     save_request_=SaveRequest{save,slot,std::move(path),std::chrono::steady_clock::now()+std::chrono::seconds(10)};save_busy_=true;return true;
 }
 bool NativeSession::take_save_result(SaveResult& result) {
     std::lock_guard lock(save_mutex_);if(!save_result_)return false;
     result=std::move(*save_result_);save_result_.reset();save_busy_=false;return true;
 }
+bool NativeSession::awaiting_save_identity_locked() const {
+    return pending_save_identity_.valid() && pending_save_identity_.wait_for(std::chrono::seconds(0))!=std::future_status::ready;
+}
 void NativeSession::process_save_request(PPCContext& context,bool ready,uint64_t frame) {
-    {std::lock_guard lock(save_mutex_);if(!save_request_)return;}
+    // F5 may arrive after the frame was selected for post-Flip dispatch. Keep
+    // the request and its deadline untouched until a legacy safe point runs.
+    if(ssne::host_frame_pipeline_callback())return;
+    {
+        std::lock_guard lock(save_mutex_);
+        if(!save_request_)return;
+        if(pending_save_identity_.valid()){
+            if(awaiting_save_identity_locked())return;
+            try{save_identity_=pending_save_identity_.get();}
+            catch(const std::exception& e){
+                save_result_=SaveResult{save_request_->save,false,save_request_->slot,e.what()};
+                save_request_.reset();
+                return;
+            }
+            save_request_->deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+        }
+    }
     std::string why;
     if(ssne::runtime_checkpoint_visit([&]{perform_save_request(context,ready,frame);},why))return;
     std::lock_guard lock(save_mutex_);
@@ -29,6 +62,7 @@ void NativeSession::process_save_request(PPCContext& context,bool ready,uint64_t
     }
 }
 void NativeSession::perform_save_request(PPCContext& context,bool ready,uint64_t frame) {
+    if(ssne::host_frame_pipeline_callback())return;
     std::optional<SaveRequest> request;savefile::Identity identity;
     {std::lock_guard lock(save_mutex_);if(!save_request_)return;request=std::move(save_request_);save_request_.reset();identity=*save_identity_;}
     SaveResult result{request->save,false,request->slot,{}};
@@ -74,7 +108,8 @@ bool NativeSession::save_session_checkpoint(std::vector<uint8_t>& out,std::strin
     if(!server_){error="Only the authoritative host has session checkpoints";return false;}
     if(active_movie_sequence_ || ssne::native_movie_presenting()){error="Wait until the video has finished before saving";return false;}
     try {
-        checkpoint::Writer w;w.u32(0x4E534331);w.u32(mem_read32(0x80000000));w.u32(ssne::guest_ram_size());w.u32(capacity_);
+        for(const auto& lease:afk_aim_leases_)if(lease.binding.actor && (lease.epoch!=epoch_ || lease.epoch!=native_.current_epoch() || !native_auto_aim_lease_matches(lease.binding))){error="Native auto-aim lease changed before checkpoint";return false;}
+        checkpoint::Writer w;w.u32(0x4E534332);w.u32(mem_read32(0x80000000));w.u32(ssne::guest_ram_size());w.u32(capacity_);
         w.u64(epoch_);w.u64(cutscene_epoch_);w.u64(afk_epoch_);
         w.flag(queued_);w.flag(host_ready_);w.flag(level_loading_);w.u64(loading_epoch_);
         w.u32(active_cutscene_object_);w.u64(active_cutscene_vote_);w.flag(cutscene_skip_applied_);
@@ -86,7 +121,8 @@ bool NativeSession::save_session_checkpoint(std::vector<uint8_t>& out,std::strin
         for(unsigned i=0;i<max_players;++i){
             id(players_[i]);w.u64(characters_[i]);
             const auto& j=join_placements_[i];id(j.player);w.u32(j.actor);w.u64(j.spawn_revision);w.flag(j.requested);
-            const auto& a=afk_aim_leases_[i];id(a.player);w.u32(a.actor);w.u32(a.aim);w.flag(a.saved);
+            const auto& a=afk_aim_leases_[i];const auto& aim=a.binding;id(a.player);
+            w.u32(aim.actor);w.u32(aim.aim);w.u32(aim.variable);w.u32(aim.profile);w.u32(aim.slot);w.u32(aim.saved_mode);w.u64(a.epoch);
             const auto& l=native_life_wait_[i];id(l.player);w.u32(l.actor);w.u64(l.spawn_revision);
             const auto& r=afk_respawn_wait_[i];w.u32(r.actor);w.u64(r.spawn_revision);
             w.u32(afk_follow_slots_[i]);w.flag(afk_native_active_[i]);w.flag(afk_states_[i]);w.u32(afk_decisions_[i]);
@@ -103,7 +139,7 @@ bool NativeSession::load_session_checkpoint(const std::vector<uint8_t>& bytes,st
     try {
         checkpoint::Reader r(bytes,2*1024*1024);
         auto require=[](bool ok){if(!ok)throw std::runtime_error("Invalid native session checkpoint state");};
-        require(r.u32()==0x4E534331 && r.u32()==mem_read32(0x80000000) && r.u32()==ssne::guest_ram_size() && r.u32()==capacity_);
+        const auto format=r.u32();require((format==0x4E534331 || format==0x4E534332) && r.u32()==mem_read32(0x80000000) && r.u32()==ssne::guest_ram_size() && r.u32()==capacity_);
         const auto epoch=r.u64(),cutscene_epoch=r.u64(),afk_epoch=r.u64();require(epoch!=0);
         const bool queued=r.flag(),ready=r.flag(),loading=r.flag();const auto loading_epoch=r.u64();
         const auto camera=r.u32();const auto vote=r.u64();const auto skipped=r.flag();const auto delay=r.u32();require(delay<=125000);
@@ -112,8 +148,9 @@ bool NativeSession::load_session_checkpoint(const std::vector<uint8_t>& bytes,st
         require(configuration.epoch==epoch && configuration.entities.empty() && !configuration.vote.cutscene);
         for(const auto& p:configuration.players)require(!p.connected);
         const auto authority=r.blob(4096);
-        require(authority.size()>=32);
-        uint64_t saved_vote=0;for(unsigned i=16;i<24;++i)saved_vote=(saved_vote<<8)|authority[i];require(vote==saved_vote);
+        SessionAuthority::CheckpointHeader authority_header;
+        require(SessionAuthority::read_checkpoint_header(authority,authority_header,error) && authority_header.capacity==capacity_);
+        require(vote==authority_header.cutscene);
         auto players=players_;auto characters=characters_;auto joins=join_placements_;auto leases=afk_aim_leases_;
         auto life=native_life_wait_;auto respawn=afk_respawn_wait_;auto follow=afk_follow_slots_;auto active=afk_native_active_;
         auto afk=afk_states_;auto decisions=afk_decisions_;auto inputs=afk_inputs_;auto bots=afk_bots_;
@@ -125,9 +162,16 @@ bool NativeSession::load_session_checkpoint(const std::vector<uint8_t>& bytes,st
             auto& j=joins[i];j.player=id();j.actor=r.u32();j.spawn_revision=r.u64();j.requested=r.flag();
             require(j.player==PlayerId{} || j.player==players[i]);require(!j.actor || actor_valid(j.actor,i));require(!j.requested || j.actor);
             require(j.player.generation || (!j.actor && !j.spawn_revision && !j.requested));
-            auto& a=leases[i];a.player=id();a.actor=r.u32();a.aim=r.u32();a.saved=r.flag();
-            require(!a.actor || (a.player==players[i] && actor_valid(a.actor,i) && a.aim>=0x80000000u && a.aim<=ssne::guest_ram_end()-0x58u && mem_read32(a.actor+0x37C)==a.aim));
-            require(a.actor || (!a.aim && a.player==PlayerId{} && !a.saved));
+            auto& a=leases[i];a={};a.player=id();auto& aim=a.binding;aim.actor=r.u32();aim.aim=r.u32();
+            if(format==0x4E534331){
+                // NSC1 saved the marker-enable flag, not the menu option. Its
+                // code never changed AutoAimType, so restored RAM owns the prior mode.
+                const bool old_marker=r.flag();
+                if(aim.actor){const auto pointer=aim.aim;std::string why;require(read_native_auto_aim_binding(aim.actor,aim,why) && aim.aim==pointer);a.epoch=epoch;}
+                else require(!old_marker);
+            }else{aim.variable=r.u32();aim.profile=r.u32();aim.slot=r.u32();aim.saved_mode=r.u32();a.epoch=r.u64();}
+            require(!aim.actor || (a.player==players[i] && actor_valid(aim.actor,i) && a.epoch==epoch && native_auto_aim_lease_matches(aim)));
+            require(aim.actor || (!aim.aim && !aim.variable && !aim.profile && !aim.slot && !aim.saved_mode && !a.epoch && a.player==PlayerId{}));
             auto& l=life[i];l.player=id();l.actor=r.u32();l.spawn_revision=r.u64();require(!l.actor || (l.player==players[i] && actor_valid(l.actor,i) && l.spawn_revision<=ssne::native_party_spawn_revision(l.actor)));
             require(l.actor || (l.player==PlayerId{} && !l.spawn_revision));
             auto& p=respawn[i];p.actor=r.u32();p.spawn_revision=r.u64();require(!p.actor || (actor_valid(p.actor,i) && p.spawn_revision<=ssne::native_party_spawn_revision(p.actor)));
@@ -139,7 +183,7 @@ bool NativeSession::load_session_checkpoint(const std::vector<uint8_t>& bytes,st
             port::netplay::CompanionBot::Checkpoint b;b.target=r.u32();for(auto& f:b.previous)f=r.real();b.stalled=r.u32();b.escape=r.u32();b.moving=r.flag();const auto count=small(128);for(unsigned n=0;n<count;++n){std::array<float,3> point;for(auto& f:point)f=r.real();b.trail.push_back(point);}require(bots[i].restore_checkpoint(std::move(b)));
         }
         std::map<uint32_t,uint32_t> bindings;const auto count=r.u32();require(count<=capacity_);
-        for(unsigned n=0;n<count;++n){const auto actor=r.u32(),aim=r.u32();require(bindings.emplace(actor,aim).second);const auto lease=std::find_if(leases.begin(),leases.end(),[&](const auto& a){return a.actor==actor && a.aim==aim;});require(actor && lease!=leases.end());}
+        for(unsigned n=0;n<count;++n){const auto actor=r.u32(),aim=r.u32();require(bindings.emplace(actor,aim).second);const auto lease=std::find_if(leases.begin(),leases.end(),[&](const auto& a){return a.binding.actor==actor && a.binding.aim==aim;});require(actor && lease!=leases.end());}
         const auto frontend=r.blob(4096);r.done();
         if(!restore_native_frontend_state(frontend,error,false))return false;
         require(!camera || (camera>=0x80000000u && camera<=ssne::guest_ram_end()-0x180u && mem_read32(camera+0x48)==0x80203078u));
@@ -157,11 +201,11 @@ bool NativeSession::load_session_checkpoint(const std::vector<uint8_t>& bytes,st
                 saved_generations[i]=players[i].generation;live_generations[i]=current[i].id.generation;
                 const auto previous=players[i];players[i]=current[i].id;
                 if(!current[i].connected){
-                    bindings.erase(leases[i].actor);characters[i]=0;joins[i]={};leases[i]={};life[i]={};respawn[i]={};
+                    bindings.erase(leases[i].binding.actor);end_native_auto_aim_override(leases[i].binding);characters[i]=0;joins[i]={};leases[i]={};life[i]={};respawn[i]={};
                     follow[i]=max_players;active[i]=afk[i]=false;decisions[i]=0;inputs[i]={};bots[i]={};
                 }else{
                     if(joins[i].player.generation)joins[i].player=players[i];
-                    if(leases[i].actor)leases[i].player=players[i];
+                    if(leases[i].binding.actor)leases[i].player=players[i];
                     if(life[i].actor)life[i].player=players[i];
                     // A newly occupied saved slot uses the normal safe join
                     // placement, rather than activating an arbitrary dormant actor.
@@ -176,7 +220,7 @@ bool NativeSession::load_session_checkpoint(const std::vector<uint8_t>& bytes,st
         afk_follow_slots_=follow;afk_native_active_=active;afk_states_=afk;afk_decisions_=decisions;afk_inputs_=inputs;afk_bots_.swap(bots);
         epoch_=epoch;cutscene_epoch_=cutscene_epoch;afk_epoch_=afk_epoch;queued_=queued;host_ready_=ready;level_loading_=loading;loading_epoch_=loading_epoch;
         active_cutscene_object_=camera;active_cutscene_vote_=vote;active_movie_sequence_=0;cutscene_skip_applied_=skipped;
-        level_.swap(configuration.level);setup_.swap(configuration.mission);
+        level_.swap(configuration.level);setup_.swap(configuration.mission);configure_survival_session(setup_);
         afk_next_decision_=std::chrono::steady_clock::now()+std::chrono::microseconds(delay);return true;
     }catch(const std::exception& e){error=e.what();return false;}
 }
@@ -202,6 +246,7 @@ bool NativeSession::restore_historical_checkpoint(PPCContext& context,const std:
         resume->commit();
         if(!ssne::acknowledge_native_event_publication(producer_epoch,runtime_tails) || !native_.acknowledge_projectile_visuals(projectile_epoch,tails[9]))ssne::fatal("Checkpoint producer baseline changed during commit");
         epoch_=cutscene_epoch_=afk_epoch_=new_epoch;characters_={};host_ready_=false;
+        for(auto& lease:afk_aim_leases_)if(lease.binding.actor)lease.epoch=new_epoch;
         active_cutscene_object_=0;active_cutscene_vote_=0;active_movie_sequence_=0;cutscene_skip_applied_=false;cutscene_trace_states_.clear();
     };
     session.abort=[&]{resume.reset();};
@@ -312,13 +357,15 @@ bool NativeSession::test_session_checkpoint(std::string& error) {
     for(unsigned at:{0u,4u,8u,12u,40u,44u,48u,60u,72u,76u,80u}){auto bad=before;std::fill_n(bad.begin()+at,4,255);sign(bad);if(!reject(bad)){error="Malformed session checkpoint changed state at "+std::to_string(at);return false;}}
     unsigned active=0,trail=0;for(unsigned i=0;i<max_players;++i){active+=afk_native_active_[i];trail+=unsigned(afk_bots_[i].checkpoint().trail.size());}
     const auto aim=native_afk_manual_aim_bindings().size();const auto vote=server_->skip_vote();
-    auto authority=server_->checkpoint_authority();checkpoint::Reader authority_reader(authority,4096);
-    authority_reader.at=8;const auto counter=authority_reader.u64();authority_reader.u64();const bool requested=authority_reader.flag(),decided=authority_reader.flag();
-    if(decided)authority_reader.at+=36;
+    auto authority=server_->checkpoint_authority();SessionAuthority::CheckpointHeader authority_header;
+    if(!SessionAuthority::read_checkpoint_header(authority,authority_header,error))return false;
+    checkpoint::Reader authority_reader(authority,4096);authority_reader.at=authority_header.participants_offset;
+    const auto counter=authority_header.counter;const bool requested=authority_header.skip_requested;
     unsigned cleared_votes=0;
-    for(unsigned i=0;i<max_players;++i){authority_reader.u32();authority_reader.u64();for(unsigned n=0;n<3;++n)authority_reader.flag();authority_reader.u64();authority_reader.text(64);authority_reader.u64();authority_reader.u64();const auto at=authority_reader.at;const bool voted=authority_reader.flag();if(voted && !requested){std::fill_n(authority.begin()+at,4,0);++cleared_votes;}}
+    for(unsigned i=0;i<max_players;++i){authority_reader.u32();authority_reader.u64();for(unsigned n=0;n<3;++n)authority_reader.flag();authority_reader.u64();authority_reader.text(64);authority_reader.u64();authority_reader.u64();const auto at=authority_reader.at;const bool voted=authority_reader.flag();if(voted && !requested){std::fill_n(authority.begin()+at,4,0);++cleared_votes;}if(authority_header.has_spectators)authority_reader.flag();}
+    authority_reader.done();
     if(counter==UINT64_MAX){error="Checkpoint test cutscene counter exhausted";return false;}
-    for(unsigned i=0;i<8;++i)authority[8+i]=uint8_t((counter+1)>>(56-i*8));sign(authority);
+    for(unsigned i=0;i<8;++i)authority[authority_header.counter_offset+i]=uint8_t((counter+1)>>(56-i*8));sign(authority);
     if(!server_->restore_checkpoint_authority(authority,error))return false;
     afk_decisions_[0]^=0x12345678u;for(auto& bot:afk_bots_)bot={};clear_native_afk_manual_aim();
     std::vector<uint8_t> changed;const bool differs=save_session_checkpoint(changed,error) && canonical(changed)!=canonical(before);

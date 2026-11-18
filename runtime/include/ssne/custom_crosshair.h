@@ -21,6 +21,11 @@ bool custom_crosshair_active();
 // Guest thread only, at GX command boundaries. Ordered with the original draw's FIFO bytes.
 // false is always safe after disable and clears a previously queued scope.
 void gx_custom_crosshair_scope(bool on);
+// Guest-thread native-menu image replacement. A null image ends the scope.
+// Its ticket is independent of the user's crosshair settings and preserves
+// the original quad geometry, clipping and fade while replacing its texture.
+void gx_custom_menu_image_scope(std::shared_ptr<const CustomCrosshairImage> image);
+uint64_t custom_menu_image_replacements();
 struct CustomCrosshairStats {
     bool ready=false,stream_active=false,last_replaced=false;
     bool last_native_color=true;

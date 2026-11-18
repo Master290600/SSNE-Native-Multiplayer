@@ -55,6 +55,18 @@ int main(){try{
     set_custom_crosshair(a);const auto stale=scope(true);custom_crosshair_reset_stream();custom_crosshair_marker(stale);check(!custom_crosshair_stream_active()&&custom_crosshair_active(),"stale state ticket reactivated an unrelated draw");const auto newer=scope(true);check(newer>stale,"private ticket identities must not be reused after state load");custom_crosshair_marker(newer);set_custom_crosshair({});check(custom_crosshair_stream_active(),"UI disable raced an already-recorded draw");custom_crosshair_marker(scope(false));check(!custom_crosshair_stream_active(),"false scope did not clear after disable");
     auto invisible=a;auto empty=std::make_shared<CustomCrosshairImage>(*a.image);std::fill(empty->rgba.begin(),empty->rgba.end(),0);invisible.image=empty;set_custom_crosshair(invisible);check(!custom_crosshair_active(),"fully transparent runtime image must fall back");
     set_custom_crosshair(a);for(unsigned i=0;i<100;++i)gx_custom_crosshair_scope(true);check(custom_crosshair_stats().dropped>0,"pending config tickets must have a bounded fallback");custom_crosshair_reset_stream();set_custom_crosshair({});
+    // A custom menu image has its own ordered payload and never turns on the
+    // user's crosshair. Its native rectangular image/clip geometry stays exact.
+    auto menu=image(91);menu->left=menu->top=0;menu->right=menu->width;menu->bottom=menu->height;
+    const auto menu_at=fifo.size();gx_custom_menu_image_scope(menu);custom_crosshair_marker(token(menu_at));
+    check(!custom_crosshair_active(),"menu image changed crosshair settings");v=quad(.2f,.3f);v[1].x+=.1f;v[2].x+=.1f;const auto menu_before=v;
+    check(custom_crosshair_prepare(PRIM_QUADS,v),"native menu quad was not replaced");cfg=fixture;custom_crosshair_apply_cfg(cfg);
+    for(size_t n=0;n<v.size();++n)check(near(v[n].x,menu_before[n].x)&&near(v[n].y,menu_before[n].y)&&v[n].z==menu_before[n].z&&v[n].w==menu_before[n].w&&v[n].color[0][3]==menu_before[n].color[0][3],"menu replacement changed native rectangle/fade/depth");
+    check(near(v[0].tex[0][0],0)&&near(v[2].tex[0][0],1)&&near(v[2].tex[0][1],1),"menu image UVs did not cover the full PNG");
+    check((cfg.tex[0]->rgba[5*8+2]&255)==91,"menu image did not retain its own texture");custom_crosshair_finish_draw();
+    const auto menu_end=fifo.size();gx_custom_menu_image_scope({});custom_crosshair_marker(token(menu_end));custom_crosshair_software_flush();check(!custom_crosshair_stream_active()&&!custom_crosshair_active(),"menu scope leaked into normal rendering");
+    set_custom_crosshair(a);const auto reticle_ticket=scope(true);const auto clear_at=fifo.size();gx_custom_menu_image_scope({});
+    check(fifo.size()==clear_at,"a null menu scope cleared a user's active reticle");custom_crosshair_marker(reticle_ticket);v=quad();check(custom_crosshair_prepare(PRIM_QUADS,v),"menu scope suppressed the user's crosshair draw");custom_crosshair_finish_draw();custom_crosshair_marker(scope(false));set_custom_crosshair({});custom_crosshair_software_flush();
     check(std::memcmp(guest_before.data(),&g,sizeof(g))==0,"custom crosshair mutated guest CP/XF/BP/TMEM state");const auto observed=custom_crosshair_stats();check(observed.replacements>=3&&observed.fallbacks>=2&&observed.rejected>=1,"renderer diagnostic counters missing actual outcomes");
     std::cout<<"Ordered GX ticket snapshots, original-quad scaling/UV/depth, PNG/native health RGB ticket snapshots and alpha/material isolation, software/GPU texture ownership, default-off bytes, bounded fallback and stale-state reset passed (native pipeline collaborators synthetic).\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

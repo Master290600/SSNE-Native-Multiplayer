@@ -12,7 +12,9 @@
 #include <thread>
 
 #include "gx_internal.h"
+#include "gx_movie.h"
 #include "gx_crosshair.h"
+#include "loading_canvas_aspect.h"
 #include "ssne/gx.h"
 #include "ssne/runtime.h"
 #include "ssne/ppc_context.h"
@@ -42,10 +44,14 @@ int16_t g_konst[4][4] = {};
 inline int sext11(uint32_t v) { return int(v << 21) >> 21; }
 
 // ---- frame publishing
+movie_presentation::Draw g_current_movie;
+uint32_t g_frame_movie = 0;
 std::mutex g_frame_mutex;
 std::vector<uint32_t> g_frame;
 int g_frame_w = 0, g_frame_h = 0;
 uint64_t g_frame_seq = 0;
+float g_frame_wide = 1.f;
+bool g_saw_art_backdrop=false;
 
 struct Pix { int r, g, b, a; };
 
@@ -811,7 +817,17 @@ void tev_reg_write(uint32_t reg, uint32_t v) {
 // whole screen (scene redraws, fades) are left alone. This is the software renderer's per-draw version; the GPU
 // recorder places whole groups of draws at the end of the frame (gx_gpu_record.cpp, place_hud), which also allows
 // moving the HUD out to the screen edges (hud_edges): per draw, that splits text, which is drawn one glyph per draw.
-const std::vector<Vtx>& widescreen_hud(const std::vector<Vtx>& v, std::vector<Vtx>& tmp) {
+const std::vector<Vtx>& widescreen_hud(const std::vector<Vtx>& v, std::vector<Vtx>& tmp, float& fitted_canvas) {
+    const float loading = loading_canvas_factor();
+    const bool ortho=(g.xf_reg[0x26] & 1)!=0;
+    if (loading > 1.f && (ortho || g_saw_art_backdrop) && !v.empty()) {
+        tmp=v;
+        const bool backdrop=fit_loading_canvas(loading,v.size(),[&](size_t i){return std::array<float,4>{v[i].x,v[i].y,v[i].z,v[i].w};},
+            [&](size_t i,float x,float y){tmp[i].x=x;tmp[i].y=y;},ortho);
+        g_saw_art_backdrop |= backdrop;
+        fitted_canvas = loading;
+        return tmp;
+    }
     float k = widescreen_frame_factor();
     if (k <= 1.001f || !(g.xf_reg[0x26] & 1)) return v;
     float mn = 1e30f, mx = -1e30f;
@@ -924,10 +940,31 @@ void draw(uint8_t prim, const std::vector<Vtx>& v_in) {
 void draw_prims(uint8_t prim, const std::vector<Vtx>& v_in) {
     if (gpu_enabled()) { gpu_record_draw(prim, v_in); return; }  // (the recorder places the widescreen HUD)
     static std::vector<Vtx> hud_tmp;
-    const std::vector<Vtx>& v = widescreen_hud(v_in, hud_tmp);
+    float fitted_canvas = 1.f;
+    const std::vector<Vtx>& v = widescreen_hud(v_in, hud_tmp, fitted_canvas);
     if (dbg.nodraw) return;
     g_cfgs.push_back(build_cfg());
-    const DrawCfg& c = g_cfgs.back();
+    DrawCfg& c = g_cfgs.back();
+    if (fitted_canvas > 1.f) {
+        const auto center_x = [fitted_canvas](float x) { return EFB_W*.5f + (x - EFB_W*.5f) / fitted_canvas; };
+        if (!(g.xf_reg[0x26] & 1)) {
+            // Clip positions carry the size adjustment. The preview has its own
+            // off-center viewport, whose origin must follow the same canvas.
+            const float origin = xfr_f(0x1D) - 342.f - c.xoff;
+            c.xoff += origin - center_x(origin);
+        }
+        if (c.scissor_x1 >= c.scissor_x0 && (c.scissor_x0 > 0 || c.scissor_x1 < EFB_W - 1)) {
+            c.scissor_x0 = int(std::lround(center_x(float(c.scissor_x0))));
+            c.scissor_x1 = int(std::lround(center_x(float(c.scissor_x1 + 1)))) - 1;
+        }
+    }
+    observe_movie(c, unsigned(v.size()), [&](unsigned i, float& x, float& y) {
+        // Screen-space vertices are produced by clip_and_submit below.
+        const Vtx& p = v[i];
+        const float inv = p.w != 0 ? 1.f / p.w : 0.f;
+        x = xfr_f(0x1D) - 342.f + xfr_f(0x1A) * p.x * inv;
+        y = xfr_f(0x1E) - 342.f + xfr_f(0x1B) * p.y * inv;
+    }, g_current_movie);
     if (tracing()) {
         fprintf(stdout, "[trace] prim %02X n=%zu stages=%d blend=%06X z=%d/%d/%d acmp=%06X", prim, v.size(), c.stages, c.blend,
                 c.z_enable, c.z_func, c.z_update, c.alpha_cmp);
@@ -981,8 +1018,12 @@ void publish_frame(const uint32_t* efb, int x0, int y0, int w, int h) {
             int sx = std::min(x0 + x, EFB_W - 1), sy = std::min(y0 + y, EFB_H - 1);
             g_frame[size_t(y) * w + x] = efb[size_t(sy) * EFB_W + sx] | 0xFF000000u;
         }
+    g_frame_movie = g_current_movie.pack(y0,h);
+    g_current_movie = {};
+    g_saw_art_backdrop = false;
     g_frame_w = w;
     g_frame_h = h;
+    g_frame_wide = widescreen_frame_factor();
     g_frame_seq++;
 }
 
@@ -1153,11 +1194,17 @@ namespace ssne {
 void set_hud_edges(bool on) { gx::g_hud_edges = on; }
 
 bool gx_get_frame(std::vector<uint32_t>& rgba, int& w, int& h, uint64_t& seq) {
+    float unused;
+    return gx_get_frame(rgba,w,h,seq,unused);
+}
+bool gx_get_frame(std::vector<uint32_t>& rgba, int& w, int& h, uint64_t& seq, float& wide) {
     std::lock_guard<std::mutex> lk(gx::g_frame_mutex);
     if (!gx::g_frame_seq || gx::g_frame_seq == seq) return false;
+    movie_presentation::displayed_software = gx::g_frame_movie;
     rgba = gx::g_frame;
     w = gx::g_frame_w;
     h = gx::g_frame_h;
+    wide = gx::g_frame_wide;
     seq = gx::g_frame_seq;
     return true;
 }

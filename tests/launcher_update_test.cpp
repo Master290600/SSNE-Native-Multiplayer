@@ -19,9 +19,9 @@ namespace fs=std::filesystem;
 using J=launcher::JSONValue;using O=J::Object;using A=J::Array;
 namespace {
 #ifdef _WIN32
-constexpr const char* launcher_name="SSNE-Native.exe";
+constexpr const char* launcher_name="SSNE-RECOOP-Native.exe";
 #else
-constexpr const char* launcher_name="SSNE-Native";
+constexpr const char* launcher_name="SSNE-RECOOP-Native";
 #endif
 fs::path archive_fixture;unsigned downloads=0,extractions=0;
 std::string feed_fixture;
@@ -60,13 +60,13 @@ void marker(const fs::path& incoming,const std::string& exe_hash={},const std::s
 }
 void native_package(const fs::path& incoming,const fs::path& base,int protocol=63){
     put(incoming/launcher_name,"synthetic incoming launcher");const auto kit=incoming/"build-kit/multiplayer";
-    put(incoming/"build-kit/ssne-recomp.exe","synthetic pinned recompiler, never executed");put(incoming/"build-kit/G3BP9G_r0.sym","synthetic symbols");
+    put(incoming/"build-kit/SSNE-RECOOP-Native.exe","synthetic pinned recompiler, never executed");put(incoming/"build-kit/G3BP9G_r0.sym","synthetic symbols");
     const std::vector<std::string> special={"lib/CMakeFiles/ssne-port.dir/port/src/native_menu_carousel.cpp.obj","lib/CMakeFiles/ssne-port.dir/port/src/native_menu_mouse.cpp.obj","lib/CMakeFiles/ssne-port.dir/port/src/main.cpp.obj"};
     A files,link;
     for(unsigned i=0;i<58;++i){const auto path=i<special.size()?special[i]:"include/synthetic/fixture_"+std::to_string(i)+".h";put(kit/path,"synthetic runtime payload "+std::to_string(i));files.emplace_back(O{{"path",path},{"sha256",hash(kit/path)}});if(i<special.size())link.emplace_back("file:"+path);}
     link.emplace_back("{game_objects}");link.emplace_back("-lbcrypt");link.emplace_back("-liphlpapi");
     const auto patcher=std::string(64,'e');
-    json(kit/"runtime-kit.json",O{{"build",202},{"protocol",protocol},{"dol_sha256",hash(base/"game_data/sys/main.dol")},{"compiler_sha256",std::string(64,'c')},{"recompiler_sha256",hash(incoming/"build-kit/ssne-recomp.exe")},{"patcher_sha256",patcher},{"compile_flags",A{"-std=gnu++20","-O2"}},{"link_args",link},{"files",files}});
+    json(kit/"runtime-kit.json",O{{"build",202},{"protocol",protocol},{"dol_sha256",hash(base/"game_data/sys/main.dol")},{"compiler_sha256",std::string(64,'c')},{"recompiler_sha256",hash(incoming/"build-kit/SSNE-RECOOP-Native.exe")},{"patcher_sha256",patcher},{"compile_flags",A{"-std=gnu++20","-O2"}},{"link_args",link},{"files",files}});
     const auto descriptor=hash(kit/"runtime-kit.json"),symbols=hash(incoming/"build-kit/G3BP9G_r0.sym");
     json(kit/"translation-recipe.json",O{{"schema",1},{"kind","ssne-pal-translation-edits"},{"format","ascii-lf"},{"output_newline","crlf"},{"runtime_kit_sha256",descriptor},{"symbols_sha256",symbols},{"patcher_sha256",patcher},{"function_count",0},{"edit_count",0},{"changed_unit_count",0},{"files",A{}}});
     json(kit/"launcher-kit.json",O{{"schema",1},{"runtime_kit_sha256",descriptor},{"patch_recipe","build-kit/multiplayer/translation-recipe.json"},{"patch_recipe_sha256",hash(kit/"translation-recipe.json")},{"symbols","build-kit/G3BP9G_r0.sym"},{"symbols_sha256",symbols}});marker(incoming);
@@ -107,16 +107,16 @@ int main(int argc,char** argv){try{
     check(updater::check(feed_release,feed_error) && feed_release.version=="1.2.7.202" && feed_release.asset_name==feed_asset,"Own-project feed did not resolve the expected version and OS asset: "+feed_error);
     feed_fixture.clear();
     Temp temp;std::string error;const auto base=temp.path/"standard",incoming=temp.path/"incoming";seed_base(base,false);fs::create_directory(incoming);
-    check(!updater::validate_package(S(base),S(incoming),error)&&error.find("no SSNE-Native")!=std::string::npos,"missing launcher accepted");
+    check(!updater::validate_package(S(base),S(incoming),error)&&error.find("no SSNE-RECOOP-Native")!=std::string::npos,"missing launcher accepted");
     put(incoming/launcher_name,"new standard launcher");check(updater::validate_package(S(base),S(incoming),error),"ordinary standard package refused: "+error);
-    const std::vector<std::string> forbidden={"launcher.ini","SETTINGS.INI","Game_Data/private.bin","saves/card_a.raw","states/slot0.state","Multiplayer/saves/card_a.raw","Multiplayer/states/slot0.state","Multiplayer/settings.ini","Multiplayer/settings-netplay.ini","Multiplayer/multiplayer-launcher.ini","build-kit/work/generated.cpp","build-kit/native-multiplayer-work/generated.cpp","SSNE-Native-Game.exe","Multiplayer/SSNE-Native-Multiplayer.exe","Multiplayer/SSNE-Native-Multiplayer-Game.exe","SSNE-Native-Game","Multiplayer/SSNE-Native-Multiplayer","Multiplayer/SSNE-Native-Multiplayer-Game","update-leftovers.txt","update/files/SSNE-Native.exe"};
+    const std::vector<std::string> forbidden={"launcher.ini","SETTINGS.INI","Game_Data/private.bin","saves/card_a.raw","states/slot0.state","Multiplayer/saves/card_a.raw","Multiplayer/states/slot0.state","Multiplayer/settings.ini","Multiplayer/settings-netplay.ini","Multiplayer/multiplayer-launcher.ini","build-kit/work/generated.cpp","build-kit/native-multiplayer-work/generated.cpp","SSNE-Native-Game.exe","Multiplayer/SSNE-Native-Multiplayer.exe","Multiplayer/SSNE-Native-Multiplayer-Game.exe","SSNE-Native-Game","Multiplayer/SSNE-Native-Multiplayer","Multiplayer/SSNE-Native-Multiplayer-Game","update-leftovers.txt","update/files/SSNE-RECOOP-Native.exe"};
     for(const auto& path:forbidden){const auto package=temp.path/("blocked-"+std::to_string(&path-forbidden.data()));put(package/launcher_name,"new standard launcher");put(package/fs::u8path(path),"forbidden package content");check(!updater::validate_package(S(base),S(package),error)&&error.find("local game data")!=std::string::npos,"personal/generated path accepted: "+path+"; "+error);}
     const auto before=get(base/"settings.ini");archive_fixture=incoming;std::string launched;
     check(updater::install({"99.0.0","fixture://package","standard.zip"},S(base),[](const std::string&,double){return true;},launched,error),"standard passthrough install failed: "+error);
     check(get(base/launcher_name)=="new standard launcher"&&get(base/"settings.ini")==before&&launched==S(base/launcher_name),"standard update changed personal data or did not replace launcher");
     const auto integrated=temp.path/"integrated";seed_base(integrated,true);
     refusal_before_replacement(integrated,incoming,"native multiplayer build support");
-    const auto complete=temp.path/"complete";native_package(complete,integrated);
+    const auto complete=temp.path/"complete";native_package(complete,integrated,64);
     check(updater::validate_package(S(integrated),S(complete),error),"complete synthetic native kit refused: "+error);
     // The same integrated launcher also handles fresh and non-PAL installs.
     // Update payload coherence must not depend on a PAL disc being installed.

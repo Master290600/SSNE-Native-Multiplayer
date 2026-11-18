@@ -1,4 +1,4 @@
-// SSNE-Native launcher: asks for the user's GameCube disc, verifies it, installs the game data and
+// SSNE-RECOOP-Native launcher: asks for the user's GameCube disc, verifies it, installs the game data and
 // launches the PC port.
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -45,6 +45,57 @@ static void save_screenshot(SDL_Window* win, const char* path) {
 // Pixels per window point (display scaling on Windows, Wayland): the fonts are rebuilt when it changes, e.g. when the
 // window moves to a screen with another scale.
 static float g_ui_scale = 0;
+// Enlarge the existing workspace before its first editor frame. SDL's pinned
+// Windows backend uses SWP_NOACTIVATE for these geometry calls; no show/raise,
+// focus, maximize or GL-context operation is needed, including in hidden QA.
+class EditorWindowWorkspace {
+    bool editor_ = false, resized_ = false;
+    int x_ = 0, y_ = 0, width_ = 0, height_ = 0, min_width_ = 0, min_height_ = 0;
+    static bool normal(SDL_Window* window) {
+        return !(SDL_GetWindowFlags(window) &
+                 (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED | SDL_WINDOW_MINIMIZED));
+    }
+public:
+    void sync(SDL_Window* window, bool editor) {
+        if (editor == editor_) return;
+        editor_ = editor;
+        SDL_SetWindowTitle(window, editor ? "SSNE-RECOOP-Native - Map Editor" : "SSNE-RECOOP-Native");
+        if (!editor) {
+            if (resized_ && normal(window)) {
+                SDL_SetWindowMinimumSize(window, min_width_, min_height_);
+                SDL_SetWindowSize(window, width_, height_);
+                SDL_SetWindowPosition(window, x_, y_);
+            }
+            resized_ = false;
+            return;
+        }
+        if (!normal(window)) return;
+        SDL_GetWindowSize(window, &width_, &height_);
+        SDL_GetWindowPosition(window, &x_, &y_);
+        SDL_GetWindowMinimumSize(window, &min_width_, &min_height_);
+        const int display = SDL_GetWindowDisplayIndex(window);
+        SDL_Rect work{};
+        if (display < 0 || SDL_GetDisplayUsableBounds(display, &work) != 0) return;
+        int top = 0, left = 0, bottom = 0, right = 0;
+        if (SDL_GetWindowBordersSize(window, &top, &left, &bottom, &right) != 0)
+            top = left = bottom = right = 0;
+        const int available_width = work.w - left - right;
+        const int available_height = work.h - top - bottom;
+        if (available_width <= 0 || available_height <= 0) return;
+        const int width = std::min(available_width, std::max(width_, 1440));
+        const int height = std::min(available_height, std::max(height_, 900));
+        const int x = std::clamp(x_ + (width_ - width) / 2,
+                                 work.x + left, work.x + work.w - right - width);
+        const int y = std::clamp(y_ + (height_ - height) / 2,
+                                 work.y + top, work.y + work.h - bottom - height);
+        resized_ = width != width_ || height != height_ || x != x_ || y != y_;
+        if (!resized_) return;
+        SDL_SetWindowMinimumSize(window, std::min(min_width_, available_width),
+                                std::min(min_height_, available_height));
+        SDL_SetWindowSize(window, width, height);
+        SDL_SetWindowPosition(window, x, y);
+    }
+};
 static void update_ui_scale(SDL_Window* win) {
     int ww, wh, dw, dh;
     SDL_GetWindowSize(win, &ww, &wh);
@@ -76,7 +127,7 @@ static int launcher_main(int argc, char** argv) {
     const bool hidden = getenv("SSNE_TEST_HIDDEN") && strcmp(getenv("SSNE_TEST_HIDDEN"), "1") == 0;
     const auto command_file = hidden ? platform::environment_utf8("SSNE_LAUNCHER_TEST_COMMAND") : std::string{};
     const char* command_path = command_file.empty() ? nullptr : command_file.c_str();
-    SDL_Window* win = SDL_CreateWindow("Serious Sam: Next Encounter Native", SDL_WINDOWPOS_CENTERED,
+    SDL_Window* win = SDL_CreateWindow("SSNE-RECOOP-Native", SDL_WINDOWPOS_CENTERED,
                                        SDL_WINDOWPOS_CENTERED, 1024, 640,
                                        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (hidden ? SDL_WINDOW_HIDDEN : 0));
     if (!win) { fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError()); return 1; }
@@ -89,7 +140,7 @@ static int launcher_main(int argc, char** argv) {
         gl = SDL_GL_CreateContext(win);
     }
     if (!gl) { fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError()); return 1; }
-    SDL_GL_SetSwapInterval(1);
+    SDL_GL_SetSwapInterval(hidden?0:1);
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
 
     IMGUI_CHECKVERSION();
@@ -107,8 +158,10 @@ static int launcher_main(int argc, char** argv) {
     {
         startup_stage = "reading launcher configuration and build kit";
         LauncherApp app(updated);
+        EditorWindowWorkspace editor_workspace;
         bool quit = false;
         while (!quit && !app.wants_quit()) {
+            editor_workspace.sync(win, app.editor_open());
             SDL_Event e;
             while (SDL_PollEvent(&e)) {
                 ImGui_ImplSDL2_ProcessEvent(&e);
@@ -136,7 +189,7 @@ static int launcher_main(int argc, char** argv) {
                     if (action == "move" || action == "down" || action == "up") {
                         float x = 0, y = 0; std::string button;
                         if (action != "move") command >> button;
-                        if (!(command >> x >> y) || (action != "move" && button != "left")) continue;
+                        if (!(command >> x >> y) || (action != "move" && button != "left" && button != "right" && button != "middle")) continue;
                         if (action == "move") {
                             event.type = SDL_MOUSEMOTION; event.motion.windowID = window_id;
                             event.motion.x = int(x); event.motion.y = int(y);
@@ -144,17 +197,29 @@ static int launcher_main(int argc, char** argv) {
                             // Position and button are independent events, just as in the backend.
                             ImGui::GetIO().AddMousePosEvent(x, y);
                             event.type = action == "down" ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
-                            event.button.windowID = window_id; event.button.button = SDL_BUTTON_LEFT;
+                            event.button.windowID = window_id; event.button.button = button=="right"?SDL_BUTTON_RIGHT:button=="middle"?SDL_BUTTON_MIDDLE:SDL_BUTTON_LEFT;
                             event.button.x = int(x); event.button.y = int(y);
                         }
                         ImGui_ImplSDL2_ProcessEvent(&event);
                     } else if (action == "key") {
                         std::string state, key; command >> state >> key;
-                        if (key != "Escape" || (state != "down" && state != "up")) continue;
+                        if (state != "down" && state != "up") continue;
+                        SDL_Keycode code=key=="Escape"?SDLK_ESCAPE:key=="Enter"?SDLK_RETURN:key=="Down"?SDLK_DOWN:key=="Up"?SDLK_UP:key=="Home"?SDLK_HOME:key=="End"?SDLK_END:key=="F1"?SDLK_F1:key=="Tab"?SDLK_TAB:key=="Backspace"?SDLK_BACKSPACE:key=="Delete"?SDLK_DELETE:key=="Ctrl"?SDLK_LCTRL:key=="Shift"?SDLK_LSHIFT:key=="Alt"?SDLK_LALT:key.size()==1?SDL_Keycode(key[0]):SDLK_UNKNOWN;
+                        if(code==SDLK_UNKNOWN)continue;
                         event.type = state == "down" ? SDL_KEYDOWN : SDL_KEYUP;
-                        event.key.windowID = window_id; event.key.keysym.sym = SDLK_ESCAPE;
-                        event.key.keysym.scancode = SDL_SCANCODE_ESCAPE;
+                        event.key.windowID = window_id; event.key.keysym.sym = code;
+                        event.key.keysym.scancode=SDL_GetScancodeFromKey(code);
+                        if(code==SDLK_LCTRL || code==SDLK_LSHIFT || code==SDLK_LALT){auto flag=code==SDLK_LCTRL?KMOD_LCTRL:code==SDLK_LSHIFT?KMOD_LSHIFT:KMOD_LALT;SDL_SetModState(SDL_Keymod(state=="down"?(SDL_GetModState()|flag):(SDL_GetModState()&~flag)));}
+                        event.key.keysym.mod=SDL_GetModState();
+
                         ImGui_ImplSDL2_ProcessEvent(&event);
+                    } else if (action == "wheel") {
+                        float dy=0;if(!(command >> dy))continue;
+                        event.type=SDL_MOUSEWHEEL;event.wheel.windowID=window_id;event.wheel.y=int(dy);event.wheel.preciseY=dy;
+                        ImGui_ImplSDL2_ProcessEvent(&event);
+                    } else if (action == "text") {
+                        std::string value;std::getline(command >> std::ws,value);
+                        if(!value.empty())ImGui::GetIO().AddInputCharactersUTF8(value.c_str());
                     } else if (action == "drop" || action == "shot") {
                         std::string path; std::getline(command >> std::ws, path);
                         if (!path.empty() && path.back() == '\r') path.pop_back();
@@ -181,6 +246,7 @@ static int launcher_main(int argc, char** argv) {
             startup_stage = "writing hidden test state";
             if (command_path) app.save_test_state(platform::exe_dir() + "/launcher-test-state.json", accepted_sequence, frames);
             SDL_GL_SwapWindow(win);
+            if(hidden)SDL_Delay(16);
         }
     }
     ImGui_ImplOpenGL3_Shutdown();
@@ -200,7 +266,7 @@ int main(int argc,char** argv) {
         const char* hidden=getenv("SSNE_TEST_HIDDEN");
         if (!hidden || strcmp(hidden,"1")!=0) {
             const std::string message=std::string("The launcher could not start: ")+error.what();
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"SSNE-Native",message.c_str(),nullptr);
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"SSNE-RECOOP-Native",message.c_str(),nullptr);
         }
         return 1;
     }

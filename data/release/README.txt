@@ -1,4 +1,4 @@
-SERIOUS SAM: NEXT ENCOUNTER NATIVE (SSNE-NATIVE)
+SSNE-RECOOP-Native
 Unofficial fan project: play Serious Sam: Next Encounter (Nintendo GameCube, 2004) as a native PC program,
 built on your own PC from your own copy of the game.
 
@@ -28,11 +28,11 @@ REQUIREMENTS
   Do not ask for, share or download disc images.
 
 FILES
-  SSNE-Native.exe        the launcher
+  SSNE-RECOOP-Native.exe        the launcher
   gctool.exe               command-line disc tool: gctool info|verify|extract <image> [...]
   known_dumps.txt          SHA-1 checksums of known good dumps (checksums only)
   build-kit\               what the launcher needs to build the game on your PC:
-      ssne-recomp.exe        translator from the GameCube program to C++
+      SSNE-RECOOP-Native.exe        translator from the GameCube program to C++
       G3BE9G_r1.sym          function names for the translator
       include\, lib\         the PC port and its runtime, prebuilt (no game code)
       kit.ini                build settings (compiler download address, compiler flags)
@@ -131,7 +131,7 @@ HOTKEYS (work any time in the game window; also listed in F12 > Hotkeys)
   Print Screen or Shift+F12  screenshot of the game image (PNG in the Screenshots folder next to the game)
 
 LEGAL
-  SSNE-Native is an unofficial, non-commercial fan project based on Silly ReEncounter. It is not affiliated with, endorsed by or
+  SSNE-RECOOP-Native is an unofficial, non-commercial fan project based on Silly ReEncounter. It is not affiliated with, endorsed by or
   sponsored by Croteam, Devolver Digital, Climax Group, Global Star Software, Take-Two Interactive or Nintendo.
   "Serious Sam" and "Serious Sam: Next Encounter" are trademarks of their respective owners and are used here only
   to identify the game this software works with. Nintendo GameCube is a trademark of Nintendo.

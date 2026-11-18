@@ -1,0 +1,10 @@
+SSNE-INTERNET-1
+# Defaults are used when settings.ini.internet is absent.
+# Copy this file next to the active game's settings.ini as settings.ini.internet
+# only when overriding the Internet services. Keep relay credentials private.
+signal_url "https://ntfy.sh"
+stun_host "stun.cloudflare.com"
+stun_port 3478
+automatic_mapping 1
+# Optional authenticated TURN fallback; provision your own service first.
+# relay "relay.example.org" 3478 "username" "password"

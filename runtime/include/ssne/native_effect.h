@@ -7,6 +7,12 @@
 #include <functional>
 #include <optional>
 namespace ssne {
+// Narrow PAL scene-emitter presentation. Neither operation dispatches mission
+// events or damage; the existing presentation guard covers native callbacks.
+bool update_native_scene_particle(PPCContext&,uint32_t emitter,unsigned kind,
+                                  float seconds,std::string& error);
+bool set_native_scene_particle_enabled(PPCContext&,uint32_t holder,unsigned kind,
+                                      bool enabled,std::string& error);
 // Automatic weapons have native ray invocations, not individual sound events. Their
 // IDs occupy a separate positive signed-64-bit namespace; bit0 is the hand.
 inline constexpr uint64_t native_automatic_ray_tag=uint64_t(1)<<62;

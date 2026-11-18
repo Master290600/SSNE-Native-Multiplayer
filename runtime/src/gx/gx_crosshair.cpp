@@ -11,7 +11,7 @@
 
 namespace ssne { namespace {
 struct Payload {
-    bool enabled=false,native_color=true;
+    bool enabled=false,native_color=true,preserve_geometry=false;
     int size=32,opacity=100;
     std::shared_ptr<const CustomCrosshairImage> image;
     std::shared_ptr<gx::Texture> texture;
@@ -19,10 +19,14 @@ struct Payload {
 std::mutex mutex;
 std::shared_ptr<const Payload> latest;
 std::unordered_map<uint64_t,std::shared_ptr<const Payload>> tickets;
+std::unordered_map<const CustomCrosshairImage*,std::shared_ptr<const Payload>> menu_images;
 uint64_t next_ticket=0;
 std::atomic<uint64_t> next_texture{0x4000000000000001ull};
 std::atomic<bool> ready{false},guest_scope{false};
+enum class GuestScope : unsigned {None,Crosshair,Menu};
+std::atomic<GuestScope> guest_scope_kind{GuestScope::None};
 CustomCrosshairStats stats;
+uint64_t menu_replacements=0;
 constexpr size_t max_tickets=32;
 // Only the command processor accesses these. UI publication never touches a queued draw.
 std::shared_ptr<const Payload> current;
@@ -69,6 +73,35 @@ void set_custom_crosshair(const CustomCrosshairConfig& cfg){
     if(active){const auto& image=*latest->image;stats.texture_id=latest->texture->id;stats.width=image.width;stats.height=image.height;stats.left=image.left;stats.top=image.top;stats.right=image.right;stats.bottom=image.bottom;}
 }
 bool custom_crosshair_active(){return ready.load(std::memory_order_acquire);}
+void gx_custom_menu_image_scope(std::shared_ptr<const CustomCrosshairImage> image){
+    if(!image || !valid_image(*image)){
+        if(guest_scope_kind.load(std::memory_order_relaxed)==GuestScope::Menu)gx_custom_crosshair_scope(false);
+        return;
+    }
+    uint64_t ticket=0;
+    {
+        std::lock_guard lock(mutex);
+        auto found=menu_images.find(image.get());
+        if(found==menu_images.end()){
+            // Images are decoded once, immutable, and bounded by the catalogue.
+            // Keep only this menu catalogue's published image objects.
+            if(menu_images.size()>=256)menu_images.clear();
+            auto payload=std::make_shared<Payload>();payload->enabled=true;
+            payload->native_color=false;payload->preserve_geometry=true;payload->image=image;
+            auto texture=std::make_shared<gx::Texture>();texture->w=int(image->width);texture->h=int(image->height);
+            texture->tex_fmt=6;texture->id=next_texture.fetch_add(1);
+            texture->rgba.resize(size_t(image->width)*image->height);
+            for(size_t n=0;n<texture->rgba.size();++n){const auto k=n*4;texture->rgba[n]=uint32_t(image->rgba[k])|(uint32_t(image->rgba[k+1])<<8)|(uint32_t(image->rgba[k+2])<<16)|(uint32_t(image->rgba[k+3])<<24);}
+            payload->texture=std::move(texture);found=menu_images.emplace(image.get(),std::move(payload)).first;
+        }
+        if(tickets.size()<1024){if(++next_ticket==0)++next_ticket;ticket=next_ticket;tickets.emplace(ticket,found->second);}
+        else ++stats.dropped;
+        if(!ticket&&!guest_scope.load(std::memory_order_relaxed))return;
+        guest_scope.store(ticket!=0,std::memory_order_relaxed);++stats.queued;
+        guest_scope_kind.store(ticket?GuestScope::Menu:GuestScope::None,std::memory_order_relaxed);
+    }
+    emit(ticket);
+}
 void gx_custom_crosshair_scope(bool on){
     if(!on&&!guest_scope.load(std::memory_order_relaxed))return;
     uint64_t ticket=0;
@@ -79,10 +112,12 @@ void gx_custom_crosshair_scope(bool on){
         }else if(on&&latest&&latest->enabled)++stats.dropped;
         if(!ticket&&!guest_scope.load(std::memory_order_relaxed))return;
         guest_scope.store(ticket!=0,std::memory_order_relaxed);++stats.queued;
+        guest_scope_kind.store(ticket?GuestScope::Crosshair:GuestScope::None,std::memory_order_relaxed);
     }
     emit(ticket);
 }
 CustomCrosshairStats custom_crosshair_stats(){std::lock_guard lock(mutex);return stats;}
+uint64_t custom_menu_image_replacements(){std::lock_guard lock(mutex);return menu_replacements;}
 
 namespace gx {
 void custom_crosshair_marker(uint64_t ticket){
@@ -99,7 +134,7 @@ void custom_crosshair_finish_draw(){if(prepared){prepared=false;g_cfg_dirty=true
 void custom_crosshair_software_flush(){software_kept.clear();}
 void custom_crosshair_reset_stream(){
     current.reset();prepared=false;texture_map=texture_coord=-1;g_cfg_dirty=true;
-    std::lock_guard lock(mutex);tickets.clear();guest_scope.store(false,std::memory_order_relaxed);stats.stream_active=false;stats.last_replaced=false;++stats.resets;
+    std::lock_guard lock(mutex);tickets.clear();guest_scope.store(false,std::memory_order_relaxed);guest_scope_kind.store(GuestScope::None,std::memory_order_relaxed);stats.stream_active=false;stats.last_replaced=false;++stats.resets;
 }
 void custom_crosshair_apply_cfg(DrawCfg& c){
     if(!prepared||!current||texture_map<0||texture_coord<0)return;
@@ -145,7 +180,7 @@ bool custom_crosshair_prepare(uint8_t primitive,std::vector<Vtx>& vertices){
     const double lu=std::hypot(ux*vx,uy*vy),lv=std::hypot(tx*vx,ty*vy);
     if(!(lu>1e-5&&lv>1e-5&&lu<4096&&lv<4096))return fallback();
     const auto& image=*current->image;const double iw=image.right-image.left,ih=image.bottom-image.top;
-    const double scale=std::max(lu,lv)*double(current->size)/32.,su=scale*(iw/std::max(iw,ih))/lu,sv=scale*(ih/std::max(iw,ih))/lv;
+    const double scale=std::max(lu,lv)*double(current->size)/32.,su=current->preserve_geometry?1.:scale*(iw/std::max(iw,ih))/lu,sv=current->preserve_geometry?1.:scale*(ih/std::max(iw,ih))/lv;
     const double cx=(point[0][0]+point[1][0]+point[2][0]+point[3][0])*.25,cy=(point[0][1]+point[1][1]+point[2][1]+point[3][1])*.25;
     if(!retain_software(current->texture))return fallback();
     double left=1e30,right=-1e30,top=-1e30,bottom=1e30,new_left=1e30,new_right=-1e30,new_top=-1e30,new_bottom=1e30;
@@ -158,7 +193,7 @@ bool custom_crosshair_prepare(uint8_t primitive,std::vector<Vtx>& vertices){
         new_left=std::min(new_left,x);new_right=std::max(new_right,x);new_top=std::max(new_top,y);new_bottom=std::min(new_bottom,y);
     }
     texture_map=map;texture_coord=coord;prepared=true;g_cfg_dirty=true;
-    ++stats.replacements;stats.last_replaced=true;stats.texture_id=current->texture->id;
+    ++stats.replacements;if(current->preserve_geometry)++menu_replacements;stats.last_replaced=true;stats.texture_id=current->texture->id;
     stats.original_left=float(left);stats.original_top=float(top);stats.original_right=float(right);stats.original_bottom=float(bottom);
     stats.drawn_left=float(new_left);stats.drawn_top=float(new_top);stats.drawn_right=float(new_right);stats.drawn_bottom=float(new_bottom);return true;
 }

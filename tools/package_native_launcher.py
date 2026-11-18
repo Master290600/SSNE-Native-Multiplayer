@@ -4,6 +4,7 @@ sources/objects/executables, user settings, saves or private build caches.
 """
 from pathlib import Path
 import argparse,hashlib,json,shutil,subprocess
+from audit_source import inspect, vendor_source
 
 
 def sha(path):
@@ -17,7 +18,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     for name in ('base','launcher','recipe','sidecar','output'):
         parser.add_argument('--'+name,type=Path,required=True)
-    parser.add_argument('--integration-build',type=int,default=198)
+    parser.add_argument('--integration-build',type=int,default=229)
     args=parser.parse_args()
     source=Path(__file__).resolve().parents[1]
     base=args.base.resolve(strict=True);kit=base/'build-kit/multiplayer'
@@ -29,12 +30,12 @@ def main():
         raise ValueError('Unexpected recipe path or checksum')
     if side['symbols']!='build-kit/G3BP9G_r0.sym' or side['symbols_sha256']!=sha(base/side['symbols']):
         raise ValueError('PAL symbols differ')
-    if sha(base/'build-kit/ssne-recomp.exe')!=descriptor['recompiler_sha256']:
+    if sha(base/'build-kit/SSNE-RECOOP-Native.exe')!=descriptor['recompiler_sha256']:
         raise ValueError('Pinned recompiler differs')
     if sha(source/'tools/patch_multiplayer.py')!=descriptor['patcher_sha256']:
         raise ValueError('Source patcher differs from reviewed runtime')
     files=descriptor['files']
-    if not 58<=len(files)<=128 or descriptor['protocol']!=63 or descriptor['build']<197:
+    if not 58<=len(files)<=128 or descriptor['protocol'] not in (63,64,65,66,67,68,69,70) or descriptor['build']<197:
         raise ValueError('Unexpected native runtime scope')
     seen=set()
     for item in files:
@@ -50,10 +51,10 @@ def main():
     output.mkdir(parents=True)
     def copy(origin,relative):
         target=output/relative;target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(origin,target)
-    copy(args.launcher,'SSNE-Native.exe')
-    for name in ('gctool.exe','known_dumps.txt','LICENSE.txt','THIRD-PARTY-NOTICES.txt'):
+    copy(args.launcher,'SSNE-RECOOP-Native.exe')
+    for name in ('gctool.exe','known_dumps.txt','LICENSE.txt'):
         copy(base/name,name)
-    for name in ('kit.ini','ssne-recomp.exe','G3BE9G_r1.sym','G3BP9G_r0.sym'):
+    for name in ('kit.ini','SSNE-RECOOP-Native.exe','G3BE9G_r1.sym','G3BP9G_r0.sym'):
         copy(base/'build-kit'/name,Path('build-kit')/name)
     for name in ('include','lib'):
         shutil.copytree(base/'build-kit'/name,output/'build-kit'/name)
@@ -62,17 +63,32 @@ def main():
     copy(args.recipe,'build-kit/multiplayer/translation-recipe.json')
     copy(args.sidecar,'build-kit/multiplayer/launcher-kit.json')
     shutil.copytree(base/'licenses',output/'licenses')
+    # Ship current notices and corresponding source licenses, not a stale base.
+    copy(source/'data/release/THIRD-PARTY-NOTICES.txt','THIRD-PARTY-NOTICES.txt')
+    for name in ('libjuice-MPL-2.0.txt','KCP-MIT.txt'):
+        copy(source/'licenses'/name,Path('licenses')/name)
+    for name in ('NATIVE-INVITATIONS.txt','SSNE-INTERNET.example'):
+        copy(source/'data/release'/name,name)
     paths=subprocess.check_output(['git','-c','core.quotepath=false','ls-files','--cached','--others','--exclude-standard','-z'],cwd=source).decode('utf8').split('\0')
-    for name in sorted(set(paths)-{''}):
+    paths=set(paths)-{''}
+    # Ensure ignored-but-reviewed dependency sources are not silently omitted.
+    # Upstream screenshots, fuzzer raw packets and editor metadata are not source.
+    for directory in ('vendor/libjuice','vendor/kcp'):
+        paths.update(p.relative_to(source).as_posix() for p in (source/directory).rglob('*')
+                     if p.is_file() and vendor_source(p.relative_to(source).as_posix()))
+    paths={name for name in paths if not name.startswith('vendor/') or vendor_source(name)}
+    for name in sorted(paths):
         path=source/name
         if path.is_symlink() or not path.is_file():raise ValueError('Missing/nonregular source: '+name)
+        issues=inspect(name,path.read_bytes())
+        if issues:raise ValueError('Source audit failed: '+name+'; '+', '.join(issues))
         if any(part in ('game_data','generated','generated-multiplayer','work','build') for part in Path(name).parts):
             raise ValueError('Private generated data in source list: '+name)
         copy(path,Path('source')/name)
     copy(source/'data/release/NATIVE-MULTIPLAYER.txt','README.txt')
     marker={'schema':1,'target':'native-multiplayer','integration_build':args.integration_build,
         'runtime_build':descriptor['build'],'protocol':descriptor['protocol'],
-        'launcher_sha256':sha(output/'SSNE-Native.exe'),
+        'launcher_sha256':sha(output/'SSNE-RECOOP-Native.exe'),
         'launcher_kit_sha256':sha(output/'build-kit/multiplayer/launcher-kit.json'),
         'runtime_descriptor_sha256':sha(output/'build-kit/multiplayer/runtime-kit.json')}
     (output/'launcher-integration.json').write_text(json.dumps(marker,indent=2)+'\n',encoding='utf8')

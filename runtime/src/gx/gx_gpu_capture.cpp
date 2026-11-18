@@ -17,8 +17,8 @@
 namespace ssne::gx {
 
 namespace {
-constexpr uint32_t kVersion = 4;  // 2: copies into part of an earlier copy (base_copy_id ...); 3: GPU vertex processing;
-                                  // 4: dst_col
+constexpr uint32_t kVersion = 5;  // 2: copies into part of an earlier copy (base_copy_id ...); 3: GPU vertex processing;
+                                  // 4: dst_col; 5: canvas_fitted in GpuState
 
 template <class T> void put(FILE* f, const T& v) { fwrite(&v, sizeof(T), 1, f); }
 template <class T> bool get(FILE* f, T& v) { return fread(&v, sizeof(T), 1, f) == 1; }
@@ -137,7 +137,8 @@ std::unique_ptr<GpuFrame> gpu_load_captured_frame(const std::string& path, std::
     for (GpuState& st : fr->states) {
         uint32_t sz;
         if (!get(f, sz) || sz != sizeof(GpuState)) return fail("state layout differs from this build");
-        fread(&st, sizeof(GpuState), 1, f);
+        if (fread(&st, sizeof(GpuState), 1, f) != 1) return fail("truncated state");
+        if (ver < 5) st.canvas_fitted = false;  // this byte was padding in older captures
         for (auto& t : st.cfg.tex) {
             uintptr_t i = reinterpret_cast<uintptr_t>(t);
             t = (i && i <= texs.size()) ? texs[i - 1].get() : nullptr;

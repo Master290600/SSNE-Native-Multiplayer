@@ -13,12 +13,34 @@ SUFFIXES={'.cpp','.h','.hpp','.inc','.cmake','.py','.ps1','.cmd','.rc','.manifes
 FORBIDDEN_PARTS={'private','generated','recompiled','game_data','saves','states','runs','vendor','build-kit','node_modules','__pycache__'}
 FORBIDDEN_EXT={'.iso','.gcm','.rvz','.wia','.gcz','.ciso','.dol','.bik','.raw','.ram','.state','.coop','.exe','.dll','.o','.obj','.a','.lib','.pdb','.mp4','.bmp','.zip','.7z','.bin'}
 
+# Only the reviewed Internet libraries' text/build sources are admitted under
+# vendor. This does not allow arbitrary vendor trees, fixtures or binaries.
+VENDOR_FILES={
+    'vendor/libjuice/CMakeLists.txt','vendor/libjuice/Makefile',
+    'vendor/libjuice/LICENSE','vendor/libjuice/README.md','vendor/libjuice/CONTRIBUTING.md',
+    'vendor/libjuice/cmake/LibJuiceConfig.cmake.in',
+    'vendor/libjuice/cmake/Modules/FindNettle.cmake',
+    'vendor/libjuice/fuzzer/fuzzer.c','vendor/libjuice/fuzzer/README.md',
+    'vendor/libjuice/include/juice/juice.h',
+    'vendor/kcp/CMakeLists.txt','vendor/kcp/LICENSE','vendor/kcp/README.md',
+    'vendor/kcp/README.en.md','vendor/kcp/protocol.txt',
+    'vendor/kcp/ikcp.c','vendor/kcp/ikcp.h','vendor/kcp/test.cpp','vendor/kcp/test.h',
+}
+
+def vendor_source(name):
+    return name in VENDOR_FILES or re.fullmatch(r'vendor/libjuice/(?:src|test)/[^/]+\.[ch]',name) is not None
+
 def inspect(name,data):
     p=Path(name);issues=[]
-    if p.is_absolute() or '..' in p.parts:issues.append('unsafe path')
-    metadata=name in {'data/kit/kit.ini','data/kit/kit-linux.ini.in','data/pgo/runtime.proftext'}
-    if name not in ROOT_FILES and not metadata and (not name.startswith(PREFIXES) or (p.suffix not in SUFFIXES and p.name!='CMakeLists.txt')):issues.append('outside source allowlist')
-    if any(part in FORBIDDEN_PARTS or part.startswith('build-') for part in p.parts):issues.append('private/generated/build directory')
+    if p.is_absolute() or '..' in p.parts or '\\' in name or ':' in name:issues.append('unsafe path')
+    metadata=name in {'data/kit/kit.ini','data/kit/kit-linux.ini.in','data/pgo/runtime.proftext','data/release/SSNE-INTERNET.example'}
+    if name == 'port/resources/game.ico':
+        if hashlib.sha256(data).hexdigest() != '8dbc49c88151736b0a1a083d804df099c7aaec2266b1b0882ecb7277e855d86f':
+            issues.append('unexpected game icon')
+        return issues
+    reviewed_vendor=vendor_source(name)
+    if name not in ROOT_FILES and not metadata and not reviewed_vendor and (not name.startswith(PREFIXES) or (p.suffix not in SUFFIXES and p.name!='CMakeLists.txt')):issues.append('outside source allowlist')
+    if any((part in FORBIDDEN_PARTS and not (part=='vendor' and reviewed_vendor and index==0)) or part.startswith('build-') for index,part in enumerate(p.parts)):issues.append('private/generated/build directory')
     if p.name.endswith('.ini.multiplayer'):issues.append('personal multiplayer settings')
     if p.suffix.lower() in FORBIDDEN_EXT:issues.append('excluded artifact type')
     # This atlas is generated from the included OFL font by make_prompt_icons.py.

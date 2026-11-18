@@ -4,12 +4,16 @@
 #include <vector>
 
 namespace launcher {
+inline constexpr char native_project_exe[] = "SSNE-Native-Game.exe";
+inline constexpr char native_legacy_exe[] = "SSNE-Native-Multiplayer-Game.exe";
+inline constexpr char native_legacy_alias[] = "SSNE-Native-Multiplayer.exe";
 struct RuntimeKitFile {
     std::string path,sha256;
 };
 struct RuntimeKit {
     std::string project_dir,kit_dir,data_dir;
     std::string descriptor_sha256,sidecar_sha256,fingerprint;
+    std::string ps2_content_sha256;   // required PAL add-on recipe, when present in the launcher kit
     std::string recipe,recipe_sha256,symbols,symbols_sha256;
     std::string compiler,compiler_sha256,recompiler,recompiler_sha256,dol_sha256;
     int build=0,protocol=0;

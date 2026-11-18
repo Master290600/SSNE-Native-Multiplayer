@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -19,6 +20,7 @@ struct Participant {
     bool afk = false;
     uint64_t character = 0;
     std::string name;
+    bool spectator = false; // voluntary preference; forced round locks are separate
 };
 struct SkipVote {
     uint64_t cutscene = 0;
@@ -36,6 +38,20 @@ enum class CommandResult { Applied, Unchanged, StalePlayer, StaleSequence, Wrong
 // the authenticated PlayerId; requests cannot select another participant.
 class SessionAuthority {
 public:
+    struct CheckpointHeader {
+        uint32_t format=0;
+        unsigned capacity=0;
+        uint8_t spectator_locks=0;
+        bool has_spectators=false,presentation_vote=false,skip_requested=false;
+        uint64_t counter=0,cutscene=0;
+        std::optional<SkipDecision> decision;
+        // Positions belong to the validated format, never fixed caller offsets.
+        std::size_t counter_offset=0,participants_offset=0;
+    };
+    // Reads and validates the checksum and versioned prefix without changing
+    // bytes or authority state. Participant validation remains in restore.
+    static bool read_checkpoint_header(const std::vector<uint8_t>&,
+                                      CheckpointHeader&,std::string& error);
     explicit SessionAuthority(unsigned capacity = max_players);
     std::optional<PlayerId> join(std::string name,bool automated=false);
     bool automate(PlayerId);
@@ -51,6 +67,12 @@ public:
     // The server alone derives allow_unready from its validated results snapshot.
     CommandResult request_afk(PlayerId connection, uint64_t sequence, bool afk,bool allow_unready=false);
     CommandResult request_skip(PlayerId connection, uint64_t sequence, uint64_t cutscene);
+    CommandResult request_spectator(PlayerId connection,uint64_t sequence,bool spectator,bool allow_unready=false);
+    // Native activation rollback only; never accepts a wire request or lowers replay floors.
+    // False for stale identity/forced round lock; only voluntary watch can be canceled.
+    bool cancel_spectator_activation(PlayerId);
+    void set_spectator_lock(uint8_t mask);
+    uint8_t spectator_lock_mask()const{return spectator_lock_mask_;}
     SkipVote skip_vote() const;
     std::optional<SkipDecision> skip_decision() const {return decision_;}
     // Exact transaction participant. The server holds its control mutex for
@@ -77,6 +99,7 @@ private:
     uint64_t cutscene_counter_ = 0, cutscene_ = 0;
     bool skip_requested_ = false;
     bool presentation_vote_ = false;
+    uint8_t spectator_lock_mask_ = 0;
     std::optional<SkipDecision> decision_;
 };
 }

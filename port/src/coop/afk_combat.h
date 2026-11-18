@@ -4,10 +4,12 @@
 #include <cmath>
 #include <cstdint>
 namespace port::coop {
-// Maximum useful primary-fire distances. Close weapons never inherit a
-// rifle's detection radius merely because both weapons are in the inventory.
+// Conservative useful primary-fire distances, not altered weapon physics.
+// Original PAL hitscan distance is400 for pistol/minigun and1500 for sniper;
+// spread and muzzle alignment still matter, so companions use shorter limits.
+// Close weapons never inherit a rifle's firing reach from inventory ownership.
 inline float bot_weapon_range(unsigned weapon){
-    constexpr std::array<float,12> ranges{2.5f,100.f,45.f,15.f,100.f,100.f,35.f,10.f,100.f,100.f,100.f,0.f};
+    constexpr std::array<float,12> ranges{2.5f,120.f,60.f,15.f,150.f,100.f,35.f,10.f,250.f,150.f,100.f,0.f};
     return weapon<ranges.size()?ranges[weapon]:0.f;
 }
 inline bool bot_weapon_in_range(unsigned weapon,float distance){
@@ -15,6 +17,14 @@ inline bool bot_weapon_in_range(unsigned weapon,float distance){
 }
 inline float bot_acquisition_range(const std::array<bool,12>& usable){
     float range=0.f;for(unsigned weapon=0;weapon<usable.size();++weapon)if(usable[weapon])range=std::max(range,bot_weapon_range(weapon));return range;
+}
+inline constexpr float bot_max_perception_range=250.f,bot_default_perception_range=160.f;
+inline float bot_perception_range(const std::array<bool,12>& usable){
+    // Perception is distinct from permission to fire. Seeing a distant threat
+    // must not make a shotgun/grenade shoot beyond its useful range, or replace
+    // the human's follow route. No usable weapon means no combat acquisition.
+    const auto fire_range=bot_acquisition_range(usable);
+    return fire_range>0.f?std::min(bot_max_perception_range,std::max(bot_default_perception_range,fire_range)):0.f;
 }
 template<class Query> bool bot_visible_target(float distance,float range,Query&& clear_native_line){
     return std::isfinite(distance) && std::isfinite(range) && distance>=0.f && range>0.f && distance<=range && clear_native_line();
@@ -34,6 +44,14 @@ inline bool bot_fire_aligned(unsigned weapon,float cosine,bool same_trigger,floa
     // the close tracking latch but require the muzzle to settle at long range.
     if(distance>30.f){const float angular=.6f/distance;threshold=std::max(threshold,1.f-.5f*angular*angular);}
     return cosine>threshold;
+}
+// A companion may collect useful supplies along the way without abandoning
+// its human. Urgent supplies still have a short, bounded detour allowance.
+inline bool bot_coop_pickup_allowed(float leader_distance,float pickup_distance,float pickup_leader_distance,bool urgent){
+    for(float distance:{leader_distance,pickup_distance,pickup_leader_distance})if(!std::isfinite(distance) || distance<0.f)return false;
+    const float extra=pickup_distance+pickup_leader_distance-leader_distance;
+    if(urgent)return pickup_distance<=8.f && extra<=8.f;
+    return leader_distance<=10.f && pickup_distance<=8.f && pickup_leader_distance<=12.f && extra<=4.f;
 }
 // Consume a bounded angular remainder, rather than replaying the same mouse
 // delta at every native frame. The total turn cannot exceed the requested turn.

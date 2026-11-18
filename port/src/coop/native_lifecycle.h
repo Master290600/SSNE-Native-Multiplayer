@@ -3,12 +3,24 @@
 #include "ssne/ppc_context.h"
 #include <chrono>
 namespace port::coop {
+// Guest-thread settings for the native mode-1 Survival integration. Original
+// PAL getters remain in use in every other mode and after Survival is disabled.
+bool configure_native_survival_rules(bool enabled,unsigned weapon_set,bool allow_powerups,std::string& error);
 bool validate_native_detached_rotor(const EntityState&,std::string&);
 uint32_t create_native_detached_rotor(PPCContext&,const EntityState&,std::string&);
 inline constexpr std::array<const char*,8> native_preference_keys{"AutoAimType","AutoLookRecentre","AutoWeaponSelect","InvertLook","HorizontalLookSpeed","VerticalLookSpeed","LookStyle","PauseWeaponWheel"};
 std::array<uint8_t,8> capture_native_preferences(uint32_t actor);
 bool apply_native_preferences(PPCContext&,uint32_t actor,const std::array<uint8_t,8>&,std::string&);
 bool refresh_native_aim_preferences(PPCContext&,uint32_t actor,bool presentation,std::string&);
+// Owns only a temporary native option override. All pointers are checked against
+// the current actor and registry before restoration; stale leases are discarded.
+struct NativeAutoAimLease {
+    uint32_t actor=0,aim=0,variable=0,profile=0,slot=0,saved_mode=0;
+};
+bool read_native_auto_aim_binding(uint32_t actor,NativeAutoAimLease&,std::string& error);
+bool native_auto_aim_lease_matches(const NativeAutoAimLease&);
+bool begin_native_auto_aim_override(PPCContext&,uint32_t actor,NativeAutoAimLease&,std::string& error);
+bool end_native_auto_aim_override(NativeAutoAimLease&);
 bool capture_native_combo_hud(uint32_t actor,EntityState&,std::string&);
 bool validate_native_combo_hud(uint32_t actor,const EntityState&,std::string&);
 bool apply_native_combo_hud(PPCContext&,uint32_t actor,const EntityState&,std::string&);

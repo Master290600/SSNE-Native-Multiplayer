@@ -47,11 +47,11 @@ void cancel_native_mouse(){g_presentation_mouse_buttons=0;g_presentation_click[0
 void sync_native_mouse_mode(){
     const auto snapshot=port::native_menu_mouse_snapshot();
     const bool focused=(getenv("SSNE_TEST_HIDDEN") || g_focused) && g_pointer_fixture_focused;
-    const bool available=g_pointer_image.valid() && focused && !port::menu_open() && !port::mod_menu_open();
+    const bool available=g_pointer_image.valid() && focused && !port::menu_open() && !port::mod_menu_open() && !g_chat.active();
     const bool active=snapshot.active && available;
     // Credits and movies have no native GUI root. Keep their ordinary pad
     // Continue/Back path, without treating a disabled menu as a blank screen.
-    const bool presentation=available && !snapshot.active && !snapshot.has_surface && (!ssne::player_control_active() || g_native_guest_presentation.load(std::memory_order_acquire)) && !ssne::native_results_presenting();
+    const bool presentation=available && !snapshot.active && !snapshot.has_surface && ((!ssne::player_control_active() && !g_coop_spectating.load(std::memory_order_acquire)) || g_native_guest_presentation.load(std::memory_order_acquire)) && !ssne::native_results_presenting();
     const bool mode=active || presentation,previous=g_native_pointer_active || g_presentation_pointer_active;
     if(snapshot.surface_generation!=g_pointer_seen_surface || snapshot.geometry_generation!=g_pointer_seen_geometry || g_pointer_view_generation!=g_pointer_seen_view || active!=g_native_pointer_active || presentation!=g_presentation_pointer_active){
         cancel_native_mouse();g_pointer_seen_surface=snapshot.surface_generation;g_pointer_seen_geometry=snapshot.geometry_generation;g_pointer_seen_view=g_pointer_view_generation;
@@ -62,7 +62,7 @@ void sync_native_mouse_mode(){
     }
     g_native_pointer_active=active;g_presentation_pointer_active=presentation;
     g_local_roster_pointer_available.store(active && !ImGui::GetIO().WantCaptureMouse,std::memory_order_release);
-    if(!mode && g_pointer_restore_capture && focused && ssne::player_control_active() && !snapshot.active && !ssne::native_results_presenting() && !port::menu_open() && !port::mod_menu_open() && g_set.mouse_look){
+    if(!mode && g_pointer_restore_capture && focused && (ssne::player_control_active() || g_coop_spectating.load(std::memory_order_acquire)) && !snapshot.active && !ssne::native_results_presenting() && !port::menu_open() && !port::mod_menu_open() && !g_chat.active() && g_set.mouse_look){
         g_pointer_restore_capture=false;g_mouse_captured=true;g_mouse_dx=g_mouse_dy=0;
         if(!getenv("SSNE_TEST_HIDDEN")){g_capture_click|=SDL_GetMouseState(nullptr,nullptr);SDL_SetRelativeMouseMode(SDL_TRUE);}
     }
@@ -177,6 +177,7 @@ uint16_t take_native_menu_pad_pulse(){
 // Private acceptance tests feed logical SDL window coordinates through this
 // same adapter, without posting desktop events or focusing/capturing a window.
 void native_mouse_test_command(){
+    if(ssne::perf::fixture_quiet.load(std::memory_order_relaxed))return;
     if(!getenv("SSNE_TEST_HIDDEN"))return;
     const auto path=getenv("SSNE_NATIVE_MOUSE_COMMAND");if(!path || !*path)return;
     std::ifstream file(std::filesystem::u8path(path),std::ios::binary);uint64_t sequence=0;std::string action;
@@ -189,6 +190,31 @@ void native_mouse_test_command(){
         button=name=="left"?SDL_BUTTON_LEFT:name=="middle"?SDL_BUTTON_MIDDLE:name=="right"?SDL_BUTTON_RIGHT:0;valid&=button!=0;
     }else if(action=="wheel"){kind=Kind::Wheel;valid=bool(file>>dx>>dy>>x>>y);}
     else if(action=="cancel"){}
+    else if(action=="ui_shot" && getenv("SSNE_TEST_CHAT")) {g_test_ui_shot=true;g_pointer_accepted_sequence=sequence;return;}
+    else if(action=="key" && getenv("SSNE_TEST_CHAT")) {
+        std::string state;int code=0;if(!(file>>state>>code) || (state!="down"&&state!="up") || code<=0 || code>=SDL_NUM_SCANCODES)return;
+        SDL_Event event{};event.type=state=="down"?SDL_KEYDOWN:SDL_KEYUP;event.key.timestamp=SDL_GetTicks();
+        event.key.windowID=g_chat_window?SDL_GetWindowID(g_chat_window):0;event.key.state=state=="down"?SDL_PRESSED:SDL_RELEASED;
+        event.key.keysym.scancode=SDL_Scancode(code);event.key.keysym.sym=SDL_GetKeyFromScancode(SDL_Scancode(code));
+        SDL_PushEvent(&event);
+        // SDL normally follows the opening key with a text event for that T.
+        if(state=="down" && code==SDL_SCANCODE_T) {
+            SDL_Event text{};text.type=SDL_TEXTINPUT;text.text.timestamp=event.key.timestamp;text.text.windowID=event.key.windowID;text.text.text[0]='t';SDL_PushEvent(&text);
+        }
+        g_pointer_accepted_sequence=sequence;return;
+    }
+    else if(action=="text" && getenv("SSNE_TEST_CHAT")) {
+        std::string value;std::getline(file,value);if(!value.empty() && value.back()=='\r')value.pop_back();if(!value.empty() && value.front()==' ')value.erase(0,1);
+        if(value.empty() || value.size()>256)return;
+        for(size_t at=0;at<value.size();) {
+            size_t count=std::min(size_t(31),value.size()-at);
+            while(count && at+count<value.size() && (uint8_t(value[at+count])&0xc0)==0x80)--count;
+            if(!count)return;
+            SDL_Event text{};text.type=SDL_TEXTINPUT;text.text.timestamp=SDL_GetTicks();text.text.windowID=g_chat_window?SDL_GetWindowID(g_chat_window):0;
+            std::memcpy(text.text.text,value.data()+at,count);SDL_PushEvent(&text);at+=count;
+        }
+        g_pointer_accepted_sequence=sequence;return;
+    }
     else if(action=="settings"&&getenv("SSNE_TEST_CROSSHAIR")) {
         std::string value;if(!(file>>value)||(value!="on"&&value!="off"))return;
         g_crosshair_test_settings_request=value=="on"?1:0;g_pointer_accepted_sequence=sequence;return;
@@ -202,6 +228,7 @@ void native_mouse_test_command(){
     else route_native_mouse_pointer(kind,x,y,uint8_t(button),dx,dy);
 }
 void write_native_mouse_input_state(){
+    if(ssne::perf::fixture_quiet.load(std::memory_order_relaxed))return;
     if(!getenv("SSNE_TEST_HIDDEN") || !getenv("SSNE_NATIVE_MOUSE_COMMAND"))return;
     static uint32_t last=0;const auto now=SDL_GetTicks();if(now-last<25)return;last=now;
     const auto snapshot=port::native_menu_mouse_snapshot();

@@ -23,30 +23,53 @@ public:
     }
     uint32_t target() const { return target_; }
     Input update(const ssne::BotWorld& world, unsigned decision_ticks=1,const std::array<float,3>* fire_origin=nullptr,
-                 const std::function<bool(const std::array<float,3>&)>& route_clear={},bool budgeted_turn=false,bool autonomous=false,float target_range=-1.f) {
+                 const std::function<bool(const std::array<float,3>&)>& route_clear={},bool budgeted_turn=false,bool autonomous=false,float target_range=-1.f,
+                 bool leader_grounded=true) {
         Input input;
         if (!world.host.id || !world.client.id || !std::isfinite(world.yaw) || !std::isfinite(world.pitch)) { *this={}; return input; }
         const auto& p=world.client.position;
+        auto valid=[](const auto& point){return std::all_of(point.begin(),point.end(),[](float v){return std::isfinite(v) && std::abs(v)<=1e9f;});};
+        if(!valid(p) || !valid(world.host.position)){*this={};return input;}
+        decision_ticks=std::clamp(decision_ticks,1u,75u);
         auto horizontal=[&](const ssne::BotActor& a) { return std::hypot(a.position[0]-p[0],a.position[2]-p[2]); };
         float host_distance=horizontal(world.host);
         if (!std::isfinite(host_distance)) return input;
         // Follow the host's recent route around corners rather than always
         // walking directly into the wall between the two players.
-        if (trail_.empty() || std::hypot(world.host.position[0]-trail_.back()[0],world.host.position[2]-trail_.back()[2])>1.5f || std::abs(world.host.position[1]-trail_.back()[1])>.6f)
+        // Native support evidence distinguishes a walkable leader sample from
+        // a jump. A height-only breadcrumb can never be reached after landing.
+        // Autonomous goals are already validated navigation waypoints.
+        if ((autonomous || leader_grounded) && (trail_.empty() || std::hypot(world.host.position[0]-trail_.back()[0],world.host.position[2]-trail_.back()[2])>1.5f || std::abs(world.host.position[1]-trail_.back()[1])>.6f))
             trail_.push_back(world.host.position);
         if (trail_.size()>128) trail_.pop_front();
+        const auto follow_position=!autonomous && !leader_grounded?(trail_.empty()?p:trail_.back()):world.host.position;
+        const float follow_distance=std::hypot(follow_position[0]-p[0],follow_position[2]-p[2]);
         // Rejoin the route after passing a waypoint or returning to the leader.
         // Height matters: a point on a floor above us has not been reached.
+        auto reached_point=[&](const auto& point){
+            if(std::hypot(point[0]-p[0],point[2]-p[2])<.75f && std::abs(point[1]-p[1])<.6f)return true;
+            const float x=p[0]-previous_[0],z=p[2]-previous_[2],length=x*x+z*z;
+            if(!moving_ || length<.001f || length>25.f)return false;
+            const float t=std::clamp(((point[0]-previous_[0])*x+(point[2]-previous_[2])*z)/length,0.f,1.f);
+            return std::hypot(point[0]-previous_[0]-t*x,point[2]-previous_[2]-t*z)<.5f && std::abs(point[1]-previous_[1]-t*(p[1]-previous_[1]))<.6f;
+        };
         auto reached=trail_.begin();
-        for(auto it=trail_.begin();it!=trail_.end();++it)
-            if(std::hypot((*it)[0]-p[0],(*it)[2]-p[2])<2.f && std::abs((*it)[1]-p[1])<1.f)reached=it;
+        for(auto it=trail_.begin();it!=trail_.end();++it)if(reached_point(*it))reached=it;
         trail_.erase(trail_.begin(),reached);
-        while(trail_.size()>1 && std::hypot(trail_.front()[0]-p[0],trail_.front()[2]-p[2])<2.f && std::abs(trail_.front()[1]-p[1])<1.f)trail_.pop_front();
-        // Only bypass an old route if native swept collision AND support-floor
-        // queries confirm the shortcut. A visual line of sight is insufficient.
-        if(trail_.size()>1 && route_clear && route_clear(trail_.back()))trail_.erase(trail_.begin(),std::prev(trail_.end()));
+        while(trail_.size()>1 && reached_point(trail_.front()))trail_.pop_front();
+        // Check at most two route shortcuts. A far-away newest breadcrumb must
+        // not hide a reachable intermediate corner in the human's route.
+        if(trail_.size()>1 && route_clear){
+            auto shortcut=trail_.end();
+            for(auto it=trail_.begin();it!=trail_.end();++it)
+                if(std::hypot((*it)[0]-p[0],(*it)[2]-p[2])<=12.f)shortcut=it;
+            if(shortcut!=trail_.end() && route_clear(*shortcut))trail_.erase(trail_.begin(),shortcut);
+            else if(trail_.size()>2 && route_clear(trail_[1]))trail_.pop_front();
+        }
+        if(!trail_.empty() && follow_distance<2.f && std::abs(follow_position[1]-p[1])<.6f && !autonomous)
+            trail_.erase(trail_.begin(),std::prev(trail_.end()));
         const ssne::BotActor* enemy=nullptr;
-        const float range=std::isfinite(target_range)?(target_range<0.f?(autonomous?60.f:30.f):std::clamp(target_range,0.f,100.f)):0.f;
+        const float range=std::isfinite(target_range)?(target_range<0.f?(autonomous?60.f:30.f):std::clamp(target_range,0.f,250.f)):0.f;
         float best=range+1.f;
         // Stay with the host; retain a target to avoid flickering between enemies.
         for (const auto& actor:world.enemies) {
@@ -76,36 +99,50 @@ public:
         if (enemy && std::abs(yaw_error)<.07f && std::abs(pitch_error)<.08f) {
             input.pad.buttons|=ssne::PAD_R; input.pad.trigger_r=255;
         }
-        if (moving_ && std::hypot(p[0]-previous_[0],p[2]-previous_[2])<.008f) stalled_+=decision_ticks;
+        // Slow scraping against a wall is a stall too. Count only actual
+        // movement requests; planning and standing near the human are idle.
+        if (moving_ && !escape_ && std::hypot(p[0]-previous_[0],p[2]-previous_[2])<.06f) stalled_+=decision_ticks;
         else stalled_=0;
-        if (stalled_>75) { escape_=60; stalled_=0; }
+        if (stalled_>32) { escape_=60; stalled_=0; }
         previous_=p;
-        moving_=host_distance>(autonomous?.3f:3.5f) || std::abs(world.host.position[1]-p[1])>1.2f;
+        const bool detour=!autonomous && trail_.size()>1 && follow_distance>=2.f;
+        // Navigation can return fine-grid points less than .3 m away.
+        // Keep walking until its tighter arrival test can consume the point.
+        moving_=follow_distance>(autonomous?.1f:3.5f) || std::abs(follow_position[1]-p[1])>1.2f || detour;
         if(!moving_){stalled_=0;escape_=0;}
         if (moving_) {
-            auto destination=autonomous?world.host.position:trail_.front();
+            auto destination=autonomous || trail_.empty()?follow_position:trail_.front();
             float route_distance=std::hypot(destination[0]-p[0],destination[2]-p[2]);
-            if (route_distance<.1f) { destination=world.host.position; route_distance=host_distance; }
-            // Directly below a leader, retain the route without dividing by zero.
-            route_distance=std::max(route_distance,.1f);
-            float x=(destination[0]-p[0])/route_distance;
-            float z=(destination[2]-p[2])/route_distance;
-            float right=x*std::cos(world.yaw)-z*std::sin(world.yaw);
-            float forward=x*std::sin(world.yaw)+z*std::cos(world.yaw);
-            float speed=host_distance>7?105.f:75.f;
-            input.pad.stick_x=uint8_t(std::clamp(128+int(std::round(right*speed)),0,255));
-            input.pad.stick_y=uint8_t(std::clamp(128+int(std::round(forward*speed)),0,255));
-            if (world.host.position[1]-p[1]>.8f && stalled_>20 && stalled_<=20+decision_ticks) {
-                input.pad.buttons|=ssne::PAD_L;input.pad.trigger_l=255;
+            if (route_distance<.1f) { destination=follow_position; route_distance=follow_distance; }
+            const float route_x=(destination[0]-p[0])/std::max(route_distance,.1f);
+            const float route_z=(destination[2]-p[2])/std::max(route_distance,.1f);
+            bool safe_escape=true;
+            if(escape_ && route_clear){
+                safe_escape=false;
+                const float side=world.client.id%2?1.f:-1.f;
+                const float angle=side*(escape_>30?.78539816f:1.57079633f);
+                for(float turn:{angle,-angle}){
+                    auto candidate=p;
+                    candidate[0]+=(route_x*std::cos(turn)-route_z*std::sin(turn))*2.5f;
+                    candidate[2]+=(route_x*std::sin(turn)+route_z*std::cos(turn))*2.5f;
+                    if(route_clear(candidate)){destination=candidate;route_distance=2.5f;safe_escape=true;break;}
+                }
+            }
+            const float x=(destination[0]-p[0])/std::max(route_distance,.1f);
+            const float z=(destination[2]-p[2])/std::max(route_distance,.1f);
+            const float right=x*std::cos(world.yaw)-z*std::sin(world.yaw);
+            const float forward=x*std::sin(world.yaw)+z*std::cos(world.yaw);
+            const float speed=follow_distance>7?105.f:75.f;
+            if(safe_escape){
+                input.pad.stick_x=uint8_t(std::clamp(128+int(std::round(right*speed)),0,255));
+                input.pad.stick_y=uint8_t(std::clamp(128+int(std::round(forward*speed)),0,255));
+                // The native integration still checks headroom before jumping.
+                if((autonomous || leader_grounded) && ((escape_==60) || (follow_position[1]-p[1]>.8f && stalled_>20 && stalled_<=20+decision_ticks))){
+                    input.pad.buttons|=ssne::PAD_L;input.pad.trigger_l=255;
+                }
             }
         }
-        if (escape_) {
-            // L is the native gameplay jump, A is use. Emit the first pulse
-            // before spending this decision's ticks (the AFK budget is eight).
-            if (escape_==60) {input.pad.buttons|=ssne::PAD_L;input.pad.trigger_l=255;}
-            escape_=escape_>decision_ticks?escape_-decision_ticks:0;
-            input.pad.stick_x=escape_>30?230:26;
-        }
+        if(escape_)escape_=escape_>decision_ticks?escape_-decision_ticks:0;
         return input;
     }
 };

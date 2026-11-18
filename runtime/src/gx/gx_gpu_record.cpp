@@ -22,7 +22,9 @@
 #include <unordered_set>
 
 #include "gx_gpu_frame.h"
+#include "loading_canvas_aspect.h"
 #include "gx_internal.h"
+#include "gx_movie.h"
 #include "ssne/gx.h"
 #include "ssne/runtime.h"
 #include "ssne/ppc_context.h"
@@ -69,6 +71,8 @@ struct HudView { float cx, cy, hw, hh; };
 struct RecCtx {
     std::unique_ptr<GpuFrame> cur;  // frame being recorded
     std::vector<HudPiece> hud;      // its widescreen HUD draws, placed when it's submitted (place_hud)
+    movie_presentation::Draw movie;
+    bool saw_art_backdrop=false;
     std::vector<HudView> views;     // its players' views (split screen: more than one)
     GpuState state;
     uint32_t state_index = ~0u;
@@ -163,7 +167,23 @@ void note_view() {
     if (R->views.size() < 8) R->views.push_back(v);
 }
 
-void note_hud(GpuFrame& f, size_t off, uint32_t n, uint32_t stride) {
+void note_hud(GpuFrame& f, size_t off, uint32_t n, uint32_t stride, float canvas_factor) {
+    const bool ortho=(g.xf_reg[0x26] & 1)!=0;
+    if (R->state.canvas_fitted) {
+        auto vertex=[&](size_t i){return f.vtx.data()+off+i*stride;};
+        const bool backdrop=fit_loading_canvas(canvas_factor,n,[&](size_t i){std::array<float,4> p;std::memcpy(p.data(),vertex(i),sizeof(p));return p;},
+            [&](size_t i,float x,float y){const float xy[]{x,y};std::memcpy(vertex(i),xy,sizeof(xy));},ortho);
+        R->saw_art_backdrop |= backdrop;
+        return;
+    }
+    const auto &st = R->state;
+    observe_movie(st.cfg, n, [&](unsigned i, float& x, float& y) {
+        float p[4];
+        memcpy(p, f.vtx.data() + off + size_t(i)*stride, sizeof(p));
+        const float inv = p[3] != 0 ? 1.f / p[3] : 0.f;
+        x = st.vp[3] - 342.f + st.vp[0] * p[0] * inv;
+        y = st.vp[4] - 342.f + st.vp[1] * p[1] * inv;
+    }, R->movie);
     const bool frontend=frontend_presenting();
     // The local-camera GPU path handles network HUD proportions. In
     // particular, do not reuse a frontend factor while entering gameplay.
@@ -263,6 +283,7 @@ void place_split_hud(RecCtx& r) {
 }
 
 void place_hud(RecCtx& r) {
+    r.saw_art_backdrop=false;
     if (!r.cur) { r.hud.clear(); r.views.clear(); return; }
     if (r.views.size() > 1) {
         place_split_hud(r);
@@ -378,17 +399,21 @@ void gpu_select_ctx(int k) { R = &g_rec[k & 1]; }
 namespace {
 
 // Brings the TEV / PE part of R->state up to date (when g_cfg_dirty says its inputs changed).
-void refresh_state() {
+float refresh_state() {
     const bool perspective=!(g.xf_reg[0x26]&1);
     const bool ui=frontend_presenting() || (perspective?netplay_render_gui_camera():netplay_render_ui());
-    if(R->state.perspective!=perspective || R->state.local_ui!=ui)g_cfg_dirty=true;
+    const float canvas_factor = (!perspective || R->saw_art_backdrop) ? loading_canvas_factor() : 1.f;
+    const bool canvas_fitted = canvas_factor > 1.f;
+    if (R->state.perspective != perspective || R->state.local_ui != ui || R->state.canvas_fitted != canvas_fitted)
+        g_cfg_dirty = true;
     GpuState& st = R->state;
     if (g_cfg_dirty) {
         build_cfg(st.cfg);  // clears cfg (padding included); vp and cull follow it without padding
         for (int i = 0; i < 6; i++) st.vp[i] = xfr_f(0x1A + i);
         st.cull = (g.bp[0x00] >> 14) & 3;
-        st.perspective=!(g.xf_reg[0x26]&1);
-        st.local_ui=frontend_presenting() || (st.perspective?netplay_render_gui_camera():netplay_render_ui());
+        st.perspective = perspective;
+        st.local_ui = ui;
+        st.canvas_fitted = canvas_fitted;
         g_cfg_dirty = false;
         R->state_index = ~0u;
     }
@@ -397,6 +422,9 @@ void refresh_state() {
         static GpuState fresh;
         static uint64_t checked = 0, bad = 0;
         memset(&fresh, 0, sizeof(fresh));
+        fresh.perspective = perspective;
+        fresh.local_ui = ui;
+        fresh.canvas_fitted = canvas_fitted;
         build_cfg(fresh.cfg);
         for (int i = 0; i < 6; i++) fresh.vp[i] = xfr_f(0x1A + i);
         fresh.cull = (g.bp[0x00] >> 14) & 3;
@@ -405,6 +433,7 @@ void refresh_state() {
         if ((++checked & 0x3FFFF) == 0)
             fprintf(stderr, "[gpu] draw state check: %llu draws, %llu stale\n", (unsigned long long)checked, (unsigned long long)bad);
     }
+    return canvas_factor;
 }
 
 uint32_t triangle_count(uint8_t prim, size_t n) {
@@ -486,7 +515,7 @@ void gpu_record_draw(uint8_t prim, const std::vector<Vtx>& v) {
     if (prim == PRIM_LINES || prim == PRIM_LINESTRIP || prim == PRIM_POINTS) { counters.lines_skipped++; return; }
     GpuFrame& f = cur();
     GpuState& st = R->state;
-    refresh_state();
+    const float canvas_factor = refresh_state();
     if (R->state_vx != 0) {  // R->state holds GPU vertex processing parameters: back to mode 0
         memset(&st.vcfg, 0, sizeof(st.vcfg));
         memset(&st.xf, 0, sizeof(st.xf));
@@ -537,7 +566,7 @@ void gpu_record_draw(uint8_t prim, const std::vector<Vtx>& v) {
         if (ntex) memcpy(p + 24, s.tex, size_t(ntex) * 12);
     }
     add_indices(f, prim, n, tris, base);
-    note_hud(f, off, uint32_t(n), stride);
+    note_hud(f, off, uint32_t(n), stride, canvas_factor);
 }
 
 uint8_t* gpu_vtx_reserve(size_t bytes) {
@@ -557,7 +586,7 @@ void gpu_record_vertices(uint8_t prim, uint32_t n, const GpuVcfg& vcfg, const Gp
     uint32_t tris = triangle_count(prim, n);
     if (!tris) { f.vtx.resize(off); return; }
     counters.triangles += tris;
-    refresh_state();
+    const float canvas_factor = refresh_state();
     if (R->state_vx != vx_version) {
         R->state.vcfg = vcfg;
         R->state.xf = xf;
@@ -566,7 +595,7 @@ void gpu_record_vertices(uint8_t prim, uint32_t n, const GpuVcfg& vcfg, const Gp
     }
     uint32_t base = batch(f, vcfg.ntg, stride, zsnap, off, n, true);
     add_indices(f, prim, n, tris, base);
-    note_hud(f, off, n, stride);
+    note_hud(f, off, n, stride, canvas_factor);
 }
 
 void gpu_record_efb_copy(uint32_t cmd) {
@@ -666,6 +695,10 @@ void gpu_record_efb_copy(uint32_t cmd) {
         if(!discard)push_cmd(k);
     }
     if (xfb) {
+        for (auto& rec : g_rec) {
+            if (rec.cur) rec.cur->movie = rec.movie.pack(y0,h);
+            rec.movie = {};
+        }
         submit_frame();
         texture_cache_trim();
     }
@@ -721,6 +754,7 @@ void gpu_recycle_frame(std::unique_ptr<GpuFrame> f) {
     f->idx.clear();
     f->textures.clear();  // drops the frame's texture references here, on the render thread
     f->kept.clear();
+    f->movie = 0;
     f->local_camera = false;
     f->seq = 0;
     f->wide = 1.0f;

@@ -145,6 +145,8 @@ enum : GLenum {
 // ARB_get_program_binary (core in 4.1, the shader cache) and KHR / ARB_parallel_shader_compile (shaders compiled on
 // the driver's threads). Null when the driver doesn't have them.
 #define SSNE_GL_OPTIONAL_FUNCS(X)                                                                               \
+    X(void, TexSubImage2D, (GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,                 \
+                            GLenum fmt, GLenum type, const void* data))                                        \
     X(void, SamplerParameterf, (GLuint s, GLenum pname, GLfloat v))                                             \
     X(void, TexImage2DMultisample, (GLenum target, GLsizei samples, GLenum ifmt, GLsizei w, GLsizei h,           \
                                     GLboolean fixed))                                                           \

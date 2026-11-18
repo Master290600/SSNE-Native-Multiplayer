@@ -1,0 +1,429 @@
+{
+  "build": 242,
+  "protocol": 70,
+  "dol_sha256": "c0b8ba71e0dd99ca632a2a6931db0a8f610d69c00a423d34c96a579eaa3710ad",
+  "donor_sha256": "63896cb433b75f0fc8145b4fcaf8259ef0950272cbfc96187df56762aa04e3c4",
+  "old_menu_extents": [
+    {
+      "base.cfg": 61322,
+      "EnglishEUR.tdb": 88451,
+      "EnglishUSA.tdb": 88419,
+      "french.tdb": 100751,
+      "German.tdb": 98922,
+      "Levels/PS2_canyon.ssw": 10297442,
+      "Levels/PS2_egypt.ssw": 17673436,
+      "Levels/PS2_flight.ssw": 16457085,
+      "Levels/PS2_fort.ssw": 12544941,
+      "Levels/PS2_maya.ssw": 17554617,
+      "Levels/PS2_medieval.ssw": 19518122,
+      "Levels/PS2_military.ssw": 10468882,
+      "Levels/PS2_neo_tokyo.ssw": 11031408,
+      "Levels/PS2_offworld.ssw": 13976139,
+      "Levels/PS2_russia.ssw": 15922764,
+      "Levels/PS2_teeth.ssw": 14661443,
+      "Levels/PS2_venice.ssw": 19018465,
+      "Levels/PS2_vertigo.ssw": 11772077,
+      "Levels/PS2_victorian.ssw": 14574399,
+      "Levels/PS2_western.ssw": 15222892,
+      "Multiplayer/skin_all.ssg": 2137583,
+      "Multiplayer/skin_ballwraith.ssg": 233546,
+      "Multiplayer/skin_drivethrough.ssg": 181411,
+      "Multiplayer/skin_fisherman.ssg": 192171,
+      "Multiplayer/skin_nesbot.ssg": 265757,
+      "Multiplayer/skin_superfella.ssg": 189859,
+      "Multiplayer/skin_wrestler.ssg": 210932,
+      "ps2-skin-content.txt": 1070
+    },
+    {
+      "EnglishEUR.tdb": 91441,
+      "EnglishUSA.tdb": 91409,
+      "french.tdb": 104077,
+      "German.tdb": 102705,
+      "ps2-skin-content.txt": 1070
+    }
+  ],
+  "rows": {
+    "game_data/files/Multiplayer/skin_ballwraith.ssg": {
+      "base": null,
+      "sha256": "5f4902af81377de1d6dbca6435609a5a30f4e26361481137ed72057d7a5f4318",
+      "bytes": 233602
+    },
+    "game_data/files/Multiplayer/skin_nesbot.ssg": {
+      "base": null,
+      "sha256": "dd6b521643ad1cca2781a2f4d680e6c562f033925818fbd7990134b1794bcd02",
+      "bytes": 266101
+    },
+    "game_data/files/Multiplayer/skin_superfella.ssg": {
+      "base": null,
+      "sha256": "65a0d4982f681d8ea38b4acfde377e72286f51d9653b11c0fc7ffa225ec07732",
+      "bytes": 189851
+    },
+    "game_data/files/Multiplayer/skin_wrestler.ssg": {
+      "base": null,
+      "sha256": "4bd6fdb53fb587af9a32057ea191097fbcdc7739ac056859c3eb24dd2fadbedd",
+      "bytes": 210994
+    },
+    "game_data/files/Multiplayer/skin_drivethrough.ssg": {
+      "base": null,
+      "sha256": "ca955c8bac3616db68093016425ad796de9a449c89f5dd8a6be324956ff72a3e",
+      "bytes": 181471
+    },
+    "game_data/files/Multiplayer/skin_fisherman.ssg": {
+      "base": null,
+      "sha256": "434c845bfb7a6b93c3140faeca607959d45a9aecd2deb34aa27c4ba2281ab017",
+      "bytes": 192213
+    },
+    "game_data/files/Multiplayer/skin_all.ssg": {
+      "base": "054619f04a08d452fea264f6916d559f63b3e3e80ec43eebee854943ac08b6d1",
+      "sha256": "8fdc94108806289523df134ecc94ebf93e6389d01cec5db3f24f20110c74fd59",
+      "bytes": 2138216
+    },
+    "game_data/files/base.cfg": {
+      "base": "01d7038bd6bb9e8050a4e8407bd9817a2353d2b03d4f2fca715552cfa2393935",
+      "sha256": "4167316f92498d001fc55ddb5094d1edf21b7183ae70e3d1fe2569b13a4e8955",
+      "bytes": 61322
+    },
+    "game_data/files/EnglishEUR.tdb": {
+      "base": "2f7426bade2c84d81e16bcf2019bb711e8ecea3eb3f66a6f9556721b3d92eaef",
+      "sha256": "a0ecd64502d3b137ca17799198b4f9ef7d4a869f685eae0f3fc0f32865776644",
+      "bytes": 91441
+    },
+    "game_data/files/EnglishUSA.tdb": {
+      "base": "38932e0b4179cfd0cb62c12d4df1f796a42146dc9a8d7c62e284166b639bd34a",
+      "sha256": "80dcc7291bfff0feb809e7a2b0f47e7ea5df85d77dc4f9f0fa4b879fa11b2adc",
+      "bytes": 91409
+    },
+    "game_data/files/french.tdb": {
+      "base": "8acf8db3c2096bebc5af1d6f1699587524a8cd6e292d19c5d43be9120689e7a0",
+      "sha256": "a021142bd4547acf38bd23c98f1c692794fcdba14e64f08ca040be1147a57dc3",
+      "bytes": 104077
+    },
+    "game_data/files/German.tdb": {
+      "base": "dc9229de178a2c77273fdcb101930d2f783ad1be67df2558d3530d52fbbccac7",
+      "sha256": "7b9084600318b1af40aa3465f4dcda6f9e53a2d20be7b4160bd370ded1ef195e",
+      "bytes": 102705
+    },
+    "game_data/files/ps2-skin-content.txt": {
+      "base": null,
+      "sha256": "ea609054d102d3e8b9bae1b41db23d4e9cb9fa7d779f184b5b4797d89ef1f1e1",
+      "bytes": 1070
+    },
+    "game_data/files/Levels/Schluchten-Level.ssw": {
+      "base": null,
+      "sha256": "95a03a60259732ca3e90dc78a649d77c09768180e34ac5ae75e35393c748befd",
+      "bytes": 10297442
+    },
+    "CustomLevels/ps2_canyon/map.ssw": {
+      "base": null,
+      "sha256": "95a03a60259732ca3e90dc78a649d77c09768180e34ac5ae75e35393c748befd",
+      "bytes": 10297442
+    },
+    "CustomLevels/ps2_canyon/level.json": {
+      "base": null,
+      "sha256": "0b66db99f1ef8970f0fc221ab091fd9920d16885786bd71c8f0619626b29bff1",
+      "bytes": 265
+    },
+    "CustomLevels/ps2_canyon/preview.png": {
+      "base": null,
+      "sha256": "8c705f8a5814bfb1792d8c0ee82524eee1c0d1c531e23c1be5edf2527992d8d1",
+      "bytes": 4513
+    },
+    "game_data/files/Levels/Das_aegyptische_Tal.ssw": {
+      "base": null,
+      "sha256": "77afc25b8a2885278b5f10c3d0672f41ab88603145e560d14dd3895c8c884261",
+      "bytes": 17673436
+    },
+    "CustomLevels/ps2_egypt/map.ssw": {
+      "base": null,
+      "sha256": "77afc25b8a2885278b5f10c3d0672f41ab88603145e560d14dd3895c8c884261",
+      "bytes": 17673436
+    },
+    "CustomLevels/ps2_egypt/level.json": {
+      "base": null,
+      "sha256": "0bac6f0cb560068f56def2cd8fef1a31eb663d811553def4dab980f8ea78fee6",
+      "bytes": 267
+    },
+    "CustomLevels/ps2_egypt/preview.png": {
+      "base": null,
+      "sha256": "9a50549e96b75a09ce0bb1669e48b013f0e6c2b5ece90ef00d7111f956b5aa95",
+      "bytes": 7009
+    },
+    "game_data/files/Levels/Flug.ssw": {
+      "base": null,
+      "sha256": "54f31bd4ea247ab9c4f9f611825fc9c3cdb562099a25fb658a95b25b980d64ea",
+      "bytes": 16457085
+    },
+    "CustomLevels/ps2_flight/map.ssw": {
+      "base": null,
+      "sha256": "54f31bd4ea247ab9c4f9f611825fc9c3cdb562099a25fb658a95b25b980d64ea",
+      "bytes": 16457085
+    },
+    "CustomLevels/ps2_flight/level.json": {
+      "base": null,
+      "sha256": "5e70f38a1d9fe6a0d6ad6aeedca08de6bdba92232f4983cfab634d0746f61392",
+      "bytes": 253
+    },
+    "CustomLevels/ps2_flight/preview.png": {
+      "base": null,
+      "sha256": "dbbb89a05ff3fd3a1e0a79d8c88267db29259ef5dd91563989cef57b6d42bc87",
+      "bytes": 7376
+    },
+    "game_data/files/Levels/Die_Festung.ssw": {
+      "base": null,
+      "sha256": "85c85ac1bf6781ed3c816eb13507a9d3b9d6665eab4cefee85515f4393fd8464",
+      "bytes": 12544941
+    },
+    "CustomLevels/ps2_fort/map.ssw": {
+      "base": null,
+      "sha256": "85c85ac1bf6781ed3c816eb13507a9d3b9d6665eab4cefee85515f4393fd8464",
+      "bytes": 12544941
+    },
+    "CustomLevels/ps2_fort/level.json": {
+      "base": null,
+      "sha256": "fee5217ea4e0468a7e8625f27b8bd2a7bca4acd9e3b716f9a70b85157776e395",
+      "bytes": 258
+    },
+    "CustomLevels/ps2_fort/preview.png": {
+      "base": null,
+      "sha256": "c21239a35dbf6678a71f1671e185d29b6c5cbc8066de75f3ccb8572d3fb284c8",
+      "bytes": 9583
+    },
+    "game_data/files/Levels/Palenque.ssw": {
+      "base": null,
+      "sha256": "e725c2c9f9ddc96677dada4987cb324622245354e6e6f6cd9b73ab384ef22802",
+      "bytes": 17554617
+    },
+    "CustomLevels/ps2_maya/map.ssw": {
+      "base": null,
+      "sha256": "e725c2c9f9ddc96677dada4987cb324622245354e6e6f6cd9b73ab384ef22802",
+      "bytes": 17554617
+    },
+    "CustomLevels/ps2_maya/level.json": {
+      "base": null,
+      "sha256": "b5a47f67c87667bca82f69c5961bbbcf1964ed10214ad34649894eeac2e3cdd5",
+      "bytes": 255
+    },
+    "CustomLevels/ps2_maya/preview.png": {
+      "base": null,
+      "sha256": "2624afecb550cfcd4695f483268c59523be9d713dbefab9d9e9ec6439b850f99",
+      "bytes": 12180
+    },
+    "game_data/files/Levels/Die_Burg.ssw": {
+      "base": null,
+      "sha256": "82ce04d90a90c2d50357dc0b1522044d2e4fda00f019401e0b29334dc0b73fa2",
+      "bytes": 19518122
+    },
+    "CustomLevels/ps2_medieval/map.ssw": {
+      "base": null,
+      "sha256": "82ce04d90a90c2d50357dc0b1522044d2e4fda00f019401e0b29334dc0b73fa2",
+      "bytes": 19518122
+    },
+    "CustomLevels/ps2_medieval/level.json": {
+      "base": null,
+      "sha256": "6c5420d224899d860b642f947d6581d38e950207061b31a9749d2310ce138c5c",
+      "bytes": 259
+    },
+    "CustomLevels/ps2_medieval/preview.png": {
+      "base": null,
+      "sha256": "0e6bdccd7e6828a17f098a526e654e6c5d681ed12cb1c18dfde888e53c7fd3a6",
+      "bytes": 9743
+    },
+    "game_data/files/Levels/Militaer-Level.ssw": {
+      "base": null,
+      "sha256": "0931a7dd33290915762e11044198b23e9d226364893fc7ca7e5a14471b26b9c4",
+      "bytes": 10468882
+    },
+    "CustomLevels/ps2_military/map.ssw": {
+      "base": null,
+      "sha256": "0931a7dd33290915762e11044198b23e9d226364893fc7ca7e5a14471b26b9c4",
+      "bytes": 10468882
+    },
+    "CustomLevels/ps2_military/level.json": {
+      "base": null,
+      "sha256": "3ec5b3619cc6eba6b66fcecda99c0cd915aff7f4a6e82649c266c2a8bb9a7860",
+      "bytes": 265
+    },
+    "CustomLevels/ps2_military/preview.png": {
+      "base": null,
+      "sha256": "8c705f8a5814bfb1792d8c0ee82524eee1c0d1c531e23c1be5edf2527992d8d1",
+      "bytes": 4513
+    },
+    "game_data/files/Levels/Neo_Tokyo.ssw": {
+      "base": null,
+      "sha256": "c13a9be731030bf16b65f9f2d714df282555385dc4d7698929bce565f1928631",
+      "bytes": 11031408
+    },
+    "CustomLevels/ps2_neo_tokyo/map.ssw": {
+      "base": null,
+      "sha256": "c13a9be731030bf16b65f9f2d714df282555385dc4d7698929bce565f1928631",
+      "bytes": 11031408
+    },
+    "CustomLevels/ps2_neo_tokyo/level.json": {
+      "base": null,
+      "sha256": "60b76bc28ccb68931ab0a81af6f1619e5b8432034159202a2a3c931553420fd2",
+      "bytes": 261
+    },
+    "CustomLevels/ps2_neo_tokyo/preview.png": {
+      "base": null,
+      "sha256": "9ead8b0550502e8df7946456014b356a4d8a22e4dff2bdfb95d46229b531011b",
+      "bytes": 16609
+    },
+    "game_data/files/Levels/Jenseits-Level.ssw": {
+      "base": null,
+      "sha256": "d8742df8497b3eb194ed293b3203c91d9501b045e10b76e7910b1b9ed9c173a7",
+      "bytes": 13976139
+    },
+    "CustomLevels/ps2_offworld/map.ssw": {
+      "base": null,
+      "sha256": "d8742df8497b3eb194ed293b3203c91d9501b045e10b76e7910b1b9ed9c173a7",
+      "bytes": 13976139
+    },
+    "CustomLevels/ps2_offworld/level.json": {
+      "base": null,
+      "sha256": "b43123837f55b197da631a70bd782160ec7d82f805c2ef4d06dfcb18ec178980",
+      "bytes": 265
+    },
+    "CustomLevels/ps2_offworld/preview.png": {
+      "base": null,
+      "sha256": "8c705f8a5814bfb1792d8c0ee82524eee1c0d1c531e23c1be5edf2527992d8d1",
+      "bytes": 4513
+    },
+    "game_data/files/Levels/Russland.ssw": {
+      "base": null,
+      "sha256": "4fc91720030878319d772019c9566c0ca54cf0e8c6174d4a2c5040d957885d3c",
+      "bytes": 15922764
+    },
+    "CustomLevels/ps2_russia/map.ssw": {
+      "base": null,
+      "sha256": "4fc91720030878319d772019c9566c0ca54cf0e8c6174d4a2c5040d957885d3c",
+      "bytes": 15922764
+    },
+    "CustomLevels/ps2_russia/level.json": {
+      "base": null,
+      "sha256": "39096b88eaeb49998fb95529fec2b0e60d4635a17b40c188ed47403a2e9e2040",
+      "bytes": 257
+    },
+    "CustomLevels/ps2_russia/preview.png": {
+      "base": null,
+      "sha256": "139f61ffd04eafacdfeb1af793989202e066167c6774020415873eb39465d51a",
+      "bytes": 10192
+    },
+    "game_data/files/Levels/Zaehne-Level.ssw": {
+      "base": null,
+      "sha256": "22fcf610cc2cc7e20d9c29d24869693cacddc4459342c707d8017cca0f534396",
+      "bytes": 14661443
+    },
+    "CustomLevels/ps2_teeth/map.ssw": {
+      "base": null,
+      "sha256": "22fcf610cc2cc7e20d9c29d24869693cacddc4459342c707d8017cca0f534396",
+      "bytes": 14661443
+    },
+    "CustomLevels/ps2_teeth/level.json": {
+      "base": null,
+      "sha256": "e0bdf2364ae08bd1001da5acc0ba8f4c9280b9c3242eb3203a8c86519c971826",
+      "bytes": 260
+    },
+    "CustomLevels/ps2_teeth/preview.png": {
+      "base": null,
+      "sha256": "8c705f8a5814bfb1792d8c0ee82524eee1c0d1c531e23c1be5edf2527992d8d1",
+      "bytes": 4513
+    },
+    "game_data/files/Levels/Venedig-Level.ssw": {
+      "base": null,
+      "sha256": "d1fa1556dce78aa66f365191ad3a3eddeec78e023606c3b9b5155bd6758f822f",
+      "bytes": 19018465
+    },
+    "CustomLevels/ps2_venice/map.ssw": {
+      "base": null,
+      "sha256": "d1fa1556dce78aa66f365191ad3a3eddeec78e023606c3b9b5155bd6758f822f",
+      "bytes": 19018465
+    },
+    "CustomLevels/ps2_venice/level.json": {
+      "base": null,
+      "sha256": "6b3d1bd3aead2e3a5b020b001acdd5ab054d7f22b719b88f6313d09069ecf9d3",
+      "bytes": 262
+    },
+    "CustomLevels/ps2_venice/preview.png": {
+      "base": null,
+      "sha256": "ed7b0002830807e10efdcb5d129a4c17e5743b127180a5dceb216cbbc83535f1",
+      "bytes": 14932
+    },
+    "game_data/files/Levels/Vertigo-Level.ssw": {
+      "base": null,
+      "sha256": "391375437ccdf12b610b080e7a5148dc1bef3f102427403b489855a5296ceeca",
+      "bytes": 11772077
+    },
+    "CustomLevels/ps2_vertigo/map.ssw": {
+      "base": null,
+      "sha256": "391375437ccdf12b610b080e7a5148dc1bef3f102427403b489855a5296ceeca",
+      "bytes": 11772077
+    },
+    "CustomLevels/ps2_vertigo/level.json": {
+      "base": null,
+      "sha256": "8af0871d9402b6e5c8d5d809ba859891373883d3c9bc588e2a3730ae63916890",
+      "bytes": 263
+    },
+    "CustomLevels/ps2_vertigo/preview.png": {
+      "base": null,
+      "sha256": "8c705f8a5814bfb1792d8c0ee82524eee1c0d1c531e23c1be5edf2527992d8d1",
+      "bytes": 4513
+    },
+    "game_data/files/Levels/London.ssw": {
+      "base": null,
+      "sha256": "482334bf99b5b019e0ece85859dce45416229fbb30dc706c6b33b987ab15dc11",
+      "bytes": 14574399
+    },
+    "CustomLevels/ps2_victorian/map.ssw": {
+      "base": null,
+      "sha256": "482334bf99b5b019e0ece85859dce45416229fbb30dc706c6b33b987ab15dc11",
+      "bytes": 14574399
+    },
+    "CustomLevels/ps2_victorian/level.json": {
+      "base": null,
+      "sha256": "366fed24584d3fead64c65e51f9c64e89bf981091bfc43a19fe4bad1c8a822cc",
+      "bytes": 258
+    },
+    "CustomLevels/ps2_victorian/preview.png": {
+      "base": null,
+      "sha256": "9f2ec1f6d8db3a101af30c8a72db0343daa48a35e4f91e6d8a52aad692748757",
+      "bytes": 10717
+    },
+    "game_data/files/Levels/Western-Level.ssw": {
+      "base": null,
+      "sha256": "444fe421bb26ca64e46ef002657fa1a9b4da9fe4e25d950615f8cdf77e20d4a9",
+      "bytes": 15222892
+    },
+    "CustomLevels/ps2_western/map.ssw": {
+      "base": null,
+      "sha256": "444fe421bb26ca64e46ef002657fa1a9b4da9fe4e25d950615f8cdf77e20d4a9",
+      "bytes": 15222892
+    },
+    "CustomLevels/ps2_western/level.json": {
+      "base": null,
+      "sha256": "8961bc3433c10dd22b372aeca15491f5dd73b48ad75bedf98653d17b6fdea61d",
+      "bytes": 263
+    },
+    "CustomLevels/ps2_western/preview.png": {
+      "base": null,
+      "sha256": "8c705f8a5814bfb1792d8c0ee82524eee1c0d1c531e23c1be5edf2527992d8d1",
+      "bytes": 4513
+    },
+    "game_data/sys/fst.bin": {
+      "base": "07caa93af6b6e99ee86b65d2cecbf81d168318a590dc16d984a7c2e6d20e2ace",
+      "sha256": "32d06e66061cb26cc03bb5534d2281e6889ed641744e6c0d5e48b2083dbd1ad3",
+      "bytes": 4221
+    },
+    "game_data/sys/boot.bin": {
+      "base": "1b6a7f9ac3889212b38c4af3aab0bf501ccc0c62ad555a93f26d9eca253d50fc",
+      "sha256": "848959da6ca9ed709ca85b352c9c5f07dc89c0bdcec574f4fab45a6be36fb327",
+      "bytes": 1088
+    },
+    "Multiplayer/online-icon.png": {
+      "base": null,
+      "sha256": "4f33cb91ef263c18fe5b558af66e70107f3794b6274a62a00d41b25034afa203",
+      "bytes": 4054
+    }
+  },
+  "kit_sha256": "80a11daad0d99e7517798d679be683a9865bda79bd6440456668179f8795be3a",
+  "content_sha256": "e71a875938228a2e3b90299a0d3db5e32eb57153c1fea3a859e7ad9cbd214157"
+}

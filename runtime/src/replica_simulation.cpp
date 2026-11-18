@@ -30,6 +30,27 @@ PPCFunc original_level_request=nullptr,original_game_end=nullptr;
 bool suppress();
 struct EnemyPose {uint32_t object,object_type,resource;std::vector<float> values;int weapon=-1;unsigned index=0;};
 std::map<uint32_t,EnemyPose> enemy_poses;
+bool pose_register_reuse_enabled(){
+    // Process-only reference path for paired private measurements.
+    static const bool enabled=[] {const auto* mode=std::getenv("SSNE_POSE_REGISTER_REUSE");return !mode || std::strcmp(mode,"0")!=0;}();
+    return enabled;
+}
+void register_received_pose(uint32_t model,uint32_t object,uint32_t object_type,uint32_t resource,
+        const std::vector<float>& values,int weapon=-1,unsigned index=0){
+    if(!pose_register_reuse_enabled()){
+        enemy_poses[model]={object,object_type,resource,values,weapon,index};return;
+    }
+    auto entry=enemy_poses.lower_bound(model);
+    if(entry==enemy_poses.end() || entry->first!=model){
+        enemy_poses.emplace_hint(entry,model,EnemyPose{object,object_type,resource,values,weapon,index});return;
+    }
+    auto& cached=entry->second;
+    // A caller may deliberately re-register this entry's own vector. Do not
+    // invalidate the input range; every metadata field is still freshly set.
+    if(&cached.values!=&values)cached.values.assign(values.begin(),values.end());
+    cached.object=object;cached.object_type=object_type;cached.resource=resource;
+    cached.weapon=weapon;cached.index=index;
+}
 struct HiddenNpcPart {uint32_t object,resource;};
 std::map<uint32_t,HiddenNpcPart> hidden_npc_parts;
 struct WeaponCameraReference{uint32_t actor=0,proxy=0,matrix=0;std::array<float,12> camera{};std::array<uint32_t,12> root{};};
@@ -376,7 +397,7 @@ void replica_clear_enemy_poses(){clear_poses();}
 bool replica_enemy_pose(uint32_t object,uint32_t model,const std::vector<float>& pose) {
     if(!original_bones || !original_skinning || pose.empty() || pose.size()>3072 || pose.size()%12 || !readable(object,0x100) || !readable(model,0xB0) || mem_read32(model)!=0x8021D668u || mem_read32(model+0x7C)*12!=pose.size())return false;
     for(auto value:pose)if(!std::isfinite(value) || std::abs(value)>10000.f)return false;
-    ensure_pose_observer();enemy_poses[model]={object,mem_read32(object+0x48),mem_read32(model+0xC),pose};register_animation_source(model);invalidate_received_mesh(model);return true;
+    ensure_pose_observer();register_received_pose(model,object,mem_read32(object+0x48),mem_read32(model+0xC),pose);register_animation_source(model);invalidate_received_mesh(model);return true;
 }
 bool replica_weapon_pose(uint32_t actor,unsigned weapon,unsigned index,const std::vector<float>& pose) {
     if(!original_bones || !original_skinning || weapon>=12 || index>=2 || !readable(actor,0x790) || mem_read32(actor+0x48)!=0x802121E8u || mem_read32(actor+0x5DC)!=weapon)return false;
@@ -384,7 +405,7 @@ bool replica_weapon_pose(uint32_t actor,unsigned weapon,unsigned index,const std
     const auto model=readable(instance,0x228)?mem_read32(instance+0x28):0;
     if(pose.empty() || pose.size()>3072 || pose.size()%12 || !readable(model,0xB0) || mem_read32(model)!=0x8021D668u || mem_read32(model+0x7C)*12!=pose.size() || !readable(mem_read32(model+0x78),unsigned(pose.size())*4))return false;
     for(auto value:pose)if(!std::isfinite(value) || std::abs(value)>10000.f)return false;
-    ensure_pose_observer();enemy_poses[model]={actor,mem_read32(actor+0x48),mem_read32(model+0xC),pose,int(weapon),index};
+    ensure_pose_observer();register_received_pose(model,actor,mem_read32(actor+0x48),mem_read32(model+0xC),pose,int(weapon),index);
     register_animation_source(model);
     invalidate_received_mesh(model);
     return restore_enemy_pose(model);

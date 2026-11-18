@@ -70,6 +70,31 @@ bool vehicle_payload(const Properties& p,std::string& error){
     return true;
 }
 }
+bool release_native_vehicle_driver(PPCContext& context,uint32_t actor,std::string& error){
+    // Reject stale registry/vehicle bindings before even touching guest stack
+    // scratch. Disconnect must never release another player's vehicle.
+    if(!context_ok(context)){error="Vehicle release requires a valid PAL context";return false;}
+    if(!readable(actor,0x790) || mem_read32(actor+0x48)!=0x802121E8u){error="Vehicle release player class unavailable";return false;}
+    const auto slot=mem_read32(actor+0x17C),registry=ssne::native_party_registry();
+    if(slot>=ssne::native_party_capacity() || !readable(registry,ssne::native_party_capacity()*4) || mem_read32(registry+slot*4)!=actor){error="Vehicle release player registry differs";return false;}
+    const auto car=mem_read32(actor+0x6C4),mode=mem_read32(actor+0x340);
+    if(!car){if(mode==3){error="Driving player has no native vehicle";return false;}return true;}
+    if(mode!=3 || !readable(car,0x1D8)){error="Vehicle release driver state differs";return false;}
+    const auto wrapper=mem_read32(car+0x1D4);
+    const auto reference=native_script_reference(wrapper);VehicleBinding binding;
+    if(!reference || *reference<=0 || !vehicle_binding(*reference,binding,error)){
+        if(error.empty())error="Vehicle release level binding unavailable";
+        return false;
+    }
+    if(binding.car!=car || binding.wrapper!=wrapper || mem_read32(car+0x160)!=actor){error="Vehicle release ownership differs";return false;}
+    // Original exit owns the controller, HUD, camera, weapon and vehicle audio
+    // transitions. Keep the caller's CPU state and temporary stack unchanged.
+    StackScratch scratch(context);auto call=context;call.msr&=~0x8000u;
+    call.r[1]-=0x200;mem_write32(call.r[1],context.r[1]);call.r[3]=actor;call.r[4]=1;
+    ssne_call(call,0x800B5558);
+    if(mem_read32(actor+0x6C4) || mem_read32(car+0x160) || mem_read32(actor+0x340)!=1){error="Original vehicle exit did not complete";return false;}
+    return true;
+}
 bool capture_native_vehicles(Properties& p,std::string& error){
     std::vector<int64_t> tags;std::vector<float> values,audio;std::vector<int64_t> extra_audio;
     const auto table=mem_read32(0x802DB7C4),count=mem_read32(0x802DB7C8);

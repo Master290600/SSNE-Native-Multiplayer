@@ -4,6 +4,9 @@ struct PPCContext;
 namespace port::coop {
 // Level-owned PAL Jeep/Combine. Wire values contain level references and
 // player slots only; renderer, physics and driver pointers stay local.
+// Guest-thread safe-point only. A verified on-foot party player is a no-op;
+// a driver leaves through the original native action before roster removal.
+bool release_native_vehicle_driver(PPCContext&,uint32_t actor,std::string& error);
 bool capture_native_vehicles(Properties&,std::string& error);
 bool validate_native_vehicles(const Properties&,const std::map<EntityId,EntityState>&,std::string& error);
 bool prepare_native_vehicle_models(PPCContext&,const Properties&,std::string& error);

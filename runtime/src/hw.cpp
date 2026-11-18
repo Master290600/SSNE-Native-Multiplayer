@@ -1,6 +1,7 @@
 // MMIO at 0xCC000000. Registers are kept as 16-bit halfwords; 32-bit accesses are split into two halves
 // (high half at the lower address), matching the hardware's 16-bit register buses.
 #include "ssne/hw.h"
+#include "ssne/custom_level_mount.h"
 #include "state_io.h"
 
 #include <algorithm>
@@ -40,7 +41,10 @@ inline uint16_t& reg(uint32_t off) { return R[(off & 0xFFFF) >> 1]; }
 inline uint32_t reg32(uint32_t off) { return uint32_t(reg(off)) << 16 | reg(off + 2); }
 
 // ------------------------------------------------------------------ disc (served from game_data)
-struct Extent { uint64_t offset; uint32_t size; fs::path file; };
+struct Extent {
+    uint64_t offset; uint32_t size; fs::path file;
+    std::shared_ptr<const std::vector<uint8_t>> memory;
+};
 std::vector<Extent> g_extents;  // sorted by offset
 std::mutex g_disc_mutex;
 
@@ -366,6 +370,7 @@ std::mutex g_vi_mutex;
 bool disc_open(const std::string& data_dir, std::string& error) {
     std::lock_guard<std::mutex> lk(g_disc_mutex);
     g_extents.clear();
+    reset_custom_level_mounts();
     fs::path root = fs::u8path(data_dir);
     auto slurp = [](const fs::path& p) {
         std::ifstream in(p, std::ios::binary);
@@ -412,6 +417,11 @@ bool disc_read(uint64_t offset, uint8_t* dst, uint32_t len) {
     for (; it != g_extents.end() && it->offset < end; ++it) {
         uint64_t a = std::max(offset, it->offset), b = std::min(end, it->offset + it->size);
         if (a >= b) continue;
+        if (it->memory) {
+            memcpy(dst + (a - offset), it->memory->data() + (a - it->offset), size_t(b - a));
+            any = true;
+            continue;
+        }
         std::ifstream in(it->file, std::ios::binary);
         in.seekg(std::streamoff(a - it->offset));
         in.read(reinterpret_cast<char*>(dst + (a - offset)), std::streamsize(b - a));
@@ -419,6 +429,32 @@ bool disc_read(uint64_t offset, uint8_t* dst, uint32_t len) {
         intro_skip_file_read(reinterpret_cast<const char*>(it->file.filename().u8string().c_str()));
     }
     return any;
+}
+
+uint64_t disc_append_offset() {
+    std::lock_guard<std::mutex> lk(g_disc_mutex);
+    uint64_t end = 0;
+    for (const auto& extent : g_extents)
+        end = std::max(end, extent.offset + extent.size);
+    return (end + 31u) & ~uint64_t(31);
+}
+bool disc_append_memory(uint64_t offset,
+                        std::shared_ptr<const std::vector<uint8_t>> bytes,
+                        std::string& error) {
+    std::lock_guard<std::mutex> lk(g_disc_mutex);
+    if (!bytes || bytes->empty() || (offset & 31) || offset > UINT32_MAX ||
+        bytes->size() > UINT32_MAX - offset) {
+        error = "Invalid downloaded virtual disc extent";
+        return false;
+    }
+    for (const auto& extent : g_extents)
+        if (offset < extent.offset + extent.size) {
+            error = "Downloaded virtual disc extent overlaps existing data";
+            return false;
+        }
+    const auto size = uint32_t(bytes->size());
+    g_extents.push_back({offset, size, {}, std::move(bytes)});
+    return true;
 }
 
 void vi_retrace() {

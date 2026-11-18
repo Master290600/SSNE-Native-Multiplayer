@@ -81,6 +81,8 @@ void set_kbm_port(int port);
 void weapon_select_group(int group);
 bool local_information_open();
 bool local_pause_menu_open();
+void prepare_network_pause_panel(PPCContext& context);
+void forget_network_pause_panel(PPCContext& context, uint32_t gui = 0);
 // Pause: the game thread stops at its next display copy until unpaused (port settings menu).
 void set_paused(bool paused);
 bool paused();
@@ -100,6 +102,12 @@ using GameFrameObserver = std::function<void(PPCContext&,uint64_t)>;
 // Set before boot or after joining the guest thread; runs at frame-flip safe point.
 void set_game_frame_observer(GameFrameObserver observer);
 void set_game_tick_observer(GameFrameObserver observer);
+// Owner-bound guest-thread gate for verified host-only render/capture pipelining.
+// Rechecked around SDKFlip; false retains the original observer phase. Callback
+// execution uses entry registers and restores all SDK-returned CPU state.
+void set_host_frame_pipeline_gate(const void* owner,std::function<bool()> gate);
+void clear_host_frame_pipeline_gate(const void* owner);
+bool host_frame_pipeline_callback();
 // Guest-thread render lease: before view traversal and after all native draws.
 void set_game_render_observer(std::function<void(PPCContext&)> begin,std::function<void(PPCContext&)> end);
 // Original local HUD list traversal after netplay camera filtering. Register before
@@ -138,6 +146,7 @@ float fov();
 void set_widescreen(float factor);
 void set_hud_edges(bool on);  // widescreen: HUD pieces left / right of the middle at the screen's edges (default on)
 float widescreen();
+float loading_canvas_factor(); // selected output width while drawing the original loading canvas
 float widescreen_frame_factor();  // factor the game's current frame was rendered with (1 outside gameplay)
 bool widescreen_frame_zoomed();   // the current frame's scene camera is zoomed in (sniper scope; widescreen gameplay)
 void set_split_two(int mode);     // 2-player split screen: 0 top / bottom, 1 left / right, -1 the game's setting (next match)
@@ -154,7 +163,7 @@ void set_cheats(const Cheats& c);
 void set_cheat_host(bool enabled);  // session role changes, before the next guest update
 bool cheats_available();  // the game's cheat code was found (USA Rev 1)
 bool cheats_active();     // a cheat is in effect right now
-bool cheat_flying();      // flying: the game flies down with L (jump) and up with R (fire)
+bool cheat_flying();      // debug flight active; movement-only L ascent / R descent keeps weapon inputs intact
 bool frontend_presenting();
 bool netplay_render_gui_camera();
 

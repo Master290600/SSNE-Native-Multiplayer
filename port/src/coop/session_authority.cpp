@@ -6,12 +6,41 @@
 #include <algorithm>
 
 namespace port::coop {
+namespace {
+SessionAuthority::CheckpointHeader checkpoint_header(checkpoint::Reader& r) {
+    auto require=[](bool ok){if(!ok)throw std::runtime_error("Invalid authority checkpoint state");};
+    SessionAuthority::CheckpointHeader h;
+    h.format=r.u32();require(h.format>=0x53414331 && h.format<=0x53414334);
+    h.capacity=r.u32();require(h.capacity>=1 && h.capacity<=max_players);
+    h.has_spectators=h.format>=0x53414333;
+    h.presentation_vote=h.format==0x53414332 || h.format==0x53414334;
+    const auto locks=h.has_spectators?r.u32():0u,mask=(1u<<h.capacity)-1u;
+    require(!(locks&~mask));h.spectator_locks=uint8_t(locks);
+    h.counter_offset=r.at;h.counter=r.u64();h.cutscene=r.u64();h.skip_requested=r.flag();
+    require(h.cutscene<=h.counter && (!h.presentation_vote || h.cutscene));
+    if(r.flag()) {
+        SkipDecision d;d.vote.cutscene=r.u64();d.vote.received=r.u32();d.vote.required=r.u32();d.vote.skip_requested=r.flag();
+        const auto connected=r.u32(),eligible=r.u32(),afk=r.u32();
+        require(!(connected&~mask) && !(eligible&~connected) && !(afk&~connected) && !(eligible&afk));
+        require(d.vote.cutscene==h.cutscene && d.vote.cutscene && d.vote.skip_requested && d.vote.required && d.vote.required==d.vote.received && d.vote.required==unsigned(std::popcount(eligible)));
+        d.connected_mask=uint8_t(connected);d.eligible_mask=uint8_t(eligible);d.afk_mask=uint8_t(afk);h.decision=d;
+    }
+    require(h.skip_requested==bool(h.decision));h.participants_offset=r.at;
+    return h;
+}
+}
+bool SessionAuthority::read_checkpoint_header(const std::vector<uint8_t>& bytes,CheckpointHeader& out,std::string& error) {
+    try {
+        checkpoint::Reader r(bytes,4096);auto header=checkpoint_header(r);
+        out=std::move(header);error.clear();return true;
+    }catch(const std::exception& e){error=e.what();return false;}
+}
 std::vector<uint8_t> SessionAuthority::checkpoint_state() const {
-    checkpoint::Writer w;w.u32(presentation_vote_?0x53414332:0x53414331);w.u32(capacity_);
+    checkpoint::Writer w;w.u32(presentation_vote_?0x53414334:0x53414333);w.u32(capacity_);w.u32(spectator_lock_mask_);
     w.u64(cutscene_counter_);w.u64(cutscene_);w.flag(skip_requested_);
     w.flag(bool(decision_));
     if(decision_){const auto& d=*decision_;w.u64(d.vote.cutscene);w.u32(d.vote.received);w.u32(d.vote.required);w.flag(d.vote.skip_requested);w.u32(d.connected_mask);w.u32(d.eligible_mask);w.u32(d.afk_mask);}
-    for(unsigned i=0;i<max_players;++i){const auto& p=players_[i];w.u32(p.id.slot);w.u64(p.id.generation);w.flag(p.connected);w.flag(p.ready);w.flag(p.afk);w.u64(p.character);w.text(p.name);w.u64(generations_[i]);w.u64(sequences_[i]);w.flag(votes_[i]);}
+    for(unsigned i=0;i<max_players;++i){const auto& p=players_[i];w.u32(p.id.slot);w.u64(p.id.generation);w.flag(p.connected);w.flag(p.ready);w.flag(p.afk);w.u64(p.character);w.text(p.name);w.u64(generations_[i]);w.u64(sequences_[i]);w.flag(votes_[i]);w.flag(p.spectator);}
     return w.finish();
 }
 bool SessionAuthority::restore_checkpoint(const std::vector<uint8_t>& bytes,std::string& error) {
@@ -21,25 +50,15 @@ bool SessionAuthority::decode_checkpoint(const std::vector<uint8_t>& bytes,std::
     try {
         checkpoint::Reader r(bytes,4096);auto next=*this;
         auto require=[](bool ok){if(!ok)throw std::runtime_error("Invalid authority checkpoint state");};
-        const auto format=r.u32();
-        require((format==0x53414331 || format==0x53414332) && r.u32()==capacity_);
-        next.presentation_vote_=format==0x53414332;
-        next.cutscene_counter_=r.u64();next.cutscene_=r.u64();next.skip_requested_=r.flag();
-        require(next.cutscene_<=next.cutscene_counter_ && (!next.presentation_vote_ || next.cutscene_));
-        next.decision_.reset();
-        if(r.flag()){
-            SkipDecision d;d.vote.cutscene=r.u64();d.vote.received=r.u32();d.vote.required=r.u32();d.vote.skip_requested=r.flag();
-            const auto connected=r.u32(),eligible=r.u32(),afk=r.u32(),mask=(1u<<capacity_)-1;
-            require(!(connected&~mask) && !(eligible&~connected) && !(afk&~connected) && !(eligible&afk));
-            require(d.vote.cutscene==next.cutscene_ && d.vote.cutscene && d.vote.skip_requested && d.vote.required && d.vote.required==d.vote.received && d.vote.required==unsigned(std::popcount(eligible)));
-            d.connected_mask=uint8_t(connected);d.eligible_mask=uint8_t(eligible);d.afk_mask=uint8_t(afk);next.decision_=d;
-        }
-        require(next.skip_requested_==bool(next.decision_));
-        for(unsigned i=0;i<max_players;++i){auto& p=next.players_[i];p.id.slot=r.u32();p.id.generation=r.u64();p.connected=r.flag();p.ready=r.flag();p.afk=r.flag();p.character=r.u64();p.name=r.text(64);next.generations_[i]=r.u64();next.sequences_[i]=r.u64();next.votes_[i]=r.flag();
+        const auto header=checkpoint_header(r);require(header.capacity==capacity_);
+        const bool has_spectators=header.has_spectators;
+        next.presentation_vote_=header.presentation_vote;next.spectator_lock_mask_=header.spectator_locks;
+        next.cutscene_counter_=header.counter;next.cutscene_=header.cutscene;next.skip_requested_=header.skip_requested;next.decision_=header.decision;
+        for(unsigned i=0;i<max_players;++i){auto& p=next.players_[i];p.id.slot=r.u32();p.id.generation=r.u64();p.connected=r.flag();p.ready=r.flag();p.afk=r.flag();p.character=r.u64();p.name=r.text(64);next.generations_[i]=r.u64();next.sequences_[i]=r.u64();next.votes_[i]=r.flag();p.spectator=has_spectators?r.flag():false;
             // Saved sockets/identities must never replace the currently authenticated peers.
             if(exact_connections)require(p.connected==players_[i].connected && p.id==players_[i].id && next.generations_[i]==generations_[i]);
             if(p.connected){require(i<capacity_ && p.id.slot==i && p.id.generation && p.id.generation==next.generations_[i] && !p.name.empty() && std::none_of(p.name.begin(),p.name.end(),[](unsigned char c){return c<32 || c==127;}));require(!p.ready || p.character);}
-            else require(p.id==PlayerId{} && !p.ready && !p.afk && !p.character && p.name.empty());
+            else require(p.id==PlayerId{} && !p.ready && !p.afk && !p.character && p.name.empty() && !p.spectator && !(next.spectator_lock_mask_&(1u<<i)));
             require(!next.votes_[i] || (next.cutscene_ && next.eligible(i)));
             for(unsigned j=0;j<i;++j)require(!p.character || p.character!=next.players_[j].character);
         }
@@ -56,7 +75,7 @@ bool SessionAuthority::restore_gameplay_checkpoint(const std::vector<uint8_t>& b
         saved.players_[i]=players_[i];
         if(saved.players_[i].connected){saved.players_[i].character=character;saved.players_[i].ready=false;saved.players_[i].afk=afk;}
     }
-    saved.generations_=generations_;saved.sequences_=sequences_;
+    saved.generations_=generations_;saved.sequences_=sequences_;saved.spectator_lock_mask_=0;
     saved.cutscene_counter_=std::max(saved.cutscene_counter_,cutscene_counter_);
     saved.votes_.fill(false);saved.presentation_vote_=false;saved.cutscene_=0;saved.skip_requested_=false;saved.decision_.reset();
     *this=std::move(saved);return true;
@@ -69,7 +88,8 @@ bool SessionAuthority::retain_live_history(const std::vector<uint8_t>& bytes,std
     // Command replay floors belong to current sockets, never to a save file.
     // A newly started session may reuse slot/generation1 with fresh counters.
     // Same-session rewinds also retain exactly the currently accepted floor.
-    for(unsigned i=0;i<max_players;++i){sequences_[i]=live.sequences_[i];players_[i].name=std::move(live.players_[i].name);}
+    for(unsigned i=0;i<max_players;++i){sequences_[i]=live.sequences_[i];players_[i].name=std::move(live.players_[i].name);players_[i].spectator=live.players_[i].spectator;}
+    spectator_lock_mask_=0;
     cutscene_counter_=std::max(cutscene_counter_,live.cutscene_counter_);
     return true;
 }
@@ -110,18 +130,19 @@ bool SessionAuthority::finish_join(PlayerId id) {
 }
 void SessionAuthority::begin_loading(bool keep_presentation_vote) {
     for(auto& player:players_)if(player.connected){player.ready=false;player.character=0;}
+    spectator_lock_mask_=0;
     if(keep_presentation_vote && presentation_vote_)return;
     votes_.fill(false);presentation_vote_=false;cutscene_=0;skip_requested_=false;decision_.reset();
 }
 bool SessionAuthority::leave(PlayerId id) {
     auto* player=find(id);if(!player)return false;
-    *player={};votes_[id.slot]=false;reconsider_vote();return true;
+    *player={};spectator_lock_mask_&=uint8_t(~(1u<<id.slot));votes_[id.slot]=false;reconsider_vote();return true;
 }
 unsigned SessionAuthority::connected_count() const {
     unsigned count=0;for(const auto& player:players_)count+=player.connected;return count;
 }
 bool SessionAuthority::eligible(unsigned slot) const {
-    const auto& player=players_[slot];return player.connected && (player.ready || presentation_vote_) && !player.afk;
+    const auto& player=players_[slot];return player.connected && (player.ready || presentation_vote_) && !player.afk && !player.spectator && !(spectator_lock_mask_&(1u<<slot));
 }
 bool SessionAuthority::accept_sequence(unsigned slot,uint64_t sequence) {
     if(!sequence || sequence<=sequences_[slot])return false;
@@ -144,6 +165,26 @@ CommandResult SessionAuthority::request_afk(PlayerId id,uint64_t sequence,bool a
     player->afk=afk;
     // Returning humans must explicitly vote again while a vote remains open.
     votes_[id.slot]=false;reconsider_vote();return CommandResult::Applied;
+}
+CommandResult SessionAuthority::request_spectator(PlayerId id,uint64_t sequence,bool spectator,bool allow_unready) {
+    auto* player=find(id);if(!player)return CommandResult::StalePlayer;
+    // A rejected locked/unready request still consumes its authenticated replay
+    // sequence, so it cannot become a valid leave after the round lock clears.
+    if(!accept_sequence(id.slot,sequence))return CommandResult::StaleSequence;
+    if((!player->ready && !presentation_vote_ && !allow_unready) || (!spectator && (spectator_lock_mask_&(1u<<id.slot))))return CommandResult::NotEligible;
+    if(player->spectator==spectator)return CommandResult::Unchanged;
+    player->spectator=spectator;votes_[id.slot]=false;reconsider_vote();return CommandResult::Applied;
+}
+bool SessionAuthority::cancel_spectator_activation(PlayerId id){
+    auto* player=find(id);if(!player || (spectator_lock_mask_&(1u<<id.slot)))return false;
+    if(player->spectator){player->spectator=false;votes_[id.slot]=false;reconsider_vote();}
+    return true;
+}
+void SessionAuthority::set_spectator_lock(uint8_t mask){
+    uint8_t connected=0;for(unsigned slot=0;slot<capacity_;++slot)if(players_[slot].connected)connected|=uint8_t(1u<<slot);
+    spectator_lock_mask_=mask&connected;
+    for(unsigned slot=0;slot<capacity_;++slot)if(spectator_lock_mask_&(1u<<slot))votes_[slot]=false;
+    reconsider_vote();
 }
 CommandResult SessionAuthority::request_skip(PlayerId id,uint64_t sequence,uint64_t cutscene) {
     if(!find(id))return CommandResult::StalePlayer;

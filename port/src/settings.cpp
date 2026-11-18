@@ -34,6 +34,29 @@ const ActionInfo kActions[ACT_COUNT] = {
     {"weapon7", "Weapon 7  (sniper rifle)"}, {"weapon8", "Weapon 8  (cannon)"},
     {"weapon9", "Weapon 9  (Serious Bomb)"},
 };
+const ActionInfo kMultiplayerActions[MP_COUNT] = {
+    {"chat", "Open multiplayer chat"}, {"ping", "Mark target or location"},
+    {"roster", "Hold player list"}, {"afk", "Toggle AFK companion"},
+};
+
+bool reserved_multiplayer_key(int code) {
+    if(code>=SDL_SCANCODE_F1 && code<=SDL_SCANCODE_F12)return true;
+    switch(code){
+    case SDL_SCANCODE_ESCAPE:case SDL_SCANCODE_RETURN:case SDL_SCANCODE_KP_ENTER:
+    case SDL_SCANCODE_INSERT:case SDL_SCANCODE_PRINTSCREEN:
+    case SDL_SCANCODE_LCTRL:case SDL_SCANCODE_RCTRL:case SDL_SCANCODE_LALT:case SDL_SCANCODE_RALT:
+    case SDL_SCANCODE_LGUI:case SDL_SCANCODE_RGUI:return true;
+    default:return false;
+    }
+}
+
+// Existing gameplay bindings take priority when loading an older file or
+// resetting controls. Invalid or duplicate multiplayer slots remain unbound.
+void sanitize_multiplayer_bindings(Settings& s) {
+    Bind requested[MP_COUNT][Settings::kMpSlots];
+    for(int a=0;a<MP_COUNT;++a)for(int k=0;k<Settings::kMpSlots;++k){requested[a][k]=s.multiplayer[a][k];s.multiplayer[a][k]={};}
+    for(int a=0;a<MP_COUNT;++a)for(int k=0;k<Settings::kMpSlots;++k)assign_multiplayer_bind(s,a,k,requested[a][k]);
+}
 
 std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
@@ -118,11 +141,39 @@ const char* pad_axis_name(int a) {
 
 const char* action_name(int a) { return a >= 0 && a < ACT_COUNT ? kActions[a].name : "?"; }
 const char* action_id(int a) { return a >= 0 && a < ACT_COUNT ? kActions[a].id : "?"; }
+const char* multiplayer_action_name(int a) { return a >= 0 && a < MP_COUNT ? kMultiplayerActions[a].name : "?"; }
+const char* multiplayer_action_id(int a) { return a >= 0 && a < MP_COUNT ? kMultiplayerActions[a].id : "?"; }
+
+bool valid_multiplayer_bind(const Bind& b) {
+    if(b.type==Bind::NONE)return b.code==0;
+    if(b.type==Bind::MOUSE)return b.code>=1 && b.code<=5;
+    return b.type==Bind::KEY && b.code>SDL_SCANCODE_UNKNOWN && b.code<SDL_NUM_SCANCODES && !reserved_multiplayer_key(b.code);
+}
+bool multiplayer_bind_in_use(const Settings& s,const Bind& b) {
+    if(b.type==Bind::NONE)return false;
+    for(const auto& slots:s.multiplayer)for(const auto& binding:slots)if(binding==b)return true;
+    return false;
+}
+MultiplayerBindConflict multiplayer_bind_conflict(const Settings& s,int action,int slot,const Bind& b) {
+    if(action<0 || action>=MP_COUNT || slot<0 || slot>=Settings::kMpSlots)return MultiplayerBindConflict::Unsupported;
+    if(b.type==Bind::KEY && reserved_multiplayer_key(b.code))return MultiplayerBindConflict::Reserved;
+    if(!valid_multiplayer_bind(b))return MultiplayerBindConflict::Unsupported;
+    if(b.type==Bind::NONE)return MultiplayerBindConflict::None;
+    for(const auto& slots:s.kb)for(const auto& binding:slots)if(binding==b)return MultiplayerBindConflict::Gameplay;
+    for(int a=0;a<MP_COUNT;++a)for(int k=0;k<Settings::kMpSlots;++k)
+        if(s.multiplayer[a][k]==b && (a!=action || k!=slot))return MultiplayerBindConflict::Multiplayer;
+    return MultiplayerBindConflict::None;
+}
+bool assign_multiplayer_bind(Settings& s,int action,int slot,const Bind& b) {
+    if(multiplayer_bind_conflict(s,action,slot,b)!=MultiplayerBindConflict::None)return false;
+    s.multiplayer[action][slot]=b;return true;
+}
 
 Settings::Settings() {
     reset_graphics();
     reset_audio();
     reset_keyboard();
+    reset_multiplayer();
     reset_gamepad();
     pause_in_menu = true;
 }
@@ -173,6 +224,15 @@ void Settings::reset_keyboard() {
     kb[ACT_DPAD_RIGHT][0] = k(SDL_SCANCODE_KP_6);
     for (int i = 0; i < 9; i++) kb[ACT_WEAPON1 + i][0] = k(SDL_Scancode(SDL_SCANCODE_1 + i));
     mouse_look = true; mouse_aim = true; mouse_sens = 1.0f; mouse_invert_y = false;
+    sanitize_multiplayer_bindings(*this);
+}
+
+void Settings::reset_multiplayer() {
+    for(auto& slots:multiplayer)for(auto& binding:slots)binding={};
+    multiplayer[MP_CHAT][0]=Bind::key(SDL_SCANCODE_T);
+    multiplayer[MP_PING][0]=Bind::key(SDL_SCANCODE_G);multiplayer[MP_PING][1]=Bind::mouse(SDL_BUTTON_MIDDLE);
+    multiplayer[MP_ROSTER][0]=Bind::key(SDL_SCANCODE_H);
+    sanitize_multiplayer_bindings(*this);
 }
 
 void Settings::reset_gamepad() {
@@ -377,6 +437,24 @@ bool load_settings(Settings& s, const std::string& path) {
     get("kbm_player", s.kbm_player);
     for (int i = 0; i < Settings::kPadSlots; i++) get(("pad" + std::to_string(i + 1) + "_player").c_str(), s.pad_player[i]);
     get("split_two", s.split_two);
+    get("team_hud", s.team_hud);
+    for(int a=0;a<MP_COUNT;++a)if(const auto it=kv.find(std::string("mp.")+multiplayer_action_id(a));it!=kv.end()){
+        std::string remaining=it->second;
+        for(int k=0;k<Settings::kMpSlots;++k){
+            const auto comma=remaining.find(',');const auto value=trim(remaining.substr(0,comma));
+            Bind binding;
+            // Numeric scancodes and mouse buttons must consume the whole value.
+            const auto colon=value.find(':');
+            if(colon!=std::string::npos && (value.substr(0,colon)=="scancode" || value.substr(0,colon)=="mouse")){
+                int parsed=0;const auto text=std::string_view(value).substr(colon+1);
+                const auto result=std::from_chars(text.data(),text.data()+text.size(),parsed);
+                if(result.ec==std::errc{} && result.ptr==text.data()+text.size() && parsed>0 && parsed<SDL_NUM_SCANCODES)
+                    binding=value.substr(0,colon)=="mouse"?(parsed<=5?Bind::mouse(parsed):Bind{}):Bind::key(SDL_Scancode(parsed));
+            }else binding=bind_from_string(value);
+            s.multiplayer[a][k]=binding;
+            remaining=comma==std::string::npos?std::string():remaining.substr(comma+1);
+        }
+    }
     get("cheat_invulnerable", s.cheat_invulnerable);
     get("cheat_infinite_ammo", s.cheat_infinite_ammo);
     get("cheat_all_weapons", s.cheat_all_weapons);
@@ -502,6 +580,7 @@ bool load_settings(Settings& s, const std::string& path) {
     s.cheat_speed = std::clamp(s.cheat_speed, 100, 300);
     s.cheat_jump = std::clamp(s.cheat_jump, 100, 500);
     s.cheat_damage = std::clamp(s.cheat_damage, 100, 1000);
+    sanitize_multiplayer_bindings(s);
     return true;
 }
 
@@ -551,6 +630,10 @@ bool save_settings(const Settings& s, const std::string& path) {
     for (int a = 0; a < ACT_COUNT; a++)
         o << "kb." << action_id(a) << " = " << bind_to_string(s.kb[a][0]) << ", " << bind_to_string(s.kb[a][1]) << ", "
           << bind_to_string(s.kb[a][2]) << "\n";
+    o << "[multiplayer]\n";
+    o << "team_hud = " << (s.team_hud ? 1 : 0) << "    # compact teammate health, armor and distance\n";
+    for(int a=0;a<MP_COUNT;++a)
+        o << "mp." << multiplayer_action_id(a) << " = " << bind_to_string(s.multiplayer[a][0]) << ", " << bind_to_string(s.multiplayer[a][1]) << "\n";
     o << "[gamepad]\n";
     o << "pad_deadzone = " << s.pad_deadzone << "\n";
     o << "pad_trigger_threshold = " << s.trigger_threshold << "\n";

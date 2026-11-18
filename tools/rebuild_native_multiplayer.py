@@ -27,7 +27,7 @@ def main():
     descriptor = json.loads((kit / 'runtime-kit.json').read_text())
     for field,path in (
         ('patcher_sha256',project/'source-multiplayer/tools/patch_multiplayer.py'),
-        ('recompiler_sha256',project/'build-kit/ssne-recomp.exe'),
+        ('recompiler_sha256',project/'build-kit/SSNE-RECOOP-Native.exe'),
         ('compiler_sha256',project/'build-kit/toolchain/bin/clang++.exe')):
         if descriptor.get(field) and sha(path)!=descriptor[field]:
             raise RuntimeError(f'Build tool differs from this runtime kit: {path}')
@@ -46,7 +46,7 @@ def main():
     compiler = project / 'build-kit/toolchain/bin/clang++.exe'
     base, generated, objects = (work / name for name in ('base', 'generated', 'objects'))
     objects.mkdir(exist_ok=True)
-    subprocess.run([str(project / 'build-kit/ssne-recomp.exe'), str(dol), str(base), '--map',
+    subprocess.run([str(project / 'build-kit/SSNE-RECOOP-Native.exe'), str(dol), str(base), '--map',
                     str(project / 'build-kit/G3BP9G_r0.sym'), '--no-comments'], check=True)
     subprocess.run([sys.executable, str(project / 'source-multiplayer/tools/patch_multiplayer.py'),
                     '--input', str(base), '--output', str(generated)], check=True)

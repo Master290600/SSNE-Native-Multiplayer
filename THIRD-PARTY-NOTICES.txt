@@ -1,4 +1,4 @@
-SSNE-Native - third-party notices
+SSNE-RECOOP-Native - third-party notices
 
 The programs in this release (and the prebuilt libraries in build-kit\lib, which end up in the game program
 built on your PC) include the following third-party software. Their full license
@@ -15,8 +15,23 @@ texts are in the licenses folder.
                         The MinGW-w64 project                             see licenses/MinGW-w64-runtime-COPYING.txt
                                                                           and licenses/winpthreads-COPYING.txt
 
-The fonts are embedded unmodified in SSNE-Native.exe. They are not sold on their own and keep their
+The fonts are embedded unmodified in SSNE-RECOOP-Native.exe. They are not sold on their own and keep their
 Reserved Font Names.
 
-The compiler used to build the game on your PC (LLVM-MinGW) is not included. The launcher downloads it from its
-official release (https://github.com/mstorsjo/llvm-mingw); it comes with its own license files.
+The Windows 1.2.8 package includes LLVM-MinGW to compile the game locally. Its license is in
+build-kit/toolchain/LICENSE.TXT. Upstream releases are at https://github.com/mstorsjo/llvm-mingw.
+
+Internet invitation dependencies (compiled into the cooperative-session runtime):
+  libjuice 1.7.4       Paul-Louis Ageneau and libjuice contributors
+                       MPL-2.0          licenses/libjuice-MPL-2.0.txt
+  KCP                  Copyright (c) 2017 Lin Wei (skywind3000 at gmail.com)
+                       MIT license      licenses/KCP-MIT.txt
+
+Corresponding unmodified library source and original notices are included under
+source/vendor/libjuice and source/vendor/kcp in launcher packages (vendor/ in a
+source checkout). The exact upstream revisions are libjuice
+b89c792e3612faf2f12cf35bcc56857313a06be3 and KCP
+b1a7a2101dcbb96017681a500d6b82bbe5a88766. Build inputs and provenance are listed
+in source/docs/INVITATION-DEPENDENCIES.json (docs/ in a source checkout).
+The public-domain credits in libjuice/src/picohash.h are preserved in that file.
+No TURN service account or third-party service availability is included.

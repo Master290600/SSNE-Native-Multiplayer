@@ -1,4 +1,5 @@
 #include "authoritative_session.h"
+#include "authority_checkpoint_cases.h"
 #include "wire_protocol.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <functional>
 #include <algorithm>
+#include <bit>
 using namespace port::coop;
 using Clock=std::chrono::steady_clock;
 void require(bool ok,const char* message){if(!ok){std::cerr<<message<<'\n';std::exit(1);}}
@@ -25,6 +27,25 @@ std::vector<uint8_t> frame(wire::Message type,const std::vector<uint8_t>& body) 
 bool transfer(SOCKET socket,uint8_t* data,size_t size,bool writing) {
     while(size){auto n=writing?send(socket,reinterpret_cast<const char*>(data),int(size),0):recv(socket,reinterpret_cast<char*>(data),int(size),0);if(n<=0)return false;data+=n;size-=size_t(n);}return true;
 }
+uint64_t get64(const std::vector<uint8_t>& bytes){require(bytes.size()>=8,"Short opaque token");uint64_t value=0;for(unsigned i=0;i<8;++i)value=(value<<8)|bytes[i];return value;}
+std::pair<wire::Message,std::vector<uint8_t>> receive_frame(SOCKET socket){
+    uint8_t header[12];require(transfer(socket,header,sizeof(header),false),"Read framed response header");
+    auto size=uint32_t(header[8])<<24|uint32_t(header[9])<<16|uint32_t(header[10])<<8|header[11];require(size<=max_frame_bytes,"Oversized framed response");
+    std::vector<uint8_t> bytes(size);require(transfer(socket,bytes.data(),bytes.size(),false),"Read framed response body");
+    return {wire::Message(uint16_t(header[6])<<8|header[7]),std::move(bytes)};
+}
+void raw_lobby_ready(SOCKET socket,uint64_t token,bool value){
+    std::vector<uint8_t> body;put64(body,token);body.push_back(value);auto packet=frame(wire::Message::LobbyReady,body);
+    require(transfer(socket,packet.data(),packet.size(),true),"Lobby-ready send");
+    // A following Ping on the same TCP stream fences processing of the ready
+    // request, so a rejected replay is proved without a scheduling sleep.
+    static uint64_t serial=0;body.clear();put64(body,++serial);packet=frame(wire::Message::Ping,body);
+    require(transfer(socket,packet.data(),packet.size(),true),"Lobby-ready processing fence send");
+    const auto end=Clock::now()+std::chrono::seconds(8);
+    for(;;){auto response=receive_frame(socket);if(response.first==wire::Message::Pong && get64(response.second)==serial)break;require(Clock::now()<end,"Lobby-ready processing fence timeout");}
+}
+int64_t lobby_integer(const AuthoritativeServer& host,const char* key){const auto world=host.latest_world();const auto it=world->mission.find(key);require(it!=world->mission.end() && std::holds_alternative<int64_t>(it->second),"Missing integer lobby property");return std::get<int64_t>(it->second);}
+uint64_t lobby_token(const AuthoritativeServer& host){return std::bit_cast<uint64_t>(lobby_integer(host,"Session.Lobby.ReadyToken"));}
 SOCKET raw_peer(uint16_t port) {
     auto socket=::socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);require(socket!=INVALID_SOCKET,"Raw socket creation");
     DWORD timeout=5000;setsockopt(socket,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<const char*>(&timeout),sizeof(timeout));
@@ -78,7 +99,105 @@ void check_connecting_lifecycle() {
     wait_for([&]{return !refused.status().connecting;},"Refused connection retained Pending");
     status=refused.status();require(!status.connected && status.message.find("socket error "+std::to_string(WSAECONNREFUSED))!=std::string::npos,"Refused connection lost Winsock refusal reason");refused.stop();closesocket(reserved);
 }
+void check_lobby_readiness(){
+    AuthoritativeServer host(3);auto unchanged=host.latest_world();host.lobby_ready(true);host.reset_lobby_readiness();require(!host.begin_lobby_game() && host.latest_world()==unchanged,"Unstarted lobby API mutated a snapshot");
+    require(host.start(0,"123456",1234,"Ready host"),"Ready host start");const auto bot=*host.add_bot();require(bot.slot==1 && lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Bot did not auto-ready");
+    auto peer=raw_peer(host.status().port);wait_for([&]{return host.status().joined==3;},"Ready peer join");const auto original=host.participants()[2].id;const auto initial=lobby_token(host);
+    raw_lobby_ready(peer,initial,true);require(lobby_integer(host,"Session.Lobby.ReadyMask")==6,"Peer ready modified another player's bit");
+    unchanged=host.latest_world();require(!host.begin_lobby_game() && host.latest_world()==unchanged,"Failed Start mutated readiness/world revision");
+    host.lobby_ready(true);require(lobby_integer(host,"Session.Lobby.ReadyMask")==7,"Host ready missing");
+    host.reset_lobby_readiness();const auto changed=lobby_token(host);require(changed!=initial && lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Setup reset retained human ready or lost bot ready");
+    raw_lobby_ready(peer,initial,true);require(lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Stale ready re-armed after setup reset");
+    raw_lobby_ready(peer,changed,true);require(lobby_integer(host,"Session.Lobby.ReadyMask")==6,"Current ready token rejected");
+    raw_lobby_ready(peer,initial,false);require(lobby_integer(host,"Session.Lobby.ReadyMask")==6,"Stale unready cleared current confirmation");
+    host.lobby_ready(true);require(host.begin_lobby_game() && !lobby_integer(host,"Session.Lobby.Open") && !lobby_integer(host,"Session.Lobby.ReadyMask"),"Unanimous Start did not consume lobby readiness");
+    raw_lobby_ready(peer,changed,true);unchanged=host.latest_world();host.reset_lobby_readiness();host.lobby_ready(true);require(!host.begin_lobby_game() && host.latest_world()==unchanged,"Closed lobby accepted readiness/reset/Start");
+    WorldState menu;menu.tick=1;menu.mission["Session.NativePhase"]=std::string("menu");std::string error;require(host.publish(menu,error),error.c_str());const auto reopened=lobby_token(host);
+    require(reopened!=changed && lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Reopened lobby retained previous readiness/token");raw_lobby_ready(peer,changed,true);require(lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Previous lobby request accepted after re-entry");
+    raw_lobby_ready(peer,reopened,true);menu.tick=2;require(host.publish(menu,error),error.c_str());require(lobby_token(host)==reopened && lobby_integer(host,"Session.Lobby.ReadyMask")==6,"Ordinary menu publication reset readiness");
+    menu.epoch=2;menu.tick=0;require(host.publish(menu,error),error.c_str());require(lobby_token(host)!=reopened && lobby_integer(host,"Session.Lobby.ReadyMask")==2,"New menu epoch retained a previous confirmation");
+    raw_lobby_ready(peer,lobby_token(host),true);closesocket(peer);wait_for([&]{return host.status().joined==2;},"Ready peer disconnect");require(lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Disconnected slot retained ready");
+    peer=raw_peer(host.status().port);wait_for([&]{return host.status().joined==3;},"Ready replacement join");const auto replacement=host.participants()[2].id;require(replacement.slot==original.slot && replacement.generation!=original.generation && lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Replacement inherited previous generation's readiness");
+    closesocket(peer);host.stop();
+
+    AuthoritativeServer bots(2);require(bots.start(0,"123456",1234,"Bot replacement host"),"Bot replacement host start");require(bots.set_match_player_limit(2),"Bot replacement admission limit");require(bool(bots.add_bot()),"Replacement bot add");bots.lobby_ready(true);require(lobby_integer(bots,"Session.Lobby.ReadyMask")==3,"Ready replacement setup");
+    bots.reset_lobby_readiness();bots.lobby_ready(true);const auto token=lobby_token(bots);require(token!=bots.latest_world()->epoch,"Ready token test did not differ from world epoch");
+    AuthoritativeClient human;require(human.start("127.0.0.1",bots.status().port,"123456",1234,"Human replacement"),"Human replacement start");wait_for([&]{return human.status().connected && !bots.bot_mask();},"Human did not replace bot");const auto id=human.status().player;
+    require(id.slot==1 && lobby_integer(bots,"Session.Lobby.ReadyMask")==1 && !bots.begin_lobby_game(),"Human inherited evicted bot ready");
+    require(bots.set_spectator_lock(2) && bots.participants()[1].spectator && !bots.begin_lobby_game(),"Unready spectator bypassed connected-player gate");
+    wait_for([&]{const auto w=human.latest_world();const auto it=w->mission.find("Session.Lobby.ReadyToken");return it!=w->mission.end() && std::bit_cast<uint64_t>(std::get<int64_t>(it->second))==token;},"Human missing ready token");human.lobby_ready(true);wait_for([&]{return lobby_integer(bots,"Session.Lobby.ReadyMask")==3;},"Client did not send advertised token");
+    human.lobby_ready(false);wait_for([&]{return lobby_integer(bots,"Session.Lobby.ReadyMask")==1;},"Client unready rejected");require(!bots.begin_lobby_game(),"Unready human spectator ignored");
+    human.stop();wait_for([&]{return bots.status().joined==1;},"Human replacement stop");require(bots.begin_lobby_game(),"Disconnected human blocked remaining ready host");bots.stop();
+}
+void check_lobby_legacy_epoch_fallback(){
+    uint16_t port=0;auto listener=loopback_endpoint(port,true);AuthoritativeClient client;require(client.start("127.0.0.1",port,"123456",1234,"Epoch fallback"),"Legacy lobby client start");auto peer=accept_pending(listener);require(receive_frame(peer).first==wire::Message::Hello,"Legacy lobby Hello");
+    std::vector<uint8_t> bytes;put32(bytes,1);put64(bytes,1);put32(bytes,2);auto packet=frame(wire::Message::Assigned,bytes);require(transfer(peer,packet.data(),packet.size(),true),"Legacy assignment send");
+    WorldState world;world.epoch=37;world.revision=1;world.mission["Session.Lobby.Open"]=int64_t(1);world.mission["Session.Lobby.ReadyMask"]=int64_t(0);world.players[1]={{1,1},true,false,false,0,"Epoch fallback"};
+    packet=frame(wire::Message::World,encode_delta(difference(static_cast<const WorldState*>(nullptr),world)));require(transfer(peer,packet.data(),packet.size(),true),"Legacy lobby world send");wait_for([&]{return client.latest_world()->epoch==37;},"Legacy lobby world receive");client.lobby_ready(true);
+    const auto end=Clock::now()+std::chrono::seconds(8);for(;;){const auto response=receive_frame(peer);if(response.first==wire::Message::LobbyReady){require(response.second.size()==9 && get64(response.second)==37 && response.second[8]==1,"Client changed LobbyReady shape or lost legacy epoch fallback");break;}require(Clock::now()<end,"Legacy lobby ready receive timeout");}
+    client.stop();closesocket(peer);closesocket(listener);
+}
+void check_lobby_setup_atomic_readiness(){
+    AuthoritativeServer host(3);require(host.start(0,"123456",1234,"Atomic setup host"),"Atomic setup host start");require(bool(host.add_bot()),"Atomic setup bot");auto peer=raw_peer(host.status().port);wait_for([&]{return host.status().joined==3;},"Atomic setup peer join");
+    WorldState world;world.tick=1;world.mission={{"Session.NativePhase",std::string("menu")},{"Session.Lobby.Level",std::string("Rlevel1_1")},{"Session.Lobby.Mode",int64_t(1)},{"Session.Lobby.LevelSet",int64_t(0)},{"Session.Lobby.Difficulty",int64_t(1)},{"Session.EnemyMultiplier",int64_t(1)},{"Session.AmmoCapacity",int64_t(1)},{"Session.AmmoPickupMultiplier",int64_t(1)}};std::string error;require(host.publish(world,error),error.c_str());
+    raw_lobby_ready(peer,lobby_token(host),true);host.lobby_ready(true);require(lobby_integer(host,"Session.Lobby.ReadyMask")==7,"Atomic setup confirmations missing");
+    host.reset_lobby_readiness();const auto intermediate=lobby_token(host);require(host.latest_world()->mission.at("Session.Lobby.Level")==Property(std::string("Rlevel1_1")),"Fixture did not expose intermediate old-proposal snapshot");
+    world.mission["Session.Lobby.Level"]=std::string("Rlevel1_2");++world.tick;require(host.publish(world,error),error.c_str());require(lobby_token(host)!=intermediate && lobby_integer(host,"Session.Lobby.ReadyMask")==2,"New proposal did not atomically renew token/clear humans");
+    raw_lobby_ready(peer,intermediate,true);require(lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Old proposal with intermediate new token confirmed changed map");
+    raw_lobby_ready(peer,lobby_token(host),true);host.lobby_ready(true);const auto stable=lobby_token(host);++world.tick;require(host.publish(world,error),error.c_str());require(lobby_token(host)==stable && lobby_integer(host,"Session.Lobby.ReadyMask")==7,"Unchanged setup tick invalidated confirmations");
+    for(const char* key:{"Session.Lobby.Mode","Session.Lobby.LevelSet","Session.Lobby.Difficulty","Session.EnemyMultiplier","Session.AmmoCapacity","Session.AmmoPickupMultiplier"}){
+        const auto before=lobby_token(host);world.mission[key]=std::get<int64_t>(world.mission.at(key))+1;++world.tick;require(host.publish(world,error),error.c_str());require(lobby_token(host)!=before && lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Changed lobby rule retained human confirmation");
+        raw_lobby_ready(peer,before,true);require(lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Old rule token re-armed confirmation");raw_lobby_ready(peer,lobby_token(host),true);host.lobby_ready(true);
+    }
+    const auto before_removal=lobby_token(host);world.mission.erase("Session.AmmoPickupMultiplier");++world.tick;require(host.publish(world,error),error.c_str());require(lobby_token(host)!=before_removal && lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Removed lobby rule retained confirmation");
+    auto invalid=world;invalid.epoch=0;invalid.mission["Session.Lobby.Level"]=std::string("Rlevel1_3");const auto unchanged=host.latest_world();require(!host.publish(invalid,error) && host.latest_world()==unchanged,"Rejected setup publication mutated token or readiness");
+    closesocket(peer);host.stop();
+}
+void check_lobby_failed_start_recovery(){
+    AuthoritativeServer host(2);require(host.start(0,"123456",1234,"Failed map host"),"Failed map host start");require(bool(host.add_bot()),"Failed map bot add");
+    WorldState world;world.tick=1;world.mission["Session.NativePhase"]=std::string("menu");std::string error;require(host.publish(world,error),error.c_str());
+    auto unchanged=host.latest_world();require(!host.cancel_lobby_game() && host.latest_world()==unchanged,"Already-open lobby cancellation mutated state");
+    host.lobby_ready(true);const auto token=lobby_token(host);require(host.begin_lobby_game(),"Failed-map Start setup");
+    require(host.cancel_lobby_game() && lobby_integer(host,"Session.Lobby.Open")==1 && lobby_token(host)!=token && lobby_integer(host,"Session.Lobby.ReadyMask")==2,"Rejected native map did not reopen and invalidate human ready");
+    unchanged=host.latest_world();require(!host.cancel_lobby_game() && !host.begin_lobby_game() && host.latest_world()==unchanged,"Recovery allowed duplicate cancellation or Start without fresh ready");
+    host.lobby_ready(true);require(host.begin_lobby_game(),"Fresh confirmation could not retry rejected map");
+    world.tick=2;world.mission["Session.NativePhase"]=std::string("loading");require(host.publish(world,error),error.c_str());unchanged=host.latest_world();require(!host.cancel_lobby_game() && host.latest_world()==unchanged && !lobby_integer(host,"Session.Lobby.Open"),"Cancellation reopened a loading session");
+    world.tick=3;world.mission["Session.NativePhase"]=std::string("gameplay");require(host.publish(world,error),error.c_str());unchanged=host.latest_world();require(!host.cancel_lobby_game() && host.latest_world()==unchanged && !lobby_integer(host,"Session.Lobby.Open"),"Cancellation reopened gameplay");
+    host.stop();unchanged=host.latest_world();require(!host.cancel_lobby_game() && host.latest_world()==unchanged,"Stopped session cancellation mutated state");
+}
+void check_afk_host_ui_input(){
+    AuthoritativeServer host(2);require(host.start(0,"123456",1234,"AFK UI host"),"AFK UI host start");
+    AuthoritativeClient client;require(client.start("127.0.0.1",host.status().port,"123456",1234,"AFK UI peer"),"AFK UI peer start");
+    wait_for([&]{return client.status().connected;},"AFK UI peer assignment");
+    const auto local=host.status().player,remote=client.status().player;WorldState world;world.tick=1;world.level="Rlevel1_1";
+    for(const auto id:{local,remote}){EntityState actor;actor.id=100+id.slot;actor.kind=EntityKind::Player;actor.owner=id;actor.definition=2;actor.properties={{"position",std::array<float,3>{float(id.slot),0,10}},{"health",100.f}};world.entities.emplace(actor.id,std::move(actor));}
+    std::string error;require(host.publish(world,error),error.c_str());require(host.attach_character(local,100+local.slot)&&host.attach_character(remote,100+remote.slot)&&host.ready_host(),"AFK UI actor readiness");
+    wait_for([&]{return client.latest_world()->players[remote.slot].character!=0;},"AFK UI peer character");client.ready(world.epoch);
+    wait_for([&]{return host.take_controls()[remote.slot].ready;},"AFK UI peer readiness");
+    require(host.host_afk(1,true)==CommandResult::Applied,"AFK UI host takeover");client.set_afk(true);
+    wait_for([&]{return host.participants()[remote.slot].afk;},"AFK UI remote takeover");
+    auto neutral=[](const ControlInput& input){return !input.pad.buttons&&!input.pressed&&input.pad.stick_x==128&&input.pad.stick_y==128&&input.pad.cstick_x==128&&input.pad.cstick_y==128&&!input.pad.trigger_l&&!input.pad.trigger_r&&!input.yaw&&!input.pitch&&input.weapon==255&&std::all_of(input.preferences.begin(),input.preferences.end(),[](auto v){return v==255;});};
+    auto read_ui=[&]{ControlInput ui;host.take_controls(&ui);return ui;};
+    ControlInput human;human.pad.buttons=ssne::PAD_START|ssne::PAD_A|ssne::PAD_R;human.pressed=ssne::PAD_Z;human.pad.stick_x=210;human.pad.stick_y=64;human.pad.cstick_x=255;human.pad.cstick_y=0;human.pad.trigger_l=human.pad.trigger_r=255;human.yaw=1234;human.pitch=-1234;human.weapon=3;human.preferences.fill(2);
+    host.submit_host_input(human);auto ui=read_ui();
+    require(ui.pad.buttons==(ssne::PAD_START|ssne::PAD_A|ssne::PAD_Z)&&ui.pad.stick_x==210&&ui.pad.stick_y==64,"AFK UI host Start/menu navigation lost");
+    require(ui.pad.cstick_x==128&&ui.pad.cstick_y==128&&!ui.pad.trigger_l&&!ui.pad.trigger_r&&!ui.yaw&&!ui.pitch&&ui.weapon==255&&std::all_of(ui.preferences.begin(),ui.preferences.end(),[](auto v){return v==255;}),"AFK UI leaked fire/look/weapon/preferences");
+    auto gameplay=host.take_controls();require(gameplay[local.slot].afk&&neutral(gameplay[local.slot].input),"AFK UI bypassed host gameplay sanitation");
+    host.submit_host_input({});require(neutral(read_ui()),"AFK UI retained a released menu button");host.take_controls();
+    ControlInput tap;tap.pressed=ssne::PAD_START;host.submit_host_input(tap);
+    require(read_ui().pad.buttons==ssne::PAD_START,"AFK UI lost a pressed-only Start tap");host.take_controls();require(neutral(read_ui()),"AFK UI replayed consumed Start tap");
+    const auto remote_sequence=host.take_controls()[remote.slot].sequence;client.submit_input(human);
+    wait_for([&]{auto current=host.take_controls()[remote.slot];require(neutral(current.input),"AFK UI bypassed remote gameplay sanitation");return current.sequence>remote_sequence;},"AFK UI remote input receipt");require(neutral(read_ui()),"Remote AFK input reached host UI");
+    host.submit_host_input(human);std::this_thread::sleep_for(std::chrono::milliseconds(280));require(neutral(read_ui()),"AFK UI kept stale host input");
+    host.submit_host_input(tap);require(host.host_afk(2,false)==CommandResult::Applied&&neutral(read_ui()),"AFK UI survived human return");
+    require(host.host_afk(3,true)==CommandResult::Applied&&neutral(read_ui()),"AFK UI replayed an earlier takeover's tap");
+    client.stop();host.stop();require(neutral(read_ui()),"AFK UI survived server stop");
+}
 int main() {
+    authority_checkpoint_test::checkpoint_regression();
+    std::cout<<"Authority checkpoint header: "<<authority_checkpoint_test::checkpoint_checks<<" checks passed.\n";
+    check_afk_host_ui_input();
+    check_lobby_readiness();check_lobby_legacy_epoch_fallback();check_lobby_setup_atomic_readiness();check_lobby_failed_start_recovery();
     AuthoritativeServer host(8);host.submit_host_input({});
     require(host.start(0,"123456",1234),"Host start");auto host_id=host.status().player;auto port=host.status().port;
     check_connecting_lifecycle();
@@ -174,7 +293,10 @@ int main() {
     auto expected_mission=world.mission;
     expected_mission["Session.Lobby.Open"]=int64_t(1);
     expected_mission["Session.Lobby.ReadyMask"]=int64_t(0);
+    expected_mission["Session.Lobby.ReadyToken"]=std::bit_cast<int64_t>(lobby_token(host));
     expected_mission["Session.Bots.Mask"]=int64_t(0);
+    expected_mission["Session.Spectators.VoluntaryMask"]=int64_t(0);
+    expected_mission["Session.Spectators.LockMask"]=int64_t(0);
     expected_mission["Session.Bots.Skills"]=std::vector<int64_t>(max_players,0);
     require(late->mission==expected_mission && late->entities.at(1000).properties==world.entities.at(1000).properties,"Late join reset door/boss/mission/enemy state");
     clients[6]->ready(world.epoch);wait_for([&]{return host.take_controls()[new_id.slot].ready;},"Late join readiness");

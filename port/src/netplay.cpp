@@ -1,4 +1,5 @@
 #include "netplay.h"
+#include "coop/ps2_content_identity.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <algorithm>
@@ -15,19 +16,27 @@
 #include <thread>
 namespace port::netplay {
 std::string local_ipv4_addresses() {
-    char hostname[256]{};
-    if (gethostname(hostname, sizeof(hostname))) return "see ipconfig";
-    addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-    addrinfo* result = nullptr;
-    if (getaddrinfo(hostname, nullptr, &hints, &result)) return "see ipconfig";
+    // Ask the IPv4 provider for locally bound interfaces. Resolving our own
+    // hostname can wait for an external DNS timeout on offline/VPN networks.
+    SOCKET probe=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+    if(probe==INVALID_SOCKET)return "see ipconfig";
+    struct Release { SOCKET socket; ~Release(){closesocket(socket);} } release{probe};
+    std::vector<char> buffer(4096);
+    DWORD bytes=0;
+    while(WSAIoctl(probe,SIO_ADDRESS_LIST_QUERY,nullptr,0,buffer.data(),DWORD(buffer.size()),&bytes,nullptr,nullptr)==SOCKET_ERROR){
+        if(WSAGetLastError()!=WSAEFAULT || bytes<=buffer.size())return "see ipconfig";
+        buffer.resize(bytes);
+    }
+    auto* interfaces=reinterpret_cast<const SOCKET_ADDRESS_LIST*>(buffer.data());
     std::vector<std::string> addresses;
-    for (auto* current = result; current; current = current->ai_next) {
-        auto* address = reinterpret_cast<sockaddr_in*>(current->ai_addr);
+    for(int i=0;i<interfaces->iAddressCount;++i){
+        const auto& entry=interfaces->Address[i];
+        if(entry.iSockaddrLength<int(sizeof(sockaddr_in)) || !entry.lpSockaddr || entry.lpSockaddr->sa_family!=AF_INET)continue;
+        auto* address=reinterpret_cast<const sockaddr_in*>(entry.lpSockaddr);
         char ip[INET_ADDRSTRLEN]{};
         if (inet_ntop(AF_INET, &address->sin_addr, ip, sizeof(ip)) && strcmp(ip,"127.0.0.1") &&
             std::find(addresses.begin(), addresses.end(), ip) == addresses.end()) addresses.emplace_back(ip);
     }
-    freeaddrinfo(result);
     std::string text;
     for (const auto& address : addresses) { if (!text.empty()) text += " / "; text += address; }
     return text.empty() ? "see ipconfig" : text;
@@ -252,6 +261,8 @@ void Session::stop() {
 uint64_t content_hash(const std::string& path) {
     std::ifstream f(path,std::ios::binary); if(!f) return 0;
     uint64_t h=14695981039346656037ull; char buffer[8192];
-    while(f) { f.read(buffer,sizeof(buffer)); for(std::streamsize i=0;i<f.gcount();++i) {h^=uint8_t(buffer[i]);h*=1099511628211ull;} } return h;
+    while(f) { f.read(buffer,sizeof(buffer)); for(std::streamsize i=0;i<f.gcount();++i) {h^=uint8_t(buffer[i]);h*=1099511628211ull;} }
+    try { return port::coop::ps2_content_fingerprint(std::filesystem::u8path(path).parent_path().parent_path(),h); }
+    catch(const std::exception& e) { port::coop::installed_skin_count.store(11); fprintf(stderr,"PS2 content verification failed: %s\n",e.what()); return 0; }
 }
 }

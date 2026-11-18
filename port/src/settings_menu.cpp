@@ -25,7 +25,8 @@ bool g_exit_requested = false;  // "Exit game" button
 int g_state_req_slot = 0;       // Save states tab: requested slot (0 = none)
 bool g_state_req_save = false;
 int g_select_tab = -1;  // tab to select on the next frame
-struct Capture { bool active = false; bool pad = false; int action = 0; int slot = 0; } g_cap;
+struct Capture { bool active = false; bool pad = false; int action = 0; int slot = 0; bool multiplayer = false; } g_cap;
+const char* g_capture_warning = nullptr;
 
 const ImVec4 kDim(0.62f, 0.62f, 0.66f, 1), kAccent(1.0f, 0.76f, 0.22f, 1), kWarn(1.0f, 0.55f, 0.35f, 1);
 
@@ -57,14 +58,28 @@ void write_crosshair_ui_trace(const Settings& settings) {
     out<<"{\"menu_open\":"<<(g_open?"true":"false")<<",\"frame\":"<<ImGui::GetFrameCount()<<",\"window\":";rect(g_crosshair_ui_window_a,g_crosshair_ui_window_b);
     out<<",\"clip\":";rect(g_crosshair_ui_clip_a,g_crosshair_ui_clip_b);
     out<<",\"cheats\":{\"god\":"<<settings.cheat_invulnerable<<",\"ammo\":"<<settings.cheat_infinite_ammo<<",\"weapons\":"<<settings.cheat_all_weapons<<",\"fly\":"<<settings.cheat_fly<<",\"flying\":"<<ssne::cheat_flying()<<"}";
+    out<<",\"team_hud\":"<<(settings.team_hud?"true":"false")<<",\"capturing_mp\":"<<(g_cap.active && g_cap.multiplayer?"true":"false")
+       <<",\"capture_action\":"<<(g_cap.active?g_cap.action:-1)<<",\"capture_slot\":"<<(g_cap.active?g_cap.slot:-1)
+       <<",\"mp_conflict\":"<<trace_json_string(g_capture_warning?g_capture_warning:"")<<",\"multiplayer_bindings\":[";
+    for(int a=0;a<MP_COUNT;++a){if(a)out<<',';out<<'[';for(int k=0;k<Settings::kMpSlots;++k){if(k)out<<',';out<<trace_json_string(bind_to_string(settings.multiplayer[a][k]));}out<<']';}out<<']';
     out<<",\"language\":"<<menu_ui::current_language<<",\"language_preference\":"<<settings.game_language<<",\"enabled\":"<<(settings.crosshair_enabled?"true":"false")<<",\"file\":"<<trace_json_string(settings.crosshair_file)<<",\"size\":"<<settings.crosshair_size<<",\"opacity\":"<<settings.crosshair_opacity<<",\"native_color\":"<<(settings.crosshair_native_color?"true":"false")<<",\"widgets\":[";
     bool comma=false;for(const auto& w:g_crosshair_ui_widgets){if(comma)out<<',';comma=true;out<<"{\"id\":"<<trace_json_string(w.id)<<",\"rect\":";rect(w.a,w.b);out<<",\"clip\":";rect(w.clip_a,w.clip_b);out<<",\"visible\":"<<(w.visible?"true":"false")<<",\"enabled\":"<<(w.enabled?"true":"false")<<'}';}out<<"]}";
     std::ofstream file("crosshair-ui-state.json.pending",std::ios::binary|std::ios::trunc);file<<out.str();file.close();
     if(file){std::remove("crosshair-ui-state.json");std::rename("crosshair-ui-state.json.pending","crosshair-ui-state.json");}
 }
 
-void assign(Settings& s, const Bind& b) {
-    if (!g_cap.pad) {
+bool assign(Settings& s, const Bind& b) {
+    if(g_cap.multiplayer){
+        switch(multiplayer_bind_conflict(s,g_cap.action,g_cap.slot,b)){
+        case MultiplayerBindConflict::Unsupported:g_capture_warning="Choose a keyboard key or mouse button. The wheel and gamepad are not supported here.";return false;
+        case MultiplayerBindConflict::Reserved:g_capture_warning="This key is reserved for menus or system shortcuts.";return false;
+        case MultiplayerBindConflict::Gameplay:g_capture_warning="This input is already assigned to a gameplay control. Clear it there first.";return false;
+        case MultiplayerBindConflict::Multiplayer:g_capture_warning="This input is already assigned to another multiplayer shortcut. Clear it there first.";return false;
+        default:break;
+        }
+        if(!assign_multiplayer_bind(s,g_cap.action,g_cap.slot,b))return false;
+    }else if (!g_cap.pad) {
+        if(multiplayer_bind_in_use(s,b)){g_capture_warning="This input is already assigned to another multiplayer shortcut. Clear it there first.";return false;}
         // One key per control: drop the key from any other control it was bound to.
         for (int a = 0; a < ACT_COUNT; a++)
             for (int k = 0; k < Settings::kKbSlots; k++)
@@ -76,6 +91,7 @@ void assign(Settings& s, const Bind& b) {
         s.pad[g_cap.action] = b;
     }
     g_cap.active = false;
+    g_capture_warning=nullptr;return true;
 }
 
 void help(const char* text) {
@@ -91,16 +107,17 @@ bool slider_pct(const char* label, float& v, float lo, float hi) {
     return ch;
 }
 
-bool bind_button(const Bind& b, bool pad, int action, int slot) {
-    bool waiting = g_cap.active && g_cap.pad == pad && g_cap.action == action && g_cap.slot == slot;
-    std::string label = waiting ? std::string(pad ? "press a pad button..." : "press a key, mouse button or wheel...") : bind_name(b);
-    label += "##" + std::to_string(pad) + "_" + std::to_string(action) + "_" + std::to_string(slot);
+bool bind_button(const Bind& b, bool pad, int action, int slot, bool multiplayer=false) {
+    bool waiting = g_cap.active && g_cap.pad == pad && g_cap.action == action && g_cap.slot == slot && g_cap.multiplayer==multiplayer;
+    std::string label = waiting ? std::string(pad ? "press a pad button..." : multiplayer?"press a key or mouse button...":"press a key, mouse button or wheel...") : bind_name(b);
+    label += "##" + std::to_string(pad) + "_" + std::to_string(action) + "_" + std::to_string(slot)+(multiplayer?"_mp":"");
     if (waiting) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.35f, 0.05f, 1));
     bool clicked = menu_ui::Button(label.c_str(), ImVec2(-1, 0));
     if (waiting) ImGui::PopStyleColor();
-    if (clicked) g_cap = {true, pad, action, slot};
+    if (clicked) {g_cap = {true, pad, action, slot, multiplayer};g_capture_warning=nullptr;}
     // Right click clears the binding.
-    return ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+    if(ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)){g_cap.active=false;g_capture_warning=nullptr;return true;}
+    return false;
 }
 
 bool crosshair_controls(Settings& s,const MenuInfo& info) {
@@ -236,7 +253,7 @@ bool tab_graphics(Settings& s, const MenuInfo& info) {
     static const char* kAspect[] = {"4:3 (original)", "16:9", "21:9", "Automatic (window shape)"};
     ImGui::SetNextItemWidth(260);
     ch |= menu_ui::Combo("Aspect ratio  (F8)", &s.aspect, kAspect, 4);
-    help("Widescreen widens the view during gameplay; menus (also pause, NETRICSA and briefings) and cutscenes stay 4:3.\n"
+    help("Use the selected aspect ratio for gameplay, intros and loading screens.\n"
          "Automatic matches the window or screen (16:10, 3440x1440 and other shapes, up to 32:9).");
     if (s.aspect > 0) {
         ch |= menu_ui::Checkbox("HUD at the screen edges", &s.hud_edges);
@@ -244,8 +261,7 @@ bool tab_graphics(Settings& s, const MenuInfo& info) {
              "game. Off: the HUD keeps the GameCube's 4:3 layout in the middle of the screen.");
     }
     ch |= menu_ui::Checkbox("Fill the sides of 4:3 screens", &s.side_fill);
-    help("Menus and cutscenes are 4:3: on a wider window, show a blurred, darkened copy of the picture at the sides\n"
-         "instead of black bars (GPU renderer).");
+    help("On a wider display, fill the sides of a 4:3 image with a blurred copy (GPU renderer).");
     {
         float hfov = 2.f * std::atan(std::tan(0.5f * float(s.fov) * 0.017453292f) * 1.4286f * ssne::widescreen()) / 0.017453292f;
         char ffmt[64];
@@ -332,8 +348,29 @@ bool tab_graphics(Settings& s, const MenuInfo& info) {
     return ch;
 }
 
-void tab_hotkeys() {
+bool tab_hotkeys(Settings& s) {
+    bool changed=false;
     ImGui::PushTextWrapPos(0.f);
+    menu_ui::SeparatorText("Multiplayer shortcuts");
+    menu_ui::TextColored(kDim,"Click a slot, then press a key or mouse button. Right-click clears. Esc cancels.");
+    menu_ui::TextColored(kDim,"AFK has no default shortcut. Assign one to let a companion play your character, or to take control again.");
+    if(ImGui::BeginTable("##mp_keys",1+Settings::kMpSlots,ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerV|ImGuiTableFlags_SizingStretchProp)){
+        menu_ui::TableSetupColumn("Action",ImGuiTableColumnFlags_WidthStretch,1.4f);
+        menu_ui::TableSetupColumn("Primary");menu_ui::TableSetupColumn("Secondary");ImGui::TableHeadersRow();
+        for(int a=0;a<MP_COUNT;++a){
+            ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);ImGui::AlignTextToFramePadding();menu_ui::TextUnformatted(multiplayer_action_name(a));
+            for(int k=0;k<Settings::kMpSlots;++k){ImGui::TableSetColumnIndex(k+1);
+                if(bind_button(s.multiplayer[a][k],false,a,k,true)){s.multiplayer[a][k]={};changed=true;}
+                trace_crosshair_widget(std::string("mp_")+multiplayer_action_id(a)+"_"+std::to_string(k));
+            }
+        }
+        ImGui::EndTable();
+    }
+    if(menu_ui::Button("Reset multiplayer shortcuts")){s.reset_multiplayer();g_cap.active=false;g_capture_warning=nullptr;changed=true;
+        if(s.multiplayer[MP_CHAT][0].type==Bind::NONE || s.multiplayer[MP_PING][0].type==Bind::NONE || s.multiplayer[MP_PING][1].type==Bind::NONE || s.multiplayer[MP_ROSTER][0].type==Bind::NONE)
+            g_capture_warning="Some multiplayer defaults conflict with your gameplay bindings and remain unbound.";
+    }trace_crosshair_widget("mp_reset");
+    menu_ui::SeparatorText("System shortcuts");
     menu_ui::TextColored(kDim, "Keys that work any time in the game window (not rebindable).");
     ImGui::Spacing();
     static const char* keys[][2] = {
@@ -366,6 +403,7 @@ void tab_hotkeys() {
         ImGui::EndTable();
     }
     ImGui::PopTextWrapPos();
+    return changed;
 }
 
 bool tab_audio(Settings& s) {
@@ -427,7 +465,13 @@ bool tab_keyboard(Settings& s) {
         ImGui::EndTable();
     }
     ImGui::Spacing();
-    if (menu_ui::Button("Reset keyboard & mouse to defaults")) { s.reset_keyboard(); ch = true; }
+    if (menu_ui::Button("Reset keyboard & mouse to defaults")) {
+        Bind previous[MP_COUNT][Settings::kMpSlots];for(int a=0;a<MP_COUNT;++a)for(int k=0;k<Settings::kMpSlots;++k)previous[a][k]=s.multiplayer[a][k];
+        s.reset_keyboard();g_cap.active=false;g_capture_warning=nullptr;
+        for(int a=0;a<MP_COUNT;++a)for(int k=0;k<Settings::kMpSlots;++k)if(!(previous[a][k]==s.multiplayer[a][k]))
+            g_capture_warning="Conflicting multiplayer shortcuts were cleared to keep the reset gameplay controls available.";
+        ch = true;
+    }
     ImGui::PopTextWrapPos();
     return ch;
 }
@@ -436,6 +480,9 @@ bool tab_players(Settings& s, const MenuInfo& info) {
     ImGui::PushTextWrapPos(0.f);
     bool ch = false;
     if(info.network) menu_ui::TextWrapped("This PC controls one online player. Network coop supports up to eight players, versus up to four. Enabled controllers and keyboard/mouse control your own player.");
+    ch|=menu_ui::Checkbox("Compact team HUD###team_hud",&s.team_hud);trace_crosshair_widget("team_hud");
+    help("Show teammates' health, armor and distance during cooperative play. This changes only your screen.");
+    menu_ui::TextWrapped("Multiplayer shortcuts can be changed in Hotkeys. Hold the player list shortcut to see names, health, status and ping.");
     if(info.bot_controls)info.bot_controls();
     menu_ui::TextColored(kDim, "Split screen for 2-4 players: in the game choose MultiPlayer, then every player presses A to join.");
     menu_ui::TextColored(kDim, "Co-operative is for 2 players; Deathmatch, Hold the Flag and Pass the Bomb for up to 4.");
@@ -654,46 +701,45 @@ bool menu_take_state_request(int& slot, bool& save) {
     return true;
 }
 bool menu_take_exit_request() { bool r = g_exit_requested; g_exit_requested = false; return r; }
-void menu_set_open(bool open) { g_open = open; if (!open) g_cap.active = false; }
+void menu_set_open(bool open) { g_open = open; if (!open) {g_cap.active = false;g_capture_warning=nullptr;} }
 void menu_select_tab(int tab) { g_select_tab = tab; }
 bool menu_capturing() { return g_open && g_cap.active; }
 
 bool menu_handle_event(const SDL_Event& e, Settings& s, bool& changed) {
     if (!menu_capturing()) return false;
-    if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) { g_cap.active = false; return true; }
+    if(e.type==SDL_WINDOWEVENT && (e.window.event==SDL_WINDOWEVENT_FOCUS_LOST || e.window.event==SDL_WINDOWEVENT_MINIMIZED)){g_cap.active=false;g_capture_warning=nullptr;return false;}
+    if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) { g_cap.active = false;g_capture_warning=nullptr; return true; }
+    if(g_cap.multiplayer && (e.type==SDL_CONTROLLERBUTTONDOWN || (e.type==SDL_CONTROLLERAXISMOTION && std::abs(e.caxis.value)>24000))){
+        g_capture_warning="Choose a keyboard key or mouse button. The wheel and gamepad are not supported here.";return true;
+    }
     if (!g_cap.pad) {
         if (e.type == SDL_KEYDOWN && !e.key.repeat) {
             SDL_Scancode sc = e.key.keysym.scancode;
-            if (sc == SDL_SCANCODE_F12) return true;  // reserved for the menu
-            assign(s, Bind::key(sc));
-            changed = true;
+            if (sc == SDL_SCANCODE_F12 && !g_cap.multiplayer) return true;  // reserved for the menu
+            changed |= assign(s, Bind::key(sc));
             return true;
         }
         if (e.type == SDL_MOUSEBUTTONDOWN) {
             if (ImGui::GetIO().WantCaptureMouse && e.button.button == SDL_BUTTON_LEFT && !ImGui::IsAnyItemHovered())
                 return false;  // clicking empty menu space: not a binding
-            assign(s, Bind::mouse(e.button.button));
-            changed = true;
+            changed |= assign(s, Bind::mouse(e.button.button));
             return true;
         }
         if (e.type == SDL_MOUSEWHEEL && e.wheel.y != 0) {
             int dy = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
-            assign(s, Bind::wheel(dy));
-            changed = true;
+            changed |= assign(s, Bind::wheel(dy));
             return true;
         }
-        if (e.type == SDL_KEYUP || e.type == SDL_TEXTINPUT) return true;
+        if (e.type == SDL_KEYUP || e.type == SDL_KEYDOWN || e.type == SDL_TEXTINPUT) return true;
     } else {
         if (e.type == SDL_CONTROLLERBUTTONDOWN) {
             if (e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK) { g_cap.active = false; return true; }  // reserved
-            assign(s, Bind::button(SDL_GameControllerButton(e.cbutton.button)));
-            changed = true;
+            changed |= assign(s, Bind::button(SDL_GameControllerButton(e.cbutton.button)));
             return true;
         }
         if (e.type == SDL_CONTROLLERAXISMOTION && e.caxis.value > 24000 &&
             (e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || e.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT)) {
-            assign(s, Bind::axis(SDL_GameControllerAxis(e.caxis.axis)));
-            changed = true;
+            changed |= assign(s, Bind::axis(SDL_GameControllerAxis(e.caxis.axis)));
             return true;
         }
     }
@@ -747,17 +793,20 @@ bool draw_menu(Settings& s, const MenuInfo& info) {
                           "(the memory card check stays). Applies from the next start.");
     ImGui::SameLine();
     if (menu_ui::Button("Exit game")) g_exit_requested = true;
+    if(g_capture_warning){ImGui::PushStyleColor(ImGuiCol_Text,kWarn);menu_ui::TextWrapped("%s",menu_ui::text(g_capture_warning));ImGui::PopStyleColor();}
     if (ImGui::BeginTabBar("##tabs")) {
         if (menu_ui::BeginTabItem("Graphics", nullptr, g_select_tab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##g"); ch |= tab_graphics(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
         if (menu_ui::BeginTabItem("Audio", nullptr, g_select_tab == 1 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##a"); ch |= tab_audio(s); ImGui::EndChild(); ImGui::EndTabItem(); }
         if (menu_ui::BeginTabItem("Keyboard & Mouse", nullptr, g_select_tab == 2 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##k"); ch |= tab_keyboard(s); ImGui::EndChild(); ImGui::EndTabItem(); }
         if (menu_ui::BeginTabItem("Gamepad", nullptr, g_select_tab == 3 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##p"); ch |= tab_gamepad(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
-        if (menu_ui::BeginTabItem("Players", nullptr, g_select_tab == 6 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##pl"); ch |= tab_players(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
+        const bool players_tab=menu_ui::BeginTabItem("Players",nullptr,g_select_tab==6?ImGuiTabItemFlags_SetSelected:0);trace_crosshair_widget("tab_players");
+        if(players_tab){ImGui::BeginChild("##pl");ch|=tab_players(s,info);ImGui::EndChild();ImGui::EndTabItem();}
         const bool cheats_tab=menu_ui::BeginTabItem("Cheats", nullptr, g_select_tab == 7 ? ImGuiTabItemFlags_SetSelected : 0);
         trace_crosshair_widget("tab_cheats");
         if (cheats_tab) { ImGui::BeginChild("##c"); ch |= tab_cheats(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
         if (menu_ui::BeginTabItem("Save states", nullptr, g_select_tab == 5 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##s"); ch |= tab_states(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
-        if (menu_ui::BeginTabItem("Hotkeys", nullptr, g_select_tab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##h"); tab_hotkeys(); ImGui::EndChild(); ImGui::EndTabItem(); }
+        const bool hotkeys_tab=menu_ui::BeginTabItem("Hotkeys",nullptr,g_select_tab==4?ImGuiTabItemFlags_SetSelected:0);trace_crosshair_widget("tab_hotkeys");
+        if(hotkeys_tab){ImGui::BeginChild("##h");ch|=tab_hotkeys(s);ImGui::EndChild();ImGui::EndTabItem();}
         ImGui::EndTabBar();
         g_select_tab = -1;
     }

@@ -41,7 +41,7 @@ struct App {
  }
  ~App(){if(game)CloseHandle(game);}
  bool busy()const{return checking||launching;}
- void save(){if(preview)return;std::ofstream f(directory/L"multiplayer-launcher.ini",std::ios::trunc);if(f)f<<"# SSNE-Native Multiplayer\nplayer_name="<<player_name.data()<<"\nplayer_skin="<<player_skin<<"\naddress="<<(remember?address.data():"")<<"\nproject="<<project<<"\nport="<<port<<"\nfullscreen="<<fullscreen<<"\nammo_capacity="<<ammo_capacity<<"\nammo_pickup_multiplier="<<ammo_pickup_multiplier<<"\nenemy_multiplier="<<enemy_multiplier<<"\nremember="<<remember<<"\n";}
+ void save(){if(preview)return;std::ofstream f(directory/L"multiplayer-launcher.ini",std::ios::trunc);if(f)f<<"# SSNE-RECOOP-Native Multiplayer\nplayer_name="<<player_name.data()<<"\nplayer_skin="<<player_skin<<"\naddress="<<(remember?address.data():"")<<"\nproject="<<project<<"\nport="<<port<<"\nfullscreen="<<fullscreen<<"\nammo_capacity="<<ammo_capacity<<"\nammo_pickup_multiplier="<<ammo_pickup_multiplier<<"\nenemy_multiplier="<<enemy_multiplier<<"\nremember="<<remember<<"\n";}
  void describe(){if(busy())return;ml::Request request;request.describe=true;request.project=project;checking=true;checked=false;message.clear();error=false;worker=std::async(std::launch::async,[dir=directory,request]{return ml::run_backend(dir,request);});}
  void choose(){if(busy())return;auto chosen=ml::choose_project();if(!chosen.empty()){project=chosen;save();describe();}}
  bool start(){
@@ -71,8 +71,8 @@ struct App {
   theme::draw_background(ImGui::GetBackgroundDrawList(),p,p+extent,t);
   ImGui::SetNextWindowPos(p);ImGui::SetNextWindowSize(extent);ImGui::Begin("##Multiplayer",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoBackground|ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse);
   ImGui::SetWindowFontScale(s);auto* dl=ImGui::GetWindowDrawList();
-  const float title_size=76*s;auto title=theme::chunky_text(nullptr,{},title_size,"SSNE-Native",theme::Look::Normal,t);
-  heading(dl,p+ImVec2((w-title.x)*.5f,29*s),title_size,"SSNE-Native",t);
+  const float title_size=68*s;auto title=theme::chunky_text(nullptr,{},title_size,"SSNE-RECOOP-Native",theme::Look::Normal,t);
+  heading(dl,p+ImVec2((w-title.x)*.5f,29*s),title_size,"SSNE-RECOOP-Native",t);
   const char* subtitle="MULTIPLAYER";float subsize=16*s,spacing=7*s;float subwidth=theme::spaced_text(nullptr,theme::fonts.bold,subsize,{},0,subtitle,spacing);
   theme::spaced_text(dl,theme::fonts.bold,subsize,p+ImVec2((w-subwidth)*.5f,129*s),IM_COL32(198,205,255,255),subtitle,spacing);
   dl->AddLine(p+ImVec2(48*s,176*s),p+ImVec2(w-48*s,176*s),IM_COL32(128,141,255,60),1);
@@ -158,7 +158,7 @@ int main(int argc,char** argv){
  for(int i=1;i<argc;++i){std::string arg=argv[i];if(arg=="--host")host=true;else if(arg=="--options")options=true;else if(arg=="--skins")skin_page=true;else if(arg=="--skin-angle" && i+1<argc)skin_angle=float(atof(argv[++i]));else if(arg=="--screenshot"&&i+1<argc)capture=fs::path(ml::wide(argv[++i]));else if(arg=="--profile-dir"&&i+1<argc)root=fs::path(ml::wide(argv[++i]));else if(arg=="--size"&&i+2<argc){width=std::max(960,atoi(argv[++i]));height=std::max(640,atoi(argv[++i]));}}
  SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS,"permonitorv2");if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_TIMER)!=0)return 1;
  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3);SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,3);SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,SDL_GL_CONTEXT_PROFILE_CORE);
- auto* window=SDL_CreateWindow("SSNE-Native - Multiplayer",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,width,height,SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE|SDL_WINDOW_ALLOW_HIGHDPI|(capture.empty()?0:SDL_WINDOW_HIDDEN));if(!window){SDL_Quit();return 2;}
+ auto* window=SDL_CreateWindow("SSNE-RECOOP-Native - Multiplayer",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,width,height,SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE|SDL_WINDOW_ALLOW_HIGHDPI|(capture.empty()?0:SDL_WINDOW_HIDDEN));if(!window){SDL_Quit();return 2;}
  SDL_SetWindowMinimumSize(window,960,640);auto context=SDL_GL_CreateContext(window);bool core=context!=nullptr;if(!context){SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,0);SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,0);context=SDL_GL_CreateContext(window);}if(!context){SDL_DestroyWindow(window);SDL_Quit();return 3;}
  SDL_GL_SetSwapInterval(1);SDL_SysWMinfo wm;SDL_VERSION(&wm.version);if(SDL_GetWindowWMInfo(window,&wm)){auto icon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(101));if(icon){SendMessageW(wm.info.win.window,WM_SETICON,ICON_BIG,(LPARAM)icon);SendMessageW(wm.info.win.window,WM_SETICON,ICON_SMALL,(LPARAM)icon);}}
  IMGUI_CHECKVERSION();ImGui::CreateContext();ImGui::GetIO().IniFilename=nullptr;ImGui::GetIO().ConfigFlags|=ImGuiConfigFlags_NavEnableKeyboard;static const ImWchar glyphs[]={0x20,0xFF,0x2000,0x206F,0};theme::load_fonts(1.25f);theme::apply_style();ImGui_ImplSDL2_InitForOpenGL(window,context);ImGui_ImplOpenGL3_Init(core?"#version 330 core":"#version 130");

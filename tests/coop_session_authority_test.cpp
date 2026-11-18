@@ -1,4 +1,5 @@
 #include "session_authority.h"
+#include "authority_checkpoint_cases.h"
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -6,6 +7,7 @@
 using namespace port::coop;
 void require(bool result,const char* message){if(!result){std::cerr<<message<<'\n';std::exit(1);}}
 int main() {
+    authority_checkpoint_test::checkpoint_regression();
     for(unsigned capacity=1;capacity<=8;++capacity) {
         SessionAuthority server(capacity);std::array<PlayerId,8> ids;
         for(unsigned slot=0;slot<capacity;++slot) {
@@ -88,4 +90,5 @@ int main() {
     bool rejected=false;try{SessionAuthority invalid(9);}catch(...){rejected=true;}require(rejected,"Capacity above eight");
     rejected=false;try{SessionAuthority invalid(0);}catch(...){rejected=true;}require(rejected,"Zero capacity");
     std::cout<<"Server session policy: 1..8 slots, stale identities, AFK status and unanimous cutscene voting passed.\n";
+    std::cout<<"Versioned authority checkpoint prefix: "<<authority_checkpoint_test::checkpoint_checks<<" checks passed.\n";
 }

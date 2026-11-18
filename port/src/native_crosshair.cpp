@@ -26,6 +26,7 @@ constexpr uint32_t quad_class=0x8021cb58;
 constexpr uint32_t group_class=0x8021cab0;
 constexpr uint32_t material_class=0x8021d2a8;
 PPCFunc original_update=nullptr,original_material=nullptr,original_group=nullptr;
+NativeMaterialObserver material_observer=nullptr;
 std::atomic<bool> supported{false};
 std::atomic<unsigned> language{0};
 thread_local bool scope_on=false;
@@ -108,6 +109,7 @@ void reticle_update(PPCContext& c) {
     remember(hud);
 }
 void material_setup(PPCContext& c) {
+    const auto caller=c.lr,quad=c.r[28];
     ++trace.materials;
     if(group_depth&&c.lr==material_return) {
         ++trace.quad_binds;trace.last_quad=c.r[28];trace.last_material=c.r[3];
@@ -122,6 +124,7 @@ void material_setup(PPCContext& c) {
     if(replace)++trace.matches;
     set_scope(replace);
     ssne_call_original(c,material_address,original_material);
+    if(material_observer)material_observer(caller,quad);
 }
 void render_group(PPCContext& c) {
     ++trace.groups;
@@ -201,6 +204,7 @@ bool install_native_crosshair() {
     native_crosshair_frame();return true;
 }
 bool native_crosshair_supported() { return supported.load(std::memory_order_acquire); }
+void set_native_material_observer(NativeMaterialObserver observer){material_observer=observer;}
 unsigned native_crosshair_language() { return language.load(std::memory_order_relaxed); }
 void native_crosshair_frame() {
     const auto value=word(0x802db838u);language.store(value<3?value:0,std::memory_order_relaxed);

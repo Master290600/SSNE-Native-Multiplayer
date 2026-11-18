@@ -1,11 +1,11 @@
-# SSNE-Native build kit (Linux): tells the launcher how to build SSNE-Native-Game on this PC from
+# SSNE-RECOOP-Native build kit (Linux): tells the launcher how to build SSNE-Native-Game on this PC from
 # the player's own disc. "kit:" means this folder. Written by tools/make_linux_release.sh from kit-linux.ini.in.
 
 # Engine version: when it changes, the launcher offers to rebuild a game built with an older kit.
 version = @VERSION@
 
 # Translator (PowerPC main.dol -> C++) and the function-name map for USA Rev 1.
-recomp = kit:ssne-recomp
+recomp = kit:SSNE-RECOOP-Native
 symbols = kit:G3BE9G_r1.sym
 # Other releases (by disc ID): Europe / PAL (English, French, German)
 symbols.G3BP9G = kit:G3BP9G_r0.sym

@@ -1,3 +1,4 @@
+#include <string_view>
 // High-level emulation: loading the game and replacing Dolphin SDK functions with native code.
 #include <atomic>
 #include <chrono>
@@ -17,6 +18,8 @@
 #include <string>
 
 #include "ssne/gx.h"
+#include "ssne/gx_decode_context.h"
+#include "ssne/movie_presentation.h"
 #include "gc/dol.h"
 #include "ssne/hw.h"
 #include "ssne/input.h"
@@ -29,6 +32,9 @@
 #include "ssne/gx_gpu.h"
 #include "ssne/gx.h"
 #include "ssne/native_party.h"
+#include "ssne/native_survival.h"
+#include "ssne/native_spectator.h"
+#include "ssne/native_session_hud.h"
 #include "ssne/native_results.h"
 #include "ssne/native_cutscene.h"
 #include "ssne/native_music.h"
@@ -37,9 +43,14 @@
 #include "ssne/mods.h"
 #include "ssne/bot.h"
 #include "native_vehicle_input.h"
+#include "native_jump_latch.h"
 #include "ssne/game_addresses.h"
 #include <array>
 #include <utility>
+#include <exception>
+#include "ssne/host_frame_dispatch.h"
+#include "ssne/native_entity.h"
+#include "native_held_pistol_winding.h"
 
 namespace ssne {
 namespace gx { bool hud_edges(); }
@@ -217,15 +228,51 @@ void select_version() {
         if (!strcmp(v.id, id)) { g_ver = &v; fprintf(stdout, "[ssne] game version %s\n", id); return; }
     fprintf(stdout, "[ssne] unknown game version %s: using USA addresses (hooks verify their code first)\n", id);
 }
+// Observe the decoder's actual GX destination. The translated Bink functions
+// still decode, play audio, advance frames and free their own resources.
+uint32_t movie_copy_address, movie_close_address, movie_handle;
+PPCFunc original_movie_copy, original_movie_close;
+void movie_copy(PPCContext& c) {
+    const uint32_t handle = c.r[3], target = c.r[4], y = c.r[8];
+    ssne_call_original(c, movie_copy_address, original_movie_copy);
+    if (handle >= 0x80000000u && handle <= guest_ram_end()-8 && target >= 0x80000000u &&
+        target < guest_ram_end()) {
+        movie_handle = handle;
+        movie_presentation::bind(target, mem_read32(handle), mem_read32(handle+4), y);
+    }
+}
+void movie_close(PPCContext& c) {
+    if (c.r[3] == movie_handle && movie_handle) {
+        gx_sync();
+        movie_presentation::decoded_texture = 0;
+        movie_handle = 0;
+    }
+    ssne_call_original(c, movie_close_address, original_movie_close);
+}
+void install_movie_presentation() {
+    const bool pal = !strcmp(g_ver->id,"G3BP9G");
+    movie_copy_address = pal ? 0x8018B934u : 0x8018B994u;
+    movie_close_address = pal ? 0x8018CBD8u : 0x8018CC38u;
+    const auto *copy = ssne_find_func(movie_copy_address), *close = ssne_find_func(movie_close_address);
+    if (!copy || !close || mem_read32(copy->address) != 0x9421FFE8u ||
+        mem_read32(copy->address+12) != 0x7C6B1B78u || mem_read32(close->address) != 0x9421FFE8u ||
+        mem_read32(close->address+8) != 0xBFA1000Cu) return;
+    original_movie_copy = copy->func;
+    original_movie_close = close->func;
+    ssne_install_hook(copy->address, movie_copy);
+    ssne_install_hook(close->address, movie_close);
+}
 // ---- player control. The player's update (800BEEC8, hooked below) runs once in each frame the player controls Sam,
 // on foot or driving, between the frame's drawing and its flip; it doesn't run in the pause menu, NETRICSA, briefings
 // or cutscenes. So the frame after a flip is a player-control frame if the player update ran before that flip (the
 // first frame of a menu still is: the game opens it in that frame's update).
 // Without both hooks (another game build), gameplay is detected by the weapon alone.
 std::atomic<bool> g_player_seen{false}, g_player_control{false};
-// Per controller port (multiplayer: a player's port is player+0x178, 0-3):
-int64_t g_jump_latched_ms[4] = {-1, -1, -1, -1};  // a jump press not yet seen by a physics step (when; see latch_jump)
-int g_switch_boost[4] = {};      // player updates left to run like 60 fps frames after a controller switch
+detail::NativeJumpLatch g_native_jumps;
+uint64_t g_jump_input_sample=0;
+uint32_t g_jump_first_bank=0;
+struct NativeJumpSwitchBoost {uint32_t actor=0;uint64_t life=0;uint32_t cancelled=0;unsigned frames=0;};
+std::array<NativeJumpSwitchBoost,8> g_switch_boost{};
 // The port of the player the keyboard and mouse play: mouse aim, weapon number keys and the vehicle check for the
 // keyboard's steering apply to that player only.
 std::atomic<int> g_kbm_port{0};
@@ -243,6 +290,7 @@ bool g_authoritative_gameplay=false;
 std::atomic<int64_t> g_last_gameplay_ms{-1000000};
 std::atomic<int64_t> g_cam_zoom_ms{-1000000};
 std::atomic<float> g_frame_factor{1.0f};  // factor used by the most recent camera projection
+std::atomic<float> g_loading_canvas_factor{1.f};
 std::atomic<bool> g_frame_zoom{false};    // that projection's scene camera was zoomed in (the sniper scope)
 int64_t now_ms() {
     using namespace std::chrono;
@@ -554,39 +602,102 @@ void weapon_keys(PPCContext& ctx, uint32_t player, int port) {
 uint32_t g_port_player[4] = {};  // the player each controller port played in its last update (cheats)
 int64_t g_port_player_ms[4] = {};
 
+struct NativeJumpFrame {
+    uint32_t actor=0,bank=0,action=0,mode=0,saved_pressed=0;
+    unsigned slot=8;
+    uint64_t life=0;
+    float acc=0,dt=0,step=0,y=0,value=0;
+    uint32_t phase=~0u,queued=0,ground=0;
+    bool eligible=false,injected=false;
+    detail::NativeJumpLatch::Decision decision{};
+};
+bool native_jump_actor(uint32_t actor){
+    return actor>=0x80000000u && actor<=guest_ram_end()-0x790u && mem_read32(actor+0x48)==game_address(0x80212268u);
+}
+bool native_jump_binding(uint32_t actor,unsigned& slot,detail::NativeJumpBinding& binding){
+    const bool network=g_netplay_active.load();
+    const detail::NativeJumpWorld world{guest_ram_end(),game_address(0x80212268u),g_jump_first_bank,native_party_second_bank(),native_party_registry(),network?native_party_capacity():4u,network,native_party_spawn_revision(actor)};
+    return detail::resolve_native_jump_binding(actor,world,[](uint32_t p){return mem_read32(p);},slot,binding);
+}
+bool native_jump_eligible(uint32_t actor){
+    const auto hp=u2f(mem_read32(actor+0xCC));
+    const auto vehicle=mem_read32(actor+0x6C4);
+    return mem_read32(game_address(0x802DB0E0u))==4 && std::isfinite(hp) && hp>0 &&
+        !mem_read32(actor+0x328) && !mem_read32(actor+0x370) && !mem_read32(actor+0x35C) &&
+        !(vehicle>=0x80000000u && vehicle<guest_ram_end()) &&
+        !native_party_spawn_waiting(actor) && (!g_netplay_active || native_party_actor_occupied(actor)) &&
+        !paused() && ((g_netplay_active && mem_read32(actor+0x17C)!=unsigned(netplay_local_player())) ||
+                      (!local_pause_menu_open() && !local_information_open())) &&
+        !native_results_presenting() && !native_movie_presenting() && !native_cutscene_presenting();
+}
+void sample_native_jump_edges(){
+    ++g_jump_input_sample;
+    const auto count=g_netplay_active?native_party_capacity():4u;
+    for(unsigned slot=0;slot<std::min(count,8u);++slot){
+        const auto actor=g_netplay_active?mem_read32(native_party_registry()+slot*4):g_port_player[slot];
+        unsigned actual=8;detail::NativeJumpBinding binding;
+        if(!native_jump_binding(actor,actual,binding) || actual!=slot){g_native_jumps.cancel(slot);continue;}
+        g_native_jumps.prepare(slot,binding,native_jump_eligible(actor),mem_read32(binding.bank+0x10)!=0,g_jump_input_sample,uint32_t(now_ms()));
+    }
+}
+NativeJumpFrame begin_native_jump(PPCContext& ctx,uint32_t actor){
+    NativeJumpFrame frame;frame.actor=actor;
+    detail::NativeJumpBinding binding;
+    if(!native_jump_binding(actor,frame.slot,binding))return frame;
+    frame.bank=binding.bank;frame.mode=binding.mode;frame.life=binding.life;frame.action=frame.bank+0x10;
+    frame.saved_pressed=mem_read32(frame.action);frame.value=u2f(mem_read32(frame.bank+0xC));
+    frame.phase=mem_read32(frame.mode+4);frame.queued=mem_read32(frame.mode+0xC);frame.ground=mem_read32(actor+0x6D0);frame.y=u2f(mem_read32(actor+0x24));
+    frame.acc=u2f(mem_read32(actor+0x140));frame.dt=u2f(mem_read32(ctx.r[13]+0xFFFF85F8u));
+    const auto step_source=mem_read32(actor+0x23C);
+    if(step_source>=0x80000000u && step_source<=guest_ram_end()-0x28u)frame.step=u2f(mem_read32(step_source+0x24));
+    if(!(frame.step>0 && frame.step<.1f))frame.step=0;
+    auto& boost=g_switch_boost[frame.slot];
+    const auto cancelled=g_native_jumps.cancellation(frame.slot);
+    if(boost.actor!=actor || boost.life!=frame.life || boost.cancelled!=cancelled)boost={actor,frame.life,cancelled,0};
+    // Preserve the original high-FPS water-exit repair: two native120Hz steps
+    // in each of the first two frames after switching movement controllers.
+    if(boost.frames>0 && frame.step>0){
+        --boost.frames;
+        if(frame.acc+frame.dt<2*frame.step){frame.acc=2*frame.step-frame.dt;mem_write32(actor+0x140,f2u(frame.acc));}
+    }
+    frame.eligible=native_jump_eligible(actor);
+    frame.decision=g_native_jumps.prepare(frame.slot,binding,frame.eligible,frame.saved_pressed!=0,g_jump_input_sample,uint32_t(now_ms()));
+    if(frame.decision.pressed && !frame.saved_pressed){mem_write32(frame.action,1);frame.injected=true;}
+    return frame;
+}
+void restore_native_jump(const NativeJumpFrame& frame){if(frame.injected)mem_write32(frame.action,frame.saved_pressed);}
+void finish_native_jump(const NativeJumpFrame& frame){
+    if(frame.slot>=8 || !frame.action)return;
+    restore_native_jump(frame);
+    const bool stepped=mem_read32(frame.actor+0x140)!=f2u(frame.acc+frame.dt);
+    g_native_jumps.finish(frame.slot,stepped);
+    if(frame.step>0 && frame.dt<.75f/60 && mem_read32(frame.actor+0x344)!=frame.mode)g_switch_boost[frame.slot].frames=2;
+    static const bool trace=getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_TEST_JUMP_TRACE");
+    if(trace){
+        static const unsigned mask=[] {const auto* value=getenv("SSNE_TEST_JUMP_TRACE_MASK");return value?unsigned(strtoul(value,nullptr,0)):3u;}();
+        static uint64_t sequence=0;
+        if((mask&(1u<<frame.slot)) && sequence<100000){
+            const auto mode=mem_read32(frame.actor+0x344);
+            const bool valid_mode=mode>=0x80000000u && mode<=guest_ram_end()-0x38u;
+            char line[720];snprintf(line,sizeof(line),"[jump-native] seq=%llu slot=%u actor=%u dt=%.9g acc0=%.9g acc1=%.9g stepped=%u phase0=%u phase1=%u queued0=%u queued1=%u ground0=%u ground1=%u y0=%.9g y1=%.9g action_value=%.9g action_pressed=%u bank=%u retained=%u api=%u eligible=%u raw_pressed=%u",
+                (unsigned long long)++sequence,frame.slot,frame.actor,double(frame.dt),double(frame.acc),double(u2f(mem_read32(frame.actor+0x140))),unsigned(stepped),frame.phase,valid_mode?mem_read32(mode+4):~0u,frame.queued,valid_mode?mem_read32(mode+0xC):0u,frame.ground,mem_read32(frame.actor+0x6D0),double(frame.y),double(u2f(mem_read32(frame.actor+0x24))),double(frame.value),unsigned(frame.saved_pressed || frame.decision.pressed),frame.bank,unsigned(frame.decision.retained),unsigned(frame.decision.queued),unsigned(frame.eligible),frame.saved_pressed);
+            log_message(line);
+        }
+    }
+}
+
 void hle_player_update(PPCContext& ctx) {
     uint32_t player = ctx.r[3];
     bool valid = player >= 0x80000000u && player <= guest_ram_end()-0x790u && mem_read32(player+0x48)==game_address(0x80212268u);
     if (valid) { g_port_player[player_port(player)] = player; g_port_player_ms[player_port(player)] = now_ms(); }
-    // A physics step runs in this update (see latch_jump) unless its accumulator ends up at exactly its old value
-    // plus the frame time (fixed-step mode without a whole step; the variable-step mode always steps).
-    float acc = valid ? u2f(mem_read32(player + 0x140)) : 0.f, dt = u2f(mem_read32(ctx.r[13] + 0xFFFF85F8u));
-    uint32_t controller = valid ? mem_read32(player + 0x344) : 0;
     const int port = valid ? player_port(player) : 0;
-    float step = 0;
-    if (valid) {
-        uint32_t step_src = mem_read32(player + 0x23C);
-        if (step_src >= 0x80000000u && step_src <= guest_ram_end()-0x28u) step = u2f(mem_read32(step_src + 0x24));
-        if (!(step > 0 && step < 0.1f)) step = 0;
-    }
-    if (g_switch_boost[port] > 0 && step > 0) {  // the frames after a controller switch step like 60 fps frames (below)
-        g_switch_boost[port]--;
-        if (acc + dt < 2 * step) { acc = 2 * step - dt; mem_write32(player + 0x140, f2u(acc)); }
-    }
+    const auto jump=begin_native_jump(ctx,player);
     PPCFunc* slot = ssne_hook_slot(g_ver->player_update);
     *slot = nullptr;
-    g_orig_player_update(ctx);
+    try{g_orig_player_update(ctx);}catch(...){restore_native_jump(jump);*slot=&hle_player_update;throw;}
     *slot = &hle_player_update;
+    finish_native_jump(jump);
     if (!valid) return;
-    bool stepped = mem_read32(player + 0x140) != f2u(acc + dt);
-    if (stepped) g_jump_latched_ms[port] = -1;
-    // Jumping out of water switches from the swim controller to the walking one: in the next frame it sets Sam's
-    // upward speed, in the one after his physics steps move him up, and after every frame a water check switches
-    // back to swimming while he is still too deep. At 60 fps that second frame runs two steps (1/60 s) and clears the
-    // depth; above 120 fps it ran none or one, the check switched back, and every attempt failed. So after a switch
-    // at frame times shorter than 3/4 of 1/60 s, the next two frames run two steps each, as at 60 fps (brought
-    // forward: the accumulator goes negative and keeps the average rate).
-    if (step > 0 && dt < 0.75f / 60 && mem_read32(player + 0x344) != controller) g_switch_boost[port] = 2;
     g_player_seen = true;
     const auto vehicle=mem_read32(player+0x6C4);
     g_vehicle_input.observe(port,vehicle_actor_driving(player,g_netplay_active.load()),now_ms());
@@ -664,6 +775,7 @@ namespace {
 #define kLookUpdate (g_ver->look_update)
 const uint32_t kLookUpdateSig[6] = {0x9421FFD0u, 0x7C0802A6u, 0xDBC10020u, 0xDBE10028u, 0x93E1001Cu, 0x90010034u};
 PPCFunc g_orig_look = nullptr;
+bool local_cheat_flight(uint32_t player);
 std::mutex g_aim_mutex;
 double g_aim_yaw[8]{}, g_aim_pitch[8]{};
 std::atomic<int64_t> g_aim_last_ms[8]{{-100000},{-100000},{-100000},{-100000},{-100000},{-100000},{-100000},{-100000}};
@@ -672,6 +784,7 @@ NetplayStep g_netplay_step;
 std::atomic<int> g_netplay_local_player{0};
 uint32_t g_netplay_render_engine = 0, g_netplay_render_sda = 0;
 PPCFunc g_netplay_render_original = nullptr;
+GameFrameObserver g_game_frame_observer;
 PPCFunc g_netplay_list_render=nullptr, g_netplay_view_create=nullptr;
 int g_netplay_list_owner=-1;
 unsigned g_netplay_count=2;
@@ -808,9 +921,12 @@ PPCFunc g_authoritative_control_gate_original=nullptr;
 PPCFunc g_authoritative_player_start_original=nullptr;
 void hle_authoritative_player_start(PPCContext& ctx) {
     const auto actor=ctx.r[3];
+    std::string survival_error;
+    if(!prepare_native_survival_player_start(ctx,actor,survival_error)){log_message("[native-survival-start-error] "+survival_error);return;}
     if(!native_party_prepare_spawn(ctx,actor,ctx.r[4]))return;
     ssne_call_original(ctx,0x800B2E5C,g_authoritative_player_start_original);
     native_party_spawn_completed(actor);
+    if(native_jump_actor(actor))cancel_native_jump_press(mem_read32(actor+(g_netplay_active?0x17C:0x178)));
 }
 PPCFunc g_authoritative_spawn_telefrag_original=nullptr;
 void hle_authoritative_spawn_telefrag(PPCContext& ctx) {
@@ -831,6 +947,7 @@ void hle_authoritative_spawn_telefrag(PPCContext& ctx) {
 PPCFunc g_authoritative_player_death_original=nullptr;
 void hle_authoritative_player_death(PPCContext& ctx) {
     const auto actor=ctx.r[3],info=ctx.r[4];
+    if(native_jump_actor(actor))cancel_native_jump_press(mem_read32(actor+(g_netplay_active?0x17C:0x178)));
     if(actor>=0x80000000u && actor<=guest_ram_end()-0x790 && mem_read32(actor+0x48)==game_address(0x80212268u)) {
         std::string event="[coop-player-death] slot="+std::to_string(mem_read32(actor+0x17C))+" health="+std::to_string(u2f(mem_read32(actor+0xCC)))+" caller="+std::to_string(ctx.lr)+" info="+std::to_string(info);
         if(info>=0x80000000u && info<=guest_ram_end()-16)event+=" type="+std::to_string(mem_read32(info+4))+" source="+std::to_string(mem_read32(info+8))+" flags="+std::to_string(mem_read32(info+12));
@@ -875,11 +992,17 @@ void hle_authoritative_player_collision(PPCContext& ctx){
 PPCFunc g_authoritative_player_update_original=nullptr;
 void hle_authoritative_player_update(PPCContext& ctx) {
     const auto actor=ctx.r[3];
+    // This hook survives leaving a session. Keep offline controller discovery
+    // current as the SP hook does, so a retired online actor cannot cancel a
+    // new offline player's between-sample jump mailbox.
+    if(!g_netplay_active && native_jump_actor(actor)){const auto port=player_port(actor);g_port_player[port]=actor;g_port_player_ms[port]=now_ms();}
     if(!native_party_actor_occupied(actor)){static std::array<uint64_t,8> skipped{};const auto slot=mem_read32(actor+0x17C);if(slot<8 && ++skipped[slot]%120==0)log_message("[coop-reserved-player-update-skipped] slot="+std::to_string(slot)+" skips="+std::to_string(skipped[slot]));return;}
     if(native_party_retry_spawn(ctx,actor))return;auto slot=mem_read32(actor+0x17C);static std::array<uint64_t,8> updates{};
     if(slot<8 && ++updates[slot]%120==0)log_message("[coop-player-dispatch] slot="+std::to_string(slot)+" updates="+std::to_string(updates[slot])+" mode="+std::to_string(mem_read32(actor+0x370))+" flags="+std::to_string(mem_read32(actor+0x1C))+" frozen="+std::to_string(mem_read32(actor+0x144)));
     std::array<float,3> idle_before;for(unsigned i=0;i<3;++i)idle_before[i]=u2f(mem_read32(actor+0x20+i*4));
-    ssne_call_original(ctx,0x800BEEC8,g_authoritative_player_update_original);
+    const auto jump=begin_native_jump(ctx,actor);
+    try{ssne_call_original(ctx,0x800BEEC8,g_authoritative_player_update_original);}catch(...){restore_native_jump(jump);throw;}
+    finish_native_jump(jump);
     native_party_stabilize_idle(ctx,actor,idle_before);
     if(slot<8 && actor>=0x80000000u && actor<=guest_ram_end()-0x790){
         g_player_seen=true;
@@ -929,6 +1052,74 @@ void hle_information_camera_set(PPCContext& ctx){
        mem_read32(native_party_view_engine(engine)+0xDC+slot*76)==camera)g_information_cameras[slot]=camera;
 }
 std::atomic<bool> g_replica_pause_menu_open{false};
+// The pause panel and controller belong to one process. Keep the physical
+// avatar in the shared simulation while its owner navigates the native GUI.
+std::atomic<uint32_t> g_network_pause_gui{0};
+unsigned g_network_pause_slot=0;
+constexpr unsigned controller_actions_offset=0xC,controller_actions_size=64*28;
+std::array<uint8_t,controller_actions_size> g_pause_gui_actions{};
+uint32_t g_pause_action_bank=0;
+PPCFunc g_network_gui_input_original=nullptr,g_network_gui_close_original=nullptr;
+PPCFunc g_network_information_event_original=nullptr;
+PPCFunc g_network_gui_colour_original=nullptr;
+
+void hle_network_gui_colour(PPCContext& ctx){
+    // Restart and Quit broadcast the end fade to every player's GUI. With a
+    // local ESC panel only its owner has allocated the two background tracks.
+    if(g_authoritative_gameplay && mem_read32(game_address(0x802DB0E0u))==4){
+        const auto gui=ctx.r[3];
+        const auto readable=[](uint32_t ptr,unsigned size){return ptr>=0x80000000u && ptr<=guest_ram_end()-size;};
+        if(!readable(gui,0x38) || !readable(mem_read32(gui+0x30),8) || !readable(mem_read32(gui+0x34),8))return;
+    }
+    ssne_call_original(ctx,0x800F73E8u,g_network_gui_colour_original);
+}
+
+void hle_network_information_event(PPCContext& ctx){
+    // The live world can send a deferred close for an already dismissed
+    // NETRICSA. It shares the same CcGUI as the player's new pause menu.
+    const auto info=ctx.r[3],event=ctx.r[4];
+    if(g_network_pause_gui.load() && mem_read32(event)==3 && !mem_read32(info+0x6C))return;
+    ssne_call_original(ctx,0x80102CF0,g_network_information_event_original);
+}
+
+void hle_network_gui_input(PPCContext& ctx){
+    const auto gui=ctx.r[3],bank=g_pause_action_bank;
+    if(!bank || gui!=g_network_pause_gui.load()){
+        ssne_call_original(ctx,0x800F664C,g_network_gui_input_original);return;
+    }
+    // Only CcGUI's local controller dispatch sees the original sampled input.
+    // Its callbacks can close the panel, restart the level, or open a submenu.
+    auto* actions=host_ptr(bank+controller_actions_offset);
+    std::memcpy(actions,g_pause_gui_actions.data(),controller_actions_size);
+    struct Restore {
+        uint32_t bank,gui;uint8_t* actions;
+        ~Restore(){
+            if(g_pause_action_bank==bank && g_network_pause_gui.load()==gui)
+                std::memcpy(g_pause_gui_actions.data(),actions,controller_actions_size);
+            if(bank==mem_read32(0x802ABA9C))std::memset(actions,0,controller_actions_size);
+        }
+    } restore{bank,gui,actions};
+    ssne_call_original(ctx,0x800F664C,g_network_gui_input_original);
+}
+void hle_network_gui_close(PPCContext& ctx){
+    // CloseMenu has already cleared the controller bit. Its remaining global
+    // close normally iterates over every GUI. For this panel, remove only its
+    // own GUI and let CloseMenu perform its usual button-release suppression.
+    const auto owner=g_network_pause_gui.load();
+    if(!owner || ctx.lr!=0x800F9AECu){
+        ssne_call_original(ctx,0x800F9A00,g_network_gui_close_original);return;
+    }
+    ctx.r[3]=ctx.r[31];
+    if(ctx.r[3]==owner){
+        if(mem_read32(ctx.r[1]+0x14)==0x8010231Cu){
+            const auto mask=ctx.r[13]-0x765Cu;
+            mem_write32(mask,mem_read32(mask)|(1u<<g_network_pause_slot));
+            return;
+        }
+        forget_network_pause_panel(ctx,owner);
+    }
+    ssne_call(ctx,0x800F643C);
+}
 void update_replica_pause_menu(PPCContext& ctx,uint32_t player,unsigned slot,bool valid){
     if(native_replica_results_presenting()){g_replica_pause_menu_open=false;return;}
     if(g_authoritative_information_open){g_replica_pause_menu_open=false;return;}
@@ -1242,7 +1433,13 @@ void hle_look_update(PPCContext& ctx) {
             log_message(message);
         }
     }
+    // The original debug-flight branch computed f29 = R - L before calling
+    // look update. Reverse only that movement scalar: L/Space ascends while
+    // weapon processing still receives the real R/fire input. f29 is preserved
+    // by the verified original look function (its nonvolatile PPC ABI).
+    const bool reverse_flight = ctx.lr==0x800BF410u && local_cheat_flight(player);
     ssne_call_original(ctx, kLookUpdate, g_orig_look);
+    if(reverse_flight){ctx.ps0[29]=-ctx.ps0[29];ctx.ps1[29]=-ctx.ps1[29];}
     if(!g_netplay_active && port!=g_kbm_port.load())return;
     if (getenv("SSNE_AIM_TRACE") && port >= 0 && port < 8) {
         static std::set<uint32_t> seen;
@@ -1322,14 +1519,130 @@ void install_perf_native_probes(){
     log_message("[performance-detail] original PAL render subcall probes="+std::to_string(installed)+"; existing hooks preserved");
 }
 
+// Mark only explicit native render transactions. Unhooked single-player and
+// all work outside them keep the legacy live getters, including MP -> SP.
+thread_local unsigned g_gx_decode_scope_depth=0;
+std::array<std::atomic<uint64_t>,5> g_gx_context_checks{};
+bool verify_gx_decode_context(){
+    static const bool enabled=[] {
+        const auto* value=std::getenv("SSNE_GX_CONTEXT_VERIFY");
+        if(!value || std::strcmp(value,"1") || !gx_scoped_context_enabled())return false;
+        const auto* async=std::getenv("SSNE_GX_ASYNC_VIEW_SCOPES");
+        if(async && !std::strcmp(async,"1"))fatal("GX context verification requires the original synchronous view fences");
+        return true;
+    }();return enabled;
+}
+GxDecodeMarkerDebug live_gx_decode_debug(uint32_t reason){
+    GxDecodeMarkerDebug tag;tag.reason=reason;tag.engine=g_netplay_render_engine;tag.sda=g_netplay_render_sda;
+    tag.scene=mem_read32(game_address(0x802DB0E0u));tag.list_owner=g_netplay_list_owner;tag.local_player=g_netplay_local_player.load();
+    if(tag.engine && tag.sda>=0x80006D94u && tag.sda<guest_ram_end())tag.view=int32_t(mem_read32(tag.sda-0x6D94u));
+    tag.information_object=g_authoritative_information_object;
+    tag.information_open=tag.information_object>=0x80000000u && tag.information_object<=guest_ram_end()-0xA4u && mem_read32(tag.information_object+0x6C)!=0;
+    if(tag.engine && tag.view>=0 && tag.view<32){const uint64_t view=uint64_t(native_party_view_engine(tag.engine))+0xDCu+uint64_t(tag.view)*76;
+        if(view>=0x80000000u && view<=guest_ram_end()-4u)tag.information_camera=mem_read32(uint32_t(view));}
+    tag.cutscene=native_cutscene_presenting();tag.movie=native_movie_presenting();return tag;
+}
+std::string gx_decode_debug_text(const GxDecodeMarkerDebug& tag){
+    constexpr const char* names[]={"unknown","root_begin","layout_enter","layout_exit","viewport_enter","viewport_exit","list_owner_enter","list_owner_exit","scene_prepare","camera_render_0","camera_render_1","nested_root_exit"};
+    char text[420];std::snprintf(text,sizeof(text),"serial=%llu reason=%s(%u) engine=%08X sda=%08X view=%d list_owner=%d local=%d scene=%u info_object=%08X view_camera=%08X info_active=%u cutscene=%u movie=%u",
+        (unsigned long long)tag.serial,tag.reason<12?names[tag.reason]:"unknown",tag.reason,tag.engine,tag.sda,tag.view,tag.list_owner,tag.local_player,tag.scene,tag.information_object,tag.information_camera,unsigned(tag.information_open),unsigned(tag.cutscene),unsigned(tag.movie));return text;
+}
+void verify_gx_decode_value(bool recorded,bool live,unsigned field){
+    g_gx_context_checks[field].fetch_add(1,std::memory_order_relaxed);
+    if(recorded==live)return;
+    constexpr const char* names[]={"discard","local","ui","gui_camera","frontend"};
+    const std::string message=std::string("GX decode context mismatch: ")+names[field]+" recorded="+std::to_string(recorded)+" live="+std::to_string(live);
+    const auto debug=gx_decode_debug_state();
+    const auto current=live_gx_decode_debug(0);
+    char fifo[550];std::snprintf(fifo,sizeof(fifo)," opcode=%02X depth=%u opcode_start=%llu marker_offset=%llu raw_head=%llu raw_taken=%llu raw_done=%llu pending_begin=%llu pending_bytes=%llu pending_need=%llu last_fence_head=%llu last_fence_pending_begin=%llu last_fence_pending_bytes=%llu last_fence_need=%llu",
+        debug.opcode,debug.depth,(unsigned long long)debug.opcode_start,(unsigned long long)debug.marker_offset,(unsigned long long)debug.raw_head,(unsigned long long)debug.raw_taken,(unsigned long long)debug.raw_done,(unsigned long long)debug.pending_begin,(unsigned long long)debug.pending_bytes,(unsigned long long)debug.pending_need,(unsigned long long)debug.last_fence_head,(unsigned long long)debug.last_fence_pending_begin,(unsigned long long)debug.last_fence_pending_bytes,(unsigned long long)debug.last_fence_need);
+    log_message("[gx-context-verify] mismatches=1 "+message+" recorded_marker={"+gx_decode_debug_text(debug.marker)+"} live_context={"+gx_decode_debug_text(current)+"}"+fifo+" info_tick_open="+std::to_string(g_authoritative_information_open.load()));
+    fatal(message.c_str());
+}
+void report_gx_decode_checks(){
+    if(!verify_gx_decode_context())return;
+    static auto next=std::chrono::steady_clock::time_point{};
+    const auto now=std::chrono::steady_clock::now();if(now<next)return;
+    next=now+std::chrono::seconds(1);
+    std::string counts;uint64_t total=0;
+    for(const auto& counter:g_gx_context_checks){const auto n=counter.load(std::memory_order_relaxed);total+=n;counts+=(counts.empty()?"":",")+std::to_string(n);}
+    log_message("[gx-context-verify] checks="+std::to_string(total)+" fields="+counts+" mismatches=0 barriers=1");
+}
+void mark_native_decode_context(uint32_t reason){
+    if(!g_gx_decode_scope_depth)return;
+    const auto context=capture_gx_decode_context();
+    if(verify_gx_decode_context()){
+        static uint64_t serial=0;auto tag=live_gx_decode_debug(reason);tag.serial=++serial;
+        gx_mark_decode_context_debug(context,tag);
+    }else gx_mark_decode_context(context);
+}
+bool async_native_view_scopes_configured(){
+    static const bool enabled=[] {
+        if(const auto* value=std::getenv("SSNE_GX_ASYNC_VIEW_SCOPES"))return !std::strcmp(value,"1");
+        // The diagnostic compares against live synchronous classification.
+        // Preserve that oracle unless async was explicitly requested (error).
+        const auto* verify=std::getenv("SSNE_GX_CONTEXT_VERIFY");return !verify || std::strcmp(verify,"1");
+    }();
+    // Depth is nonzero only for the verified authoritative PAL root with
+    // scoped decoding enabled. Every other mode keeps all legacy fences.
+    return enabled;
+}
+bool async_native_view_scopes(){return async_native_view_scopes_configured() && g_gx_decode_scope_depth!=0;}
+struct NativeDecodeContextScope {
+    // The exact camera-dispatch LRs below are verified only for native PAL.
+    bool enabled=gx_scoped_context_enabled() && g_authoritative_gameplay && mem_read32(0x80000000u)==0x47334250u;
+    NativeDecodeContextScope(){if(enabled){++g_gx_decode_scope_depth;mark_native_decode_context(1);}}
+    ~NativeDecodeContextScope(){if(enabled){if(--g_gx_decode_scope_depth)mark_native_decode_context(11);else{gx_clear_decode_context();report_gx_decode_checks();}}}
+};
+// The verified host can let SDKFlip overlap its CPU work with the render tail.
+// No guest actor/model pointer is retained; the eventual observer resolves fresh
+// bindings after the SDK's work and an explicit final drain. Replicas retain
+// their per-render pose rollback fence.
+const void* g_host_frame_gate_owner=nullptr;
+std::function<bool()> g_host_frame_gate;
+HostFrameDispatchPolicy g_host_frame_dispatch;
+bool g_host_render_tail_pending=false,g_host_frame_callback=false;
+bool host_frame_pipeline_ready(uint32_t engine,uint32_t sda){
+    static const bool enabled=[] {const auto* value=std::getenv("SSNE_HOST_RENDER_PIPELINE");return !value || std::strcmp(value,"0");}();
+    if(!enabled || g_host_frame_callback || !g_game_frame_observer || !g_host_frame_gate || !g_authoritative_gameplay || replica_simulation() ||
+       !g_netplay_world_ready || !gx_scoped_context_enabled() || !async_native_view_scopes_configured() ||
+       sda!=0x802E22A0u || !native_party_render_layout_safe(engine) ||
+       mem_read32(game_address(0x802DB0E0u))!=4 || mem_read32(game_address(0x802DB1BCu))!=1 ||
+       mem_read32(game_address(0x802DB0E4u))!=0 || g_netplay_local_player.load()!=0 || (mem_read32(sda-0x765Cu)&1u) ||
+       g_authoritative_information_open || g_replica_pause_menu_open || native_results_presenting() ||
+       native_movie_presenting() || native_cutscene_presenting() || savestate_pending())return false;
+    return g_host_frame_gate();
+}
+void trace_host_frame_pipeline(bool deferred,bool completed,bool cancelled){
+    // Hidden QA only: changes are logged once; counters never trigger per-frame
+    // I/O or clock reads in ordinary play or the normal FPS benchmark.
+    static const bool trace=std::getenv("SSNE_TEST_HIDDEN") && std::getenv("SSNE_TEST_HOST_PIPELINE_TRACE");
+    if(!trace)return;
+    static int last=-1;static unsigned changes=0;
+    const int state=cancelled?2:deferred?1:0;
+    if(last!=state && changes<64){last=state;++changes;
+        log_message("[host-frame-pipeline] deferred="+std::to_string(deferred)+" completed="+std::to_string(completed)+" cancelled="+std::to_string(cancelled));}
+}
+PPCFunc g_decode_prepare_original=nullptr;
+void hle_decode_scene_prepare(PPCContext& ctx){
+    // A distinct scene renderer can submit offscreen texture GX work before
+    // CameraRender, so its own entry needs the freshly selected view as well.
+    mark_native_decode_context(8);
+    ssne_call_original(ctx,0x8013F5A0u,g_decode_prepare_original);
+}
+
 void hle_netplay_list_render(PPCContext& ctx) {
-    gx_sync();
-    struct GxScopeDrain { ~GxScopeDrain(){ gx_sync(); } } gx_scope_drain;
+    const bool asynchronous=async_native_view_scopes();
+    if(!asynchronous)gx_sync();
+    struct GxScopeDrain {bool asynchronous;~GxScopeDrain(){if(!asynchronous)gx_sync();}} gx_scope_drain{asynchronous};
     ssne::perf::detail::Scope perf_detail(ssne::perf::detail::ListDraw);
     struct OwnerScope {
+        bool asynchronous;
         int previous=g_netplay_list_owner,previous_native=native_party_owner();
-        ~OwnerScope(){gx_sync();g_netplay_list_owner=previous;native_party_owner_set(previous_native);}
-    } scope;
+        // Only host classification and the guest-thread owner change here.
+        // The FIFO worker uses its issued marker, never this owner variable.
+        ~OwnerScope(){if(!asynchronous)gx_sync();g_netplay_list_owner=previous;native_party_owner_set(previous_native);mark_native_decode_context(7);}
+    } scope{asynchronous};
     if(g_netplay_render_engine)for(unsigned port=0;port<g_netplay_count;++port) {
         auto player=g_netplay_players[port];if(!player)continue;
         auto view=mem_read32(player+0x374);if(view<0x80000000 || view>(guest_ram_end()-0x1000u))continue;
@@ -1342,6 +1655,7 @@ void hle_netplay_list_render(PPCContext& ctx) {
     // HUD callbacks issue canonical view indices too. Keep native view
     // relocation in the same player scope as GPU draw filtering.
     if(native_party_extended() && g_netplay_list_owner>=0)native_party_owner_set(g_netplay_list_owner);
+    mark_native_decode_context(6);
     detail::NativeHudListScope hud_scope(g_native_hud_list_observer);
     ssne_call_original(ctx, game_address(0x8011E5F4u), g_netplay_list_render);
 }
@@ -1395,6 +1709,80 @@ void hle_authoritative_visibility_projection(PPCContext& ctx) {
 
 PPCFunc g_authoritative_viewport_original=nullptr;
 PPCFunc g_authoritative_proxy_draw_original=nullptr;
+PPCFunc g_held_pistol_material_original=nullptr;
+bool g_held_pistol_winding_enabled=false;
+thread_local detail::HeldPistolWinding g_held_pistol_winding;
+bool held_pistol_readable(uint32_t pointer,uint32_t size){
+    return pointer>=0x80000000u && size<=guest_ram_size() && pointer<=guest_ram_end()-size;
+}
+std::optional<detail::HeldPistolBinding> held_left_pistol_binding(uint32_t proxy){
+    // Reject the ordinary world, body and first-person models before the
+    // resource lookup or bounded player scan. This is the original MP asset.
+    if(!g_held_pistol_winding_enabled || !held_pistol_readable(proxy,0x40) ||
+       mem_read32(proxy+0x24)!=2 || mem_read8(proxy+0x2F)!=2 || !mem_read32(proxy+0x30))return {};
+    const auto resource=mem_read32(proxy+0x1C),matrix=mem_read32(proxy+4);
+    if(!held_pistol_readable(resource,0x34) || !held_pistol_readable(matrix,48) ||
+       !detail::held_left_pistol_name(native_static_model_name(resource)))return {};
+    std::array<float,12> root;
+    for(unsigned i=0;i<root.size();++i){root[i]=u2f(mem_read32(matrix+i*4));if(!std::isfinite(root[i]))return {};}
+    const double determinant=double(root[0])*(double(root[5])*root[10]-double(root[6])*root[9])-
+        double(root[1])*(double(root[4])*root[10]-double(root[6])*root[8])+
+        double(root[2])*(double(root[4])*root[9]-double(root[5])*root[8]);
+    if(!std::isfinite(determinant) || determinant<=1.e-8)return {};
+    const auto registry=native_party_registry(),capacity=native_party_capacity();
+    if(capacity>8 || !held_pistol_readable(registry,capacity*4))return {};
+    for(unsigned slot=0;slot<capacity;++slot){
+        const auto actor=mem_read32(registry+slot*4);
+        if(!held_pistol_readable(actor,0x790) || mem_read32(actor+0x48)!=0x802121E8u ||
+           mem_read32(actor+0x17C)!=slot || mem_read32(actor+0x5DC)!=1)continue;
+        const auto body=mem_read32(actor+0x148);
+        if(held_pistol_readable(body,0xA8) && mem_read32(body+8)==proxy && mem_read32(body+0xA4)==2)
+            return detail::HeldPistolBinding{actor,proxy,resource,matrix,mem_read32(resource+4),mem_read32(resource+0xC)};
+    }
+    return {};
+}
+void hle_held_pistol_material(PPCContext& ctx){
+    const auto selected=g_held_pistol_winding.binding(&ctx,ctx.r[1],ctx.lr);
+    const auto live=selected?held_left_pistol_binding(selected->proxy):std::nullopt;
+    const bool material_readable=selected && held_pistol_readable(ctx.r[3],0xC);
+    const auto flags=material_readable?mem_read16(ctx.r[3]+8):uint16_t(0);
+    const auto material=ctx.r[3],caller=ctx.lr;
+    const bool applied=g_held_pistol_winding.material(ctx,material_readable && live && *selected==*live,flags,[](PPCContext& c){
+        ssne_call_original(c,0x8012680Cu,g_held_pistol_material_original);
+    });
+    static const bool trace=std::getenv("SSNE_TEST_HIDDEN") && std::getenv("SSNE_TEST_HELD_PISTOL_WINDING_TRACE");
+    if(trace && applied){
+        static unsigned samples=0;
+        if(samples++<16){char line[220];std::snprintf(line,sizeof(line),"[held-pistol-winding] actor=%08X proxy=%08X resource=%08X material=%08X flags=%04X caller=%08X original_back=2 corrected_front=1",
+            selected->actor,selected->proxy,selected->resource,material,unsigned(flags),caller);log_message(line);}
+    }
+}
+void install_held_pistol_winding(){
+    g_held_pistol_winding_enabled=false;
+    const auto* setting=std::getenv("SSNE_NATIVE_HELD_PISTOL_WINDING");
+    if(setting && !std::strcmp(setting,"0"))return;
+    if(mem_read32(0x80000000u)!=0x47334250u || mem_read16(0x80000004u)!=0x3947u)return;
+    const auto matched=[](uint32_t address,uint32_t size,uint64_t expected){
+        if(!ssne_find_func(address) || !held_pistol_readable(address,size))return false;
+        uint64_t hash=14695981039346656037ull;
+        for(uint32_t i=0;i<size;++i){hash^=mem_read8(address+i);hash*=1099511628211ull;}
+        return hash==expected;
+    };
+    // Whole original bodies pin the frame/caller/cull assumptions above.
+    if(!matched(0x8013D4D0u,1272,0xF1BA850E474969CEull) ||
+       !matched(0x8012ED78u,1776,0xB07CCB0DF1A1B40Full) ||
+       !matched(0x8012680Cu,1792,0xBC9108D7D5ADDDB0ull)){
+        log_message("[ssne] held left pistol winding correction unavailable: original PAL draw bodies differ");return;
+    }
+    const auto* material=ssne_find_func(0x8012680Cu);
+    const auto previous=*ssne_hook_slot(material->address);
+    if(previous!=hle_held_pistol_material){
+        g_held_pistol_material_original=previous?previous:material->func;
+        ssne_install_hook(material->address,hle_held_pistol_material);
+    }
+    g_held_pistol_winding_enabled=true;
+    log_message("[ssne] original MP left Desert Hawk winding correction installed; scoped material cull only");
+}
 void hle_authoritative_proxy_draw(PPCContext& ctx){
     ssne::perf::detail::Scope perf_detail(ssne::perf::detail::ModelDraw);
     // Original parent callbacks still need these local attachment objects,
@@ -1402,11 +1790,15 @@ void hle_authoritative_proxy_draw(PPCContext& ctx){
     // Filter the old proxy at its real draw entry; +2D is a culling override,
     // not a reliable way to disable a normally culled native model.
     if(replica_suppressed_npc_proxy(ctx.r[3])){ctx.r[3]=0;return;}
+    const auto binding=held_left_pistol_binding(ctx.r[3]);
+    detail::HeldPistolWinding::Scope pistol_scope(g_held_pistol_winding,&ctx,ctx.r[1],binding.value_or(detail::HeldPistolBinding{}));
     ssne_call_original(ctx,0x8013D4D0u,g_authoritative_proxy_draw_original);
 }
 void hle_authoritative_viewport(PPCContext& ctx) {
-    gx_sync();
-    struct GxScopeDrain { ~GxScopeDrain(){ gx_sync(); } } gx_scope_drain;
+    const bool asynchronous=async_native_view_scopes();
+    if(!asynchronous)gx_sync();
+    mark_native_decode_context(4);
+    struct GxScopeDrain {bool asynchronous;~GxScopeDrain(){if(!asynchronous)gx_sync();mark_native_decode_context(5);}} gx_scope_drain{asynchronous};
     ssne::perf::detail::Scope perf_detail(ssne::perf::detail::Viewport);
     CoopHookTimer timer("viewport_"+std::to_string(ctx.r[4]));
     if(g_netplay_render_engine && getenv("SSNE_COOP_RENDER_TRACE")) {
@@ -1426,13 +1818,17 @@ void hle_authoritative_viewport(PPCContext& ctx) {
     ssne_call_original(ctx,0x801179BC,g_authoritative_viewport_original);
 }
 void hle_netplay_render(PPCContext& ctx) {
-    gx_sync();
-    struct GxScopeDrain { ~GxScopeDrain(){ gx_sync(); } } gx_scope_drain;
+    const bool sdk_nested_render=g_host_frame_dispatch.pending();
+    if(!sdk_nested_render)g_host_frame_dispatch.begin_render(false);
+    bool defer_host_tail=false;
+    gx_sync();g_host_render_tail_pending=false;
+    NativeDecodeContextScope decode_scope;
+    struct GxScopeDrain {bool& defer;bool sdk_nested;int exceptions=std::uncaught_exceptions();~GxScopeDrain(){if(!defer || std::uncaught_exceptions()>exceptions){gx_sync();g_host_render_tail_pending=false;if(!sdk_nested)g_host_frame_dispatch.clear();}}} gx_scope_drain{defer_host_tail,sdk_nested_render};
     ssne::perf::detail::Frame perf_frame(ssne::perf::detail::GuestRender);
     CoopHookTimer timer("native_render");
     struct HudEdgeScope {
         PPCContext context;
-        struct Position{uint32_t widget,x,y;};
+        struct Position{uint32_t widget,base,x,y;};
         std::vector<Position> saved;
         void position(uint32_t widget,uint32_t x,uint32_t y){
             // Pure native GUI positioning, using this process's widgets.
@@ -1464,7 +1860,7 @@ void hle_netplay_render(PPCContext& ctx) {
                 if(group==1?anchor!=7:group==2?anchor!=6:(anchor!=2 && anchor!=3))return;
                 const auto x=mem_read32(widget+4),y=mem_read32(widget+8);
                 if(!std::isfinite(u2f(x)) || !std::isfinite(u2f(y)))return;
-                saved.push_back({widget,x,y});position(widget,f2u(u2f(x)+((anchor==2 || anchor==6)?-1.f:1.f)*320.f*(wide-1.f)),y);
+                saved.push_back({widget,base,x,y});position(widget,f2u(u2f(x)+((anchor==2 || anchor==6)?-1.f:1.f)*320.f*(wide-1.f)),y);
             };
             for(unsigned off:{0x84u,0x88u,0x8Cu,0x90u,0x94u,0x98u,0x9Cu,0xA0u,0x3DCu})shift(mem_read32(hud+off));
             for(unsigned i=0;i<12;++i)for(unsigned child=0;child<2;++child)shift(mem_read32(hud+0x22C+i*36+child*4));
@@ -1477,10 +1873,22 @@ void hle_netplay_render(PPCContext& ctx) {
                 shift(mem_read32(hud+0x180+i*24),2);
             }
         }
+        bool restore_async_safe()const{
+            // PAL GUIBase's checked setter writes only widget/anchor/2D
+            // coordinates. Rendering has already copied them into immediate
+            // FIFO values; no bone, vertex, display-list or texture lease ends.
+            for(const auto& p:saved){
+                if(p.widget<0x80000000u || p.widget>guest_ram_end()-0x38u || mem_read32(p.widget)!=p.base ||
+                   p.base<0x80000000u || p.base>guest_ram_end()-0x38u || mem_read32(p.base)!=0x8021CAB0u ||
+                   mem_read16(0x8021CAB0u+0x30u)!=0 || mem_read32(0x8021CAB0u+0x34u)!=0x8011D3D8u)return false;
+            }
+            return true;
+        }
         ~HudEdgeScope(){for(const auto& p:saved)position(p.widget,p.x,p.y);}
     };
     struct LayoutScope {
         uint32_t engine, previous_engine, previous_sda;
+        bool& defer_host_tail;
         std::array<std::array<uint32_t, 6>, 24> saved{};
         std::array<bool,24> changed{};
         unsigned count()const{return 2*g_netplay_count;}
@@ -1488,8 +1896,8 @@ void hle_netplay_render(PPCContext& ctx) {
             if(native_party_extended())return slot<g_netplay_count?slot:slot<2*g_netplay_count?slot+8-g_netplay_count:slot+16-2*g_netplay_count;
             return slot<g_netplay_count?slot:slot+6-g_netplay_count;
         }
-        LayoutScope(PPCContext& c) : engine(c.r[3]), previous_engine(g_netplay_render_engine),
-            previous_sda(g_netplay_render_sda) {
+        LayoutScope(PPCContext& c,bool& defer) : engine(c.r[3]), previous_engine(g_netplay_render_engine),
+            previous_sda(g_netplay_render_sda),defer_host_tail(defer) {
             for (unsigned slot = 0; slot < count(); ++slot) {
                 if(information_camera(index(slot),engine))continue;
                 changed[slot]=true;
@@ -1501,14 +1909,16 @@ void hle_netplay_render(PPCContext& ctx) {
                 mem_write32(view+0x18, 3); // anchor at the full screen lower-right
             }
             g_netplay_render_engine=engine; g_netplay_render_sda=c.r[13];
+            mark_native_decode_context(2);
         }
         ~LayoutScope() {
-            gx_sync();
+            if(!defer_host_tail)gx_sync();
             for (unsigned slot=0; slot<count(); ++slot)
                 if(changed[slot])
                 for (unsigned i=0; i<6; ++i)
                     mem_write32(native_party_view_engine(engine)+0xDC+index(slot)*76+4+i*4, saved[slot][i]);
             g_netplay_render_engine=previous_engine; g_netplay_render_sda=previous_sda;
+            mark_native_decode_context(3);
         }
     };
     if (frontend_presenting() || !g_netplay_world_ready || ctx.r[3]<0x80000000u || ctx.r[3]>(guest_ram_end()-0x1000u)) {
@@ -1521,13 +1931,13 @@ void hle_netplay_render(PPCContext& ctx) {
         ctx.r[4]=native_party_extended()?0xFF000000u:(mem_read32(0x802ABAD0u)&~0xFu);
         ssne_call_original(ctx,game_address(0x80117434),g_netplay_render_original);return;
     }
-    LayoutScope scope(ctx);
+    LayoutScope scope(ctx,defer_host_tail);
     HudEdgeScope hud_edges(ctx);
     struct ClientPresentationScope {
-        PPCContext& context;
-        explicit ClientPresentationScope(PPCContext& c):context(c){if(g_game_render_begin)g_game_render_begin(c);}
-        ~ClientPresentationScope(){gx_sync();if(g_game_render_end)g_game_render_end(context);}
-    } client_presentation(ctx);
+        PPCContext& context;bool& defer_host_tail;
+        explicit ClientPresentationScope(PPCContext& c,bool& defer):context(c),defer_host_tail(defer){if(g_game_render_begin)g_game_render_begin(c);}
+        ~ClientPresentationScope(){if(!defer_host_tail)gx_sync();if(g_game_render_end)g_game_render_end(context);}
+    } client_presentation(ctx,defer_host_tail);
     // Zero is the original movie path: world, weapons and HUD are disabled.
     // Expanding that mask to every party viewport draws gameplay behind Bink.
     if(native_party_extended() && ctx.r[4] && !native_movie_presenting())ctx.r[4]=0xFFFFFFFFu;
@@ -1541,7 +1951,10 @@ void hle_netplay_render(PPCContext& ctx) {
         uint32_t information=0;for(const auto& [slot,camera]:g_information_cameras)if(information_camera(slot))information|=1u<<slot;
         ctx.r[4]&=shared|information|(native_cutscene_presenting()?0u:own);
     }
+    ctx.r[4]=native_spectator_filter_render_mask(ctx.r[4]);
     ssne_call_original(ctx, game_address(0x80117434), g_netplay_render_original);
+    defer_host_tail=!sdk_nested_render && host_frame_pipeline_ready(scope.engine,ctx.r[13]) && hud_edges.restore_async_safe();
+    if(defer_host_tail){g_host_render_tail_pending=true;g_host_frame_dispatch.begin_render(true);}
 }
 
 void install_mouse_aim() {
@@ -1577,31 +1990,9 @@ uint8_t g_pad_sticks[4][4];   // its stick bytes (x, y, sub x, sub y) right afte
 bool g_pad_fix_trace = false;
 int g_pad_passes = 0;         // processing passes since the last PADClamp (trace)
 
-// ---- jump at high frame rates. The controller processing turns the pads into actions, records of 28 bytes at
-// controller + 0x70C * port + 12 + 28 * n: value (float), pressed this pass (+4), held (+8), ..., held time (+0x14);
-// jump is action 0. Each player (split screen: up to four) is latched on its own port. The player's update (800BEEC8) runs the movement controller (player+0x344) in fixed steps of 1/120 s
-// (player+0x23C -> +0x24): the frame time goes into an accumulator (player+0x140), and the physics method (slot 0x34)
-// runs once per whole step, i.e. twice per game frame at 60 fps but only every second to fourth frame above 120 fps.
-// The jump is taken there, from the "pressed" flag, which lasts one processing pass, i.e. one game frame: a press in
-// a frame without a physics step was lost (1 in 10 at 144 fps, 5 in 10 at ~280 fps), and jumping out of water, which
-// takes a press at the edge, failed. The flag is kept set until the player update has run a physics step, in frames
-// the player controls Sam only (no physics runs in the menus), and never longer than 50 ms. (Leaving the water also
-// needed the first step after a controller switch to come early: hle_player_update.)
-constexpr uint32_t kJumpAction = 0;
-constexpr uint32_t kPortBlock = 0x70C;  // the controller processing's data per controller port (actions at +12)
-
-void latch_jump(uint32_t controller) {
-    if (controller < 0x80000000u || controller >= 0x817FF000u - 3 * kPortBlock) return;
-    for (int port = 0; port < 4; port++) {
-        uint32_t pressed = controller + port * kPortBlock + 12 + kJumpAction * 28 + 4;
-        int64_t& latched = g_jump_latched_ms[port];
-        if (mem_read32(pressed)) { latched = now_ms(); continue; }
-        if (latched < 0) continue;
-        if (!g_player_control.load() || now_ms() - latched > 50) { latched = -1; continue; }
-        mem_write32(pressed, 1);
-    }
-}
-
+// Retain only genuine edges in host memory. Replaying action0.pressed is
+// scoped to the original player update, never written after pad processing:
+// the native zero/held0 branch otherwise leaves a synthetic pressed flag set.
 void remember_clamped_pad(uint32_t status) {
     if (status < 0x80000000u || status >= (guest_ram_end()-0x30u)) { g_pad_status = 0; return; }
     for (uint32_t ch = 0; ch < 4; ch++)
@@ -1618,6 +2009,12 @@ void hle_pad_clamp(PPCContext& ctx) {
 }
 
 void hle_pad_process(PPCContext& ctx) {
+    // Restore the previous sample for native hold/repeat edge detection. The
+    // game thread alone owns the guest controller and the temporary GUI copy.
+    if(g_pause_action_bank && ctx.r[3]==g_pause_action_bank){
+        std::memcpy(host_ptr(g_pause_action_bank+controller_actions_offset),g_pause_gui_actions.data(),controller_actions_size);
+        g_pause_action_bank=0;
+    }
     if (g_pad_status) {
         for (uint32_t ch = 0; ch < 4; ch++)
             for (uint32_t k = 0; k < 4; k++) mem_write8(g_pad_status + 12 * ch + 2 + k, g_pad_sticks[ch][k]);
@@ -1644,6 +2041,14 @@ void hle_pad_process(PPCContext& ctx) {
     }
     trace_bank("second");
 
+    if(g_network_pause_gui.load() && !replica_simulation() && g_network_pause_slot==0 &&
+       party_bank==mem_read32(0x802ABA9C) && party_bank>=0x80000000u && party_bank<=guest_ram_end()-0x70Cu){
+        auto* actions=host_ptr(party_bank+controller_actions_offset);
+        std::memcpy(g_pause_gui_actions.data(),actions,controller_actions_size);
+        std::memset(actions,0,controller_actions_size);
+        g_pause_action_bank=party_bank;
+    }
+
     if(g_authoritative_gameplay) {
         static uint64_t samples=0;
         if(++samples%120==0)for(unsigned slot=0;slot<g_netplay_count;++slot) {
@@ -1661,7 +2066,8 @@ void hle_pad_process(PPCContext& ctx) {
       for(unsigned i=0;i<4;++i)line+=" pad="+std::to_string(mem_read16(statuses+12*i))+"/"+std::to_string(int8_t(mem_read8(statuses+12*i+10)))+" controller="+std::to_string(mem_read32(party_bank+i*0x70C))+"/"+std::to_string(mem_read32(party_bank+i*0x70C+4));
       log_message(line);
     }
-    if(!g_netplay_active)latch_jump(party_bank);
+    g_jump_first_bank=party_bank;
+    sample_native_jump_edges();
 }
 
 bool code_matches(uint32_t addr, const uint32_t sig[6]) {
@@ -1910,6 +2316,11 @@ constexpr uint32_t kDamageFields[3] = {0x10, 0x14, 0x28};
 // +0x1C) on, player+0x35C set and flags 0xC000 at player+0x1C (no gravity, no collision), the sticks fly Sam.
 uint32_t g_fly_player = 0, g_fly_saved_allow = 0, g_fly_saved_flags = 0, g_fly_saved_active = 0, g_fly_allow_entry = 0;
 std::atomic<bool> g_flying{false};
+bool local_cheat_flight(uint32_t player) {
+    return g_flying.load() && player==g_fly_player && player>=0x80000000u &&
+        player<=guest_ram_end()-0x790u && mem_read32(player+0x48)==game_address(0x80212268u) &&
+        mem_read32(player+0x35C)!=0 && !(mem_read32(player+0x6C4)>=0x80000000u && mem_read32(player+0x6C4)<guest_ram_end());
+}
 std::atomic<bool> g_cheat_host{false};
 std::atomic<uint32_t> g_cheat_bits{0};  // 1 invulnerable, 2 infinite ammo, 4 all weapons, 8 unlock all, 16 fly
 std::atomic<float> g_cheat_speed{1}, g_cheat_jump{1}, g_cheat_damage{1};
@@ -2104,20 +2515,250 @@ void install_cheats() {
 }
 
 // ---- save states: the request is carried out at the start of the game's frame flip (savestate.cpp).
+// Original UpdateLoadingProgress calls the bar's SetBounds only on ticks that
+// passed its 50 ms throttle. With the presentation hold clear, Render(canvas)
+// and Flip immediately follow. Keep this aspect attached to that GX batch.
+
+// CcBootScene keeps the current still texture at +0x18 and the Bink
+// object separately at +0x1c. Legal, Publisher and TitleScreen all
+// use the original 854-by-480 canvas, including their fades.
+PPCFunc g_boot_update_original = nullptr, g_boot_exit_original = nullptr;
+uint32_t g_boot_update_address = 0, g_boot_exit_address = 0;
+float g_scene_canvas_factor = 1.f;
+bool g_loading_flip_pending = false;
+void set_scene_canvas_factor(float factor) {
+    if (factor == g_scene_canvas_factor) return;
+    g_scene_canvas_factor = factor;
+    if (!g_loading_flip_pending) {
+        gx_sync();
+        g_loading_canvas_factor = factor;
+    }
+}
+void hle_boot_update(PPCContext& ctx) {
+    const uint32_t scene = ctx.r[3];
+    ssne_call_original(ctx, g_boot_update_address, g_boot_update_original);
+    // The logo reaches the top of the title image. Keep the complete authored
+    // frame visible on displays wider than 16:9 as well.
+    const float authored = std::min(g_widescreen.load(), 4.f/3.f);
+    set_scene_canvas_factor(mem_read32(scene + 0x18) ? authored : 1.f);
+}
+void hle_boot_exit(PPCContext& ctx) {
+    set_scene_canvas_factor(1.f);
+    ssne_call_original(ctx, g_boot_exit_address, g_boot_exit_original);
+}
+void install_boot_canvas_aspect() {
+    const bool pal = g_ver == &kVersions[1];
+    g_boot_update_address = pal ? 0x80163578u : 0x801635B4u;
+    g_boot_exit_address = pal ? 0x801634D4u : 0x80163510u;
+    const uint32_t update_sig[]{0x9421FFE8,0x7C0802A6,0xDBE10010,0xBFC10008,
+                                0x9001001C,pal ? 0x812D95E8u : 0x812D95D8u};
+    const uint32_t exit_sig[]{0x9421FFF0,0x7C0802A6,0xBFC10008,0x90010014,0x7C7F1B78,0x3FC0802B};
+    const auto update = ssne_find_func(g_boot_update_address);
+    const auto exit = ssne_find_func(g_boot_exit_address);
+    if (!update || !exit || !code_matches(g_boot_update_address, update_sig) ||
+        !code_matches(g_boot_exit_address, exit_sig) ||
+        mem_read32(g_boot_update_address + 0x1F8) != 0x801F0018) return;
+    const auto prior_update = *ssne_hook_slot(g_boot_update_address);
+    const auto prior_exit = *ssne_hook_slot(g_boot_exit_address);
+    g_boot_update_original = prior_update ? prior_update : update->func;
+    g_boot_exit_original = prior_exit ? prior_exit : exit->func;
+    ssne_install_hook(g_boot_update_address, hle_boot_update);
+    ssne_install_hook(g_boot_exit_address, hle_boot_exit);
+}
+
+
+// NETRICSA keeps the same canvas and selected player while browsing messages,
+// enemies, weapons or the level briefing.
+PPCFunc g_info_select_original = nullptr, g_info_close_original = nullptr;
+uint32_t g_info_select_address = 0, g_info_close_address = 0, g_info_owner = 0;
+bool briefing_range(uint32_t p, unsigned n) {
+    return p >= 0x80000000u && p <= guest_ram_end() - n;
+}
+// The original score menu is also used offline. Remember its owner at
+// OpenMenu so entering gameplay, loading, or opening a different menu on
+// another local player does not widen an unrelated screen.
+uint32_t g_score_gui = 0, g_open_menu_address = 0;
+PPCFunc g_open_menu_original = nullptr;
+bool score_root_linked(uint32_t gui) {
+    if (!briefing_range(gui,0x90) || mem_read32(gui+0x14)) return false;
+    uint32_t node = mem_read32(gui+0x6c);
+    for (unsigned depth=0; depth<32 && briefing_range(node,0x28); ++depth) {
+        const uint32_t definition = mem_read32(node+0x1c);
+        if (briefing_range(definition,4) && mem_read16(definition+2)==0xbc) return true;
+        node=mem_read32(node+8);
+    }
+    return false;
+}
+void score_menu_open(PPCContext& ctx) {
+    const uint32_t gui = ctx.r[3], id = ctx.r[4];
+    ssne_call_original(ctx,g_open_menu_address,g_open_menu_original);
+    if (id==0xbc && score_root_linked(gui)) {
+        g_score_gui=gui;
+        set_scene_canvas_factor(g_widescreen.load());
+    }
+}
+void install_score_canvas_aspect() {
+    const uint32_t address=g_ver==&kVersions[1] ? 0x800F9978u : 0x800F993Cu;
+    const uint32_t signature[]{0x9421FFE8u,0x7C0802A6u,0xBF810008u,0x9001001Cu,0x7C7E1B78u,0x816D89A4u,0xA93E0084u};
+    const auto entry=ssne_find_func(address);
+    if (!entry || !code_matches(address,signature)) return;
+    g_open_menu_address=address;
+    const auto previous=*ssne_hook_slot(address);
+    g_open_menu_original=previous ? previous : entry->func;
+    ssne_install_hook(address,score_menu_open);
+}
+void hle_info_select(PPCContext& ctx) {
+    const uint32_t owner = ctx.r[3];
+    ssne_call_original(ctx, g_info_select_address, g_info_select_original);
+    if (!briefing_range(owner, 0x98) || mem_read32(game_address(0x802DB0E0u)) != 4) return;
+    const uint32_t player = mem_read32(owner + 0x90);
+    if (!briefing_range(player, 0x724) || mem_read32(player + 0x720) != owner) return;
+    if (g_netplay_active ? mem_read32(player + 0x17C) != uint32_t(g_netplay_local_player.load()) :
+        mem_read32(game_address(0x802DB1BCu)) != 0) return;
+    g_info_owner = mem_read32(owner + 0x6C) ? owner : 0;
+    set_scene_canvas_factor(g_info_owner ? g_widescreen.load() : 1.f);
+}
+void hle_info_close(PPCContext& ctx) {
+    if (ctx.r[3] == g_info_owner) {
+        g_info_owner = 0;
+        set_scene_canvas_factor(1.f);
+    }
+    ssne_call_original(ctx, g_info_close_address, g_info_close_original);
+}
+// Each of the original GUI backdrop's nine strips advances by four times its
+// signed speed per retrace. The update receives seconds, but the native loop
+// only passes them to the child sprite; it never uses them for horizontal motion.
+PPCFunc g_backdrop_scroll_original = nullptr;
+uint32_t g_backdrop_scroll_address = 0, g_backdrop_speeds = 0;
+
+void hle_backdrop_scroll(PPCContext& ctx) {
+    const uint32_t layers = mem_read32(ctx.r[3] + 0x3C);
+    const float seconds = float(ctx.ps0[1]);
+    if (layers && std::isfinite(seconds) && seconds >= 0.f) {
+        // The original loop still applies one step and then performs its own
+        // wrap and sprite update. Correct only the distance before that step.
+        // VIGetTvFormat reads this SDA word in both supported SDKs.
+        // Only PAL and debug PAL run at 50 Hz; EURGB60 uses NTSC timing.
+        const uint32_t tv_mode = mem_read32(ctx.r[13] - 0x58FC);
+        const float original_refresh = tv_mode == 1 || tv_mode == 4 ? 50.f : 60000.f / 1001.f;
+        const float extra_step = 4.f * (seconds * original_refresh - 1.f);
+        for (uint32_t i = 0; i < 9; ++i) {
+            const uint32_t parameters = mem_read32(layers + 12*i);
+            const uint32_t position = mem_read32(parameters);
+            const float speed = u2f(mem_read32(g_backdrop_speeds + 4*i));
+            float x = u2f(mem_read32(position));
+            // BGCreate converts (random % 1024) - 512 as unsigned. Recover
+            // negative starting positions before float precision hides motion.
+            if (x > 2147483648.f)
+                x = float(std::remainder(double(x) - 4294967296.,1344.));
+            mem_write32(position, f2u(x + speed * extra_step));
+        }
+    }
+    ssne_call_original(ctx,g_backdrop_scroll_address,g_backdrop_scroll_original);
+}
+
+void install_backdrop_scroll() {
+    const bool pal = g_ver == &kVersions[1];
+    const uint32_t address = pal ? 0x800F78C8u : 0x800F788Cu;
+    const uint32_t signature[]{0x9421FFC0u,0x7C0802A6u,0xDB610018u,0xDB810020u,0xDBA10028u,0xDBC10030u};
+    const auto entry = ssne_find_func(address);
+    if (!entry || !code_matches(address,signature) || mem_read32(address + 0x80) != 0xEC0D06FAu) return;
+    g_backdrop_scroll_address = address;
+    g_backdrop_speeds = pal ? 0x802184D0u : 0x80218550u;
+    const auto prior = *ssne_hook_slot(address);
+    g_backdrop_scroll_original = prior ? prior : entry->func;
+    ssne_install_hook(address,hle_backdrop_scroll);
+}
+
+void install_info_canvas_aspect() {
+    const bool pal = g_ver == &kVersions[1];
+    g_info_select_address = pal ? 0x801024B8u : 0x8010247Cu;
+    g_info_close_address = pal ? 0x801020F8u : 0x801020BCu;
+    const uint32_t select_sig[]{0x9421FFD0,0x7C0802A6,0xDBE10028,0xBF410010,0x90010034,0x7C7D1B78};
+    const uint32_t close_sig[]{0x9421FFF0,0x7C0802A6,0x93E1000C,0x90010014,0x7C7F1B78,0x801F006C};
+    const auto select = ssne_find_func(g_info_select_address);
+    const auto close = ssne_find_func(g_info_close_address);
+    if (!select || !close || !code_matches(g_info_select_address, select_sig) ||
+        !code_matches(g_info_close_address, close_sig)) return;
+    const auto prior_select = *ssne_hook_slot(g_info_select_address);
+    const auto prior_close = *ssne_hook_slot(g_info_close_address);
+    g_info_select_original = prior_select ? prior_select : select->func;
+    g_info_close_original = prior_close ? prior_close : close->func;
+    ssne_install_hook(g_info_select_address, hle_info_select);
+    ssne_install_hook(g_info_close_address, hle_info_close);
+}
+
+PPCFunc g_loading_bounds_original = nullptr;
+uint32_t g_loading_hold_offset = 0;
+uint32_t g_loading_bounds_address = 0, g_loading_bounds_return = 0;
+void hle_loading_bounds(PPCContext& ctx) {
+    if(ctx.lr == g_loading_bounds_return && mem_read32(ctx.r[13] - g_loading_hold_offset) == 0) {
+        const float wide = g_widescreen.load();
+        if(wide > 1.001f) {
+            gx_sync();
+            g_loading_flip_pending = true;
+            g_loading_canvas_factor = wide;
+        }
+    }
+    ssne_call_original(ctx, g_loading_bounds_address, g_loading_bounds_original);
+}
+void install_loading_aspect() {
+    const bool pal = g_ver == &kVersions[1];
+    const uint32_t address = pal ? 0x8011DE88u : 0x8011DED0u;
+    const uint32_t caller = pal ? 0x8014EEFCu : 0x8014EF44u;
+    g_loading_hold_offset = pal ? 0x6B04u : 0x6B0Cu;
+    const uint32_t signature[]{0x81240000,0x81440004,0x7C681B78,0x38600000,0x91280014,0x91480018};
+    const auto bounds = ssne_find_func(address);
+    if(!bounds || !code_matches(address, signature) || mem_read32(caller-4)!=0x4e800021 ||
+       mem_read32(caller)!=(pal ? 0x800D94FCu : 0x800D94F4u) || mem_read32(caller+8)!=0x40820058)return;
+    g_loading_bounds_address = address;
+    g_loading_bounds_return = caller;
+    const auto previous = *ssne_hook_slot(address);
+    g_loading_bounds_original = previous ? previous : bounds->func;
+    ssne_install_hook(address, hle_loading_bounds);
+}
+
 const uint32_t kFlipSig[6] = {0x9421FFE8u, 0x7C0802A6u, 0xBFA1000Cu, 0x9001001Cu, 0x7C7F1B78u, 0x7C9D2378u};
 PPCFunc g_orig_flip = nullptr;
-GameFrameObserver g_game_frame_observer;
 uint64_t g_game_frame_number=0;
 void hle_flip(PPCContext& ctx) {
+    const auto frame=g_game_frame_observer?++g_game_frame_number:g_game_frame_number;
+    const auto engine=ctx.r[3],sda=ctx.r[13];
+    const bool deferred=g_host_frame_dispatch.schedule(frame,host_frame_pipeline_ready(engine,sda));
+    if(!deferred && g_host_render_tail_pending){gx_sync();g_host_render_tail_pending=false;}
     end_player_frame();
     cheats_frame(true);
     perf::detail::Frame perf_frame(perf::detail::GuestFlip);
     CoopHookTimer timer("flip");
-    if(g_game_frame_observer)g_game_frame_observer(ctx,++g_game_frame_number);
+    std::optional<PPCContext> entry_context;if(deferred)entry_context=ctx;
+    if(!deferred && g_game_frame_observer)g_game_frame_observer(ctx,frame);
     if(g_authoritative_gameplay)frame_limit_wait_impl(effective_frame_limit());
     savestate_checkpoint_probe(ctx);
     if(!g_netplay_active)savestate_safe_point(ctx);
     ssne_call_original(ctx, g_ver->flip, g_orig_flip);
+    if(g_loading_flip_pending) {
+        gx_sync();
+        g_loading_flip_pending = false;
+        g_loading_canvas_factor = g_scene_canvas_factor;
+    }
+    if (g_info_owner || g_score_gui) {
+        const bool gameplay = mem_read32(game_address(0x802DB0E0u)) == 4;
+        if (g_info_owner && (!gameplay || !mem_read32(g_info_owner + 0x6C))) g_info_owner = 0;
+        if (g_score_gui && (!gameplay || !score_root_linked(g_score_gui))) g_score_gui = 0;
+        set_scene_canvas_factor(g_info_owner || g_score_gui ? g_widescreen.load() : 1.f);
+    }
+    if(deferred){
+        // This late fence protects every real GX source before fresh native
+        // capture, including unusual SDKFlip render tails. It follows the SDK's
+        // existing CPU work rather than serializing before that work.
+        gx_sync();g_host_render_tail_pending=false;
+        const auto ticket=g_host_frame_dispatch.take(host_frame_pipeline_ready(engine,sda));
+        if(ticket && g_game_frame_observer){
+            struct CallbackScope{CallbackScope(){g_host_frame_callback=true;}~CallbackScope(){g_host_frame_callback=false;}} callback_scope;
+            with_preserved_context(ctx,*entry_context,[&](PPCContext& callback_context){g_game_frame_observer(callback_context,*ticket);});
+            trace_host_frame_pipeline(true,true,false);
+        }else trace_host_frame_pipeline(true,false,true); // No request/cursor was consumed; next flip takes the legacy path.
+    }else trace_host_frame_pipeline(false,false,false);
     cheats_frame(false);
 }
 void install_savestates() {
@@ -2127,6 +2768,11 @@ void install_savestates() {
     if (!ok) { fprintf(stdout, "[ssne] save states: frame flip not found (different game build?)\n"); return; }
     g_orig_flip = f->func;
     ssne_install_hook(g_ver->flip, hle_flip);
+    install_loading_aspect();
+    install_boot_canvas_aspect();
+    install_info_canvas_aspect();
+    install_backdrop_scroll();
+    install_score_canvas_aspect();
     g_control_hooks++;
 }
 
@@ -2158,9 +2804,11 @@ void mouse_aim_add(int port, double yaw, double pitch) {
     g_aim_pitch[port] += pitch;
 }
 void mouse_aim_set_multiplayer(bool enabled) { g_aim_multiplayer = enabled; }
-void set_netplay_step(NetplayStep step) {reset_vehicle_input(bool(step));g_authoritative_gameplay=false;g_netplay_active = bool(step); g_netplay_step = std::move(step); }
+void queue_native_jump_press(unsigned slot){g_native_jumps.queue(slot,uint32_t(now_ms()));}
+void cancel_native_jump_press(unsigned slot){g_native_jumps.cancel(slot);}
+void set_netplay_step(NetplayStep step) {g_native_jumps.cancel_all();reset_vehicle_input(bool(step));g_authoritative_gameplay=false;g_netplay_active = bool(step); g_netplay_step = std::move(step); }
 namespace {void switch_authoritative_sdk(bool);}
-void set_authoritative_gameplay(bool enabled) {reset_vehicle_input(enabled);g_netplay_step={};g_authoritative_gameplay=enabled;g_netplay_active=enabled;switch_authoritative_sdk(enabled);}
+void set_authoritative_gameplay(bool enabled) {g_native_jumps.cancel_all();reset_vehicle_input(enabled);g_netplay_step={};g_authoritative_gameplay=enabled;g_netplay_active=enabled;switch_authoritative_sdk(enabled);}
 void netplay_filter_client_pad(PadState& pad,int port) {
     if (!g_netplay_active) return;
     bool character_selection = false;
@@ -2193,17 +2841,17 @@ void netplay_set_visibility(float horizontal,float vertical) {
 void netplay_set_roster(unsigned count) { g_netplay_count=std::clamp(count,1u,8u); native_party_configure(g_netplay_count); }
 void netplay_set_local_player(int port) { g_netplay_local_player = port; }
 int netplay_local_player() {return g_netplay_local_player.load();}
-bool netplay_render_local() { return g_netplay_render_engine != 0 && !native_movie_presenting(); }
-bool netplay_render_ui() { return g_netplay_render_engine && g_netplay_list_owner >= 0; }
-bool netplay_render_gui_camera() {
+namespace {
+bool live_netplay_render_local() { return g_netplay_render_engine != 0 && !native_movie_presenting(); }
+bool live_netplay_render_ui() { return g_netplay_render_engine && g_netplay_list_owner >= 0; }
+bool live_netplay_render_gui_camera() {
     if(!g_netplay_render_engine)return false;
     const auto view=int32_t(mem_read32(g_netplay_render_sda-0x6D94));
     if(view>=0 && information_camera(unsigned(view)))return true;
     return native_party_extended() ? (view>=16 && view<24) || view==26 || view==27
                                    : (view>=10 && view<14) || view==14 || view==15;
 }
-bool netplay_render_world_camera(){return g_netplay_render_engine && int32_t(mem_read32(g_netplay_render_sda-0x6D94))==g_netplay_local_player.load();}
-bool netplay_render_discard() {
+bool live_netplay_render_discard() {
     if (!g_netplay_render_engine || native_movie_presenting()) return false;
     // A shared movie has no player-owned viewport; its original draw stream
     // must reach every peer, including clients whose local slot is not zero.
@@ -2220,7 +2868,18 @@ bool netplay_render_discard() {
     const int owner = native_party_extended() && slot>=0 && slot<24?slot%8:slot>=6 && slot<6+int(std::min(g_netplay_count,4u)) ? slot-6 : slot>=0 && slot<int(std::min(g_netplay_count,4u)) ? slot : -1;
     return (owner >= 0 && owner != g_netplay_local_player) || (g_netplay_list_owner >= 0 && g_netplay_list_owner != g_netplay_local_player);
 }
+}
+bool netplay_render_world_camera(){return g_netplay_render_engine && int32_t(mem_read32(g_netplay_render_sda-0x6D94))==g_netplay_local_player.load();}
+void gx_mark_native_view_context(uint32_t return_address){mark_native_decode_context(return_address==0x801176D8u?9:10);}
+GxDecodeContext capture_gx_decode_context(){
+    return {live_netplay_render_discard(),live_netplay_render_local(),live_netplay_render_ui(),live_netplay_render_gui_camera(),mem_read32(game_address(0x802DB0E0u))==3};
+}
+bool netplay_render_local(){if(const auto* c=gx_decode_context_override()){if(verify_gx_decode_context())verify_gx_decode_value(c->local,live_netplay_render_local(),1);return c->local;}return live_netplay_render_local();}
+bool netplay_render_ui(){if(const auto* c=gx_decode_context_override()){if(verify_gx_decode_context())verify_gx_decode_value(c->ui,live_netplay_render_ui(),2);return c->ui;}return live_netplay_render_ui();}
+bool netplay_render_gui_camera(){if(const auto* c=gx_decode_context_override()){if(verify_gx_decode_context())verify_gx_decode_value(c->gui_camera,live_netplay_render_gui_camera(),3);return c->gui_camera;}return live_netplay_render_gui_camera();}
+bool netplay_render_discard(){if(const auto* c=gx_decode_context_override()){if(verify_gx_decode_context())verify_gx_decode_value(c->discard,live_netplay_render_discard(),0);return c->discard;}return live_netplay_render_discard();}
 void netplay_reset_world() {
+    g_native_jumps.cancel_all();
     g_netplay_world_ready = false;
     reset_vehicle_input(g_netplay_active.load());
     for (int port=0;port<8;++port) { g_netplay_players[port]=0; g_netplay_player_types[port]=0; }
@@ -2262,7 +2921,40 @@ void netplay_mouse(int port, double yaw, double pitch) {
 bool mouse_aim_available() { return g_orig_look != nullptr; }
 bool mouse_aim_active() { const int port=std::clamp(g_netplay_active?g_netplay_local_player.load():g_kbm_port.load(),0,7); return g_orig_look && (g_replica_control_active || now_ms() - g_aim_last_ms[port].load() < 200); }
 bool local_information_open() {return g_authoritative_gameplay && g_authoritative_information_open;}
-bool local_pause_menu_open() {return g_replica_pause_menu_open.load() || native_replica_results_presenting();}
+void forget_network_pause_panel(PPCContext& c,uint32_t gui){
+    const auto owner=g_network_pause_gui.load();
+    if(!owner || (gui && owner!=gui))return;
+    mem_write32(c.r[13]-0x765Cu,mem_read32(c.r[13]-0x765Cu)&~(1u<<g_network_pause_slot));
+    g_network_pause_gui=0;g_pause_action_bank=0;
+}
+void prepare_network_pause_panel(PPCContext& c){
+    if(!g_authoritative_gameplay || !netplay_world_ready() || mem_read32(game_address(0x802DB0E0u))!=4)return;
+    if(c.r[4]==0xBC){forget_network_pause_panel(c);return;} // The shared results screen owns its original pause.
+    if(c.r[4]!=0x129 || g_network_pause_gui.load())return;
+    const unsigned slot=unsigned(netplay_local_player());
+    if(slot>=native_party_capacity())return;
+    const auto actor=mem_read32(native_party_registry()+slot*4),gui=c.r[3];
+    if(!native_jump_actor(actor) || gui<0x80000000u || gui>guest_ram_end()-0x104u ||
+       mem_read32(actor+0x71C)!=gui || int16_t(mem_read16(gui+0x84))!=int(slot))return;
+    const auto mask=c.r[13]-0x765Cu,bit=1u<<slot;
+    // CcGUI's pause-root callback sets its background colour on open. The
+    // normal global pause constructs those native tracks for every GUI.
+    // Create them only for this owner, before the callback can use them.
+    auto background=c;
+    background.msr&=~0x8000u;
+    background.r[1]-=0x200;
+    mem_write32(background.r[1],c.r[1]);
+    background.r[3]=gui;
+    background.r[4]=3; background.r[5]=5; background.r[6]=8;
+    background.ps0[1]=background.ps1[1]=u2f(mem_read32(0x802183C4u));
+    ssne_call(background,0x800F6E94u);
+    if(mem_read32(mask)&bit)return; // The spectator and map-transfer panels already own their local GUI.
+    // Original OpenMenu now enters its per-player tail, skipping the global
+    // pause that otherwise stops the host world and opens every player's GUI.
+    mem_write32(mask,mem_read32(mask)|bit);
+    g_network_pause_slot=slot;g_network_pause_gui=gui;
+}
+bool local_pause_menu_open() {return g_network_pause_gui.load() || g_replica_pause_menu_open.load() || native_spectator_menu_open() || native_replica_results_presenting();}
 
 bool player_control_active() { return (mouse_aim_active() || player_in_vehicle()) && (!g_netplay_active || (!local_pause_menu_open() && !local_information_open())); }
 bool player_in_vehicle() {
@@ -2283,7 +2975,17 @@ namespace { std::atomic<bool> g_paused{false}; }
 void set_game_tick_observer(GameFrameObserver observer){g_game_tick_observer=std::move(observer);g_game_tick_number=0;}
 void set_game_render_observer(std::function<void(PPCContext&)> begin,std::function<void(PPCContext&)> end){g_game_render_begin=std::move(begin);g_game_render_end=std::move(end);}
 void set_native_hud_list_observer(NativeHudListObserver observer){g_native_hud_list_observer=observer;}
-void set_game_frame_observer(GameFrameObserver observer){g_game_frame_observer=std::move(observer);g_game_frame_number=0;}
+void set_host_frame_pipeline_gate(const void* owner,std::function<bool()> gate){
+    if(g_host_render_tail_pending){gx_sync();g_host_render_tail_pending=false;}
+    g_host_frame_dispatch.clear();g_host_frame_gate_owner=owner;g_host_frame_gate=std::move(gate);
+}
+void clear_host_frame_pipeline_gate(const void* owner){
+    if(g_host_frame_gate_owner!=owner)return;
+    if(g_host_render_tail_pending){gx_sync();g_host_render_tail_pending=false;}
+    g_host_frame_dispatch.clear();g_host_frame_gate={};g_host_frame_gate_owner=nullptr;
+}
+bool host_frame_pipeline_callback(){return g_host_frame_callback;}
+void set_game_frame_observer(GameFrameObserver observer){if(g_host_render_tail_pending){gx_sync();g_host_render_tail_pending=false;}g_host_frame_dispatch.clear();g_game_frame_observer=std::move(observer);g_game_frame_number=0;}
 void set_paused(bool p) { g_paused = p; }
 bool paused() { return g_paused.load(); }
 
@@ -2312,6 +3014,7 @@ void frame_limit_wait_impl(int lim){
 
 #include "native_skinning.inc"
 #include "native_render_paths.inc"
+#include "native_opacity_coverage.inc"
 #include "native_model_update.inc"
 #include "native_render_list.inc"
 #include "native_animation_pose.inc"
@@ -2370,9 +3073,21 @@ void install_network_sdk_hooks(){
             const auto* viewport=ssne_find_func(0x801179BC);
             if(!viewport || mem_read32(viewport->address)!=0x9421FF80u)fatal("Native viewport diagnostic revision unsupported.");
             g_authoritative_viewport_original=viewport->func;ssne_install_hook(viewport->address,hle_authoritative_viewport);
+            if(gx_scoped_context_enabled()){
+                const auto* prepare=ssne_find_func(0x8013F5A0u);
+                if(!prepare || mem_read32(prepare->address)!=0x9421FFE8u)fatal("Native scoped GX scene-prepare revision unsupported");
+                const auto previous=*ssne_hook_slot(prepare->address);
+                g_decode_prepare_original=previous?previous:prepare->func;
+                ssne_install_hook(prepare->address,hle_decode_scene_prepare);
+            }
             const auto* proxy_draw=ssne_find_func(0x8013D4D0u);
             if(!proxy_draw || mem_read32(proxy_draw->address)!=0x9421FF80u)fatal("Native render proxy revision unsupported.");
-            g_authoritative_proxy_draw_original=proxy_draw->func;ssne_install_hook(proxy_draw->address,hle_authoritative_proxy_draw);
+            const auto previous_proxy_draw=*ssne_hook_slot(proxy_draw->address);
+            if(previous_proxy_draw!=hle_authoritative_proxy_draw){
+                g_authoritative_proxy_draw_original=previous_proxy_draw?previous_proxy_draw:proxy_draw->func;
+                ssne_install_hook(proxy_draw->address,hle_authoritative_proxy_draw);
+            }
+            install_held_pistol_winding();
 
         }
         if (!ssne_find_func(game_address(0x801C193C)) || mem_read32(game_address(0x801C193C)) != 0x7C0802A6u)
@@ -2437,6 +3152,19 @@ void install_authoritative_game_hooks(){
             if(!camera_setter || mem_read32(camera_setter->address)!=0x1C84004Cu)fatal("Unsupported native widget camera setter.");
             g_information_camera_setter=camera_setter->func;ssne_install_hook(camera_setter->address,hle_information_camera_set);
             const auto* pause=ssne_find_func(0x80155BC8);
+            const auto* menu_colour=ssne_find_func(0x800F73E8u);
+            if(!menu_colour || mem_read32(menu_colour->address)!=0x3D208021u || mem_read32(menu_colour->address+4)!=0x81630034u)
+                fatal("Unsupported native menu background colour routine");
+            g_network_gui_colour_original=menu_colour->func;ssne_install_hook(menu_colour->address,hle_network_gui_colour);
+            const auto* menu_input=ssne_find_func(0x800F664Cu);
+            const auto* menu_close=ssne_find_func(0x800F9A00u);
+            const auto* information_event=ssne_find_func(0x80102CF0u);
+            if(!information_event || mem_read32(information_event->address)!=0x9421FFE8u)fatal("Unsupported native information event dispatcher");
+            g_network_information_event_original=information_event->func;ssne_install_hook(information_event->address,hle_network_information_event);
+            if(!menu_input || !menu_close || mem_read32(menu_input->address)!=0x9421FFA8u || mem_read32(menu_close->address)!=0x9421FFF0u)
+                fatal("Unsupported native session menu controller");
+            g_network_gui_input_original=menu_input->func;ssne_install_hook(menu_input->address,hle_network_gui_input);
+            g_network_gui_close_original=menu_close->func;ssne_install_hook(menu_close->address,hle_network_gui_close);
             if(pause && mem_read32(pause->address)==0x9421FFF8u){g_authoritative_pause_original=pause->func;ssne_install_hook(pause->address,hle_authoritative_pause);}
 
 }
@@ -2453,7 +3181,7 @@ void switch_authoritative_sdk(bool enabled){
             for(size_t i=0;i<g_ssne_func_count;++i){const auto address=g_ssne_funcs[i].address;const auto after=*ssne_hook_slot(address);if(before[i]!=after)authority_hooks.push_back({address,before[i],after});}
         }catch(...){for(size_t i=0;i<g_ssne_func_count;++i)ssne_install_hook(g_ssne_funcs[i].address,before[i]);authority_hooks.clear();throw;}
     }else for(const auto& hook:authority_hooks)ssne_install_hook(hook.address,enabled?hook.network:hook.offline);
-    dynamic_authority=enabled;g_netplay_world_ready=false;g_replica_pause_menu_open=false;g_authoritative_information_open=false;g_replica_control_active=false;g_host_information_z_consumed=false;
+    dynamic_authority=enabled;g_netplay_world_ready=false;g_network_pause_gui=0;g_pause_action_bank=0;g_replica_pause_menu_open=false;g_authoritative_information_open=false;g_replica_control_active=false;g_host_information_z_consumed=false;
     if(!enabled){g_netplay_character_guis.clear();g_netplay_random_streams.clear();}
     log_message(std::string("[native-network-runtime] active=")+(enabled?"1":"0")+" hooks="+std::to_string(authority_hooks.size()));
 }
@@ -2505,6 +3233,7 @@ void install_sdk_hooks() {
     }
     fprintf(stdout, "[ssne] installed %d native SDK replacements\n", n);
     if (!no_game_hooks) {
+        install_movie_presentation();
         install_frame_limiter();
         install_vehicle_detector();
         install_mouse_aim();
@@ -2529,6 +3258,9 @@ void install_sdk_hooks() {
         install_replica_simulation_hooks();
         native_skinning::install();
         native_render_paths::install();
+        native_opacity_coverage::install();
+    install_native_survival();
+    install_native_session_hud();
         native_model_update::install();
         native_render_list_adapter::install();
         native_animation_pose::install();
@@ -2561,11 +3293,15 @@ float fov() { return g_fov.load(); }
 
 void set_widescreen(float factor) { g_widescreen = factor < 1.0f ? 1.0f : factor; }
 float widescreen() { return g_widescreen.load(); }
-float widescreen_frame_factor() { return g_frame_factor.load(); }
+float loading_canvas_factor() { return g_loading_canvas_factor.load(); }
+float widescreen_frame_factor() {
+    const float loading = loading_canvas_factor();
+    return loading > 1.f ? loading : g_frame_factor.load();
+}
 bool widescreen_frame_zoomed() { return g_netplay_active?zoomed_in():g_frame_zoom.load(); }
 double game_time() { return g_game_time.load(); }
 void set_split_two(int mode) { g_split_two = mode < 0 ? -1 : std::min(mode, 1); }
-bool frontend_presenting() { return mem_read32(game_address(0x802DB0E0u))==3; }
+bool frontend_presenting() { if(const auto* c=gx_decode_context_override()){if(verify_gx_decode_context())verify_gx_decode_value(c->frontend,mem_read32(game_address(0x802DB0E0u))==3,4);return c->frontend;}return mem_read32(game_address(0x802DB0E0u))==3; }
 
 } // namespace ssne
 

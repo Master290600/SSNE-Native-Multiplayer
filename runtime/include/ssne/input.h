@@ -20,6 +20,11 @@ struct PadState {
 
 // Logical game inputs 0..7. Values above 3 never alias the four SI hardware channels.
 void set_pad(int port, const PadState& state);
+// A fresh on-foot jump edge, including a complete keyboard tap between pad
+// samples. Thread-safe; retained at most50ms and consumed by native physics.
+// This does not change held/analog inputs, fire, menu confirm or flight axes.
+void queue_native_jump_press(unsigned slot);
+void cancel_native_jump_press(unsigned slot);
 // Whether a controller is plugged into a port (ports 2-4, index 1-3; port 1 is always connected): the game sees the
 // others as empty (multiplayer: one per player).
 void set_pad_connected(int port, bool on);

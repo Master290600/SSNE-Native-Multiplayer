@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the public SSNE-Native release: launcher, gctool, build kit (translator + prebuilt PC port, no
+# Builds the public SSNE-RECOOP-Native release: launcher, gctool, build kit (translator + prebuilt PC port, no
 # game code), licenses and the source tree. Game code is never included: the port is configured without
 # SSNE_RECOMPILED_DIR and players build the game on their own PC from their own disc.
 #
@@ -24,11 +24,12 @@ cmake --build "$BUILD" --target ssne-launcher gctool ssne-recomp ssne-port
 
 STRIP=$LLVM/bin/llvm-strip
 rm -rf "$OUT"; mkdir -p "$OUT/build-kit/lib/port" "$OUT/build-kit/include" "$OUT/licenses"
-cp "$BUILD/bin/SSNE-Native.exe" "$BUILD/bin/gctool.exe" "$ROOT/data/known_dumps.txt" "$OUT/"
-cp "$BUILD/bin/ssne-recomp.exe" "$ROOT/data/symbols/G3BE9G_r1.sym" "$ROOT/data/symbols/G3BP9G_r0.sym" "$ROOT/data/kit/kit.ini" "$OUT/build-kit/"
-"$STRIP" "$OUT/SSNE-Native.exe" "$OUT/gctool.exe" "$OUT/build-kit/ssne-recomp.exe"
+cp "$BUILD/bin/SSNE-RECOOP-Native.exe" "$BUILD/bin/gctool.exe" "$ROOT/data/known_dumps.txt" "$OUT/"
+cp "$BUILD/bin/build-kit/SSNE-RECOOP-Native.exe" "$ROOT/data/symbols/G3BE9G_r1.sym" "$ROOT/data/symbols/G3BP9G_r0.sym" "$ROOT/data/kit/kit.ini" "$OUT/build-kit/"
+"$STRIP" "$OUT/SSNE-RECOOP-Native.exe" "$OUT/gctool.exe" "$OUT/build-kit/SSNE-RECOOP-Native.exe"
 cp -r "$ROOT/runtime/include/ssne" "$OUT/build-kit/include/"
 for f in main settings settings_menu png_write; do cp "$BUILD/CMakeFiles/ssne-port.dir/port/src/$f.cpp.obj" "$OUT/build-kit/lib/port/$f.obj"; done
+"$LLVM/bin/x86_64-w64-mingw32-windres" -I "$ROOT/port/resources" -i "$ROOT/port/resources/game.rc" -O coff -o "$OUT/build-kit/lib/port/game-icon.obj"
 cp "$BUILD/libssne-runtime.a" "$BUILD/libimgui.a" "$BUILD/libgc.a" "$OUT/build-kit/lib/"
 cp "$BUILD/_deps/sdl2-build/libSDL2main.a" "$BUILD/_deps/sdl2-build/libSDL2.a" "$OUT/build-kit/lib/"
 "$STRIP" -g "$OUT"/build-kit/lib/*.a "$OUT"/build-kit/lib/port/*.obj

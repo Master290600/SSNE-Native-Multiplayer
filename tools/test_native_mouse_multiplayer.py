@@ -111,7 +111,7 @@ def model_change(p,role):
 
 
 def host_create(p):
- p.expect_root(0x3d);screenshot(p,'host');p.click(0x3f,root=0x3d);page(p,1);p.click(0x14a);page(p,2);p.click(0x14a)
+ p.expect_root(0x3d);screenshot(p,'host');p.click(0x15c,root=0x3d);page(p,1);p.click(0x14b)
  p.m.wait(lambda:p.m.state().get('active'),25);p.expect_root(0xa7);screenshot(p,'host');p.click(0xa9,root=0xa7);p.expect_root(0x59);p.m.delay(.6);screenshot(p,'host')
  start=None
  for candidate in (0x5d,'footer.start','footer.confirm'):
@@ -127,16 +127,16 @@ def host_create(p):
  else:p.report['mouse_rules_start_proven']=True
  record(p,'host_created_through_original_mouse_menus',rules_start_control=start,state=public_menu(p.m.state()))
  # Exercise authoritatively managed bots, then restore exactly two human slots.
- p.click(0x154,root=0x9a);page(p,6);before=p.m.state().get('bots');p.click(0x14a);p.m.wait(lambda:p.m.state().get('bots')==before+1,15)
+ p.click(0x154,root=0x9a);page(p,15);p.click(0x14d);page(p,6);before=p.m.state().get('bots');p.click(0x14a);p.m.wait(lambda:p.m.state().get('bots')==before+1,15)
  skill=p.m.state().get('skill');p.click(0x14b);p.m.wait(lambda:p.m.state().get('skill')!=skill,10)
- p.click(0x14c);p.m.wait(lambda:p.m.state().get('bots')==before,15);p.click(0x14d);wait_lobby(p)
+ p.click(0x14c);p.m.wait(lambda:p.m.state().get('bots')==before,15);p.click(0x14d);page(p,15);p.click(0x155);wait_lobby(p)
  assert p.m.state().get('bots')==0,public_menu(p.m.state())
  record(p,'host_lobby_bot_add_skill_remove_by_mouse',bots_restored=0)
 
 
 def client_join_and_roles(p):
  p.m.start_role('client',p.m.a.client_language);p.m.wait(lambda:p.m.mouse('client').get('surfaces') and p.m.mouse_ack('client').get('image_rect'),20)
- p.command('client','cancel');screenshot(p,'client');p.click(0x3f,'client',root=0x3d);page(p,1,'client');p.click(0x14b,'client');page(p,3,'client');p.click(0x14d,'client');page(p,8,'client')
+ p.command('client','cancel');screenshot(p,'client');p.click(0x15c,'client',root=0x3d);page(p,1,'client');p.click(0x14a,'client');page(p,3,'client');p.click(0x14b,'client');page(p,8,'client')
  p.m.wait(lambda:p.m.state('client').get('rooms',0)>0,20);p.m.delay(.8);screenshot(p,'client');p.click(0x14a,'client')
  p.m.wait(lambda:p.m.state('client').get('active') and p.m.state().get('players')==2,40);wait_lobby(p,'host');wait_lobby(p,'client');synchronized_models(p)
  assert ident(lobby_state(p,'host')['own'])==0

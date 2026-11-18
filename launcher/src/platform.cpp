@@ -90,6 +90,36 @@ std::string open_file_dialog(const char* title) {
 #endif
 }
 
+std::string open_png_dialog(const char* title) {
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH * 4] = L"";
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = L"PNG image (*.png)\0*.png\0";
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = sizeof(buf) / sizeof(buf[0]);
+    const auto caption = widen(title);
+    ofn.lpstrTitle = caption.c_str();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameW(&ofn) ? narrow(buf) : std::string{};
+#else
+    (void)title;
+    for (const auto* command : {"zenity --file-selection --title='Select level preview' --file-filter='PNG image | *.png' 2>/dev/null", "kdialog --getopenfilename . '*.png' 2>/dev/null"}) {
+        FILE* stream = popen(command, "r");
+        if (!stream) continue;
+        char value[4096]{};
+        const bool read = fgets(value, sizeof(value), stream) != nullptr;
+        pclose(stream);
+        if (read) {
+            std::string path(value);
+            while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+            if (!path.empty()) return path;
+        }
+    }
+    return {};
+#endif
+}
+
 std::string exe_dir() {
 #ifdef _WIN32
     wchar_t buf[MAX_PATH * 4];
@@ -262,9 +292,9 @@ bool download(const std::string& url, const std::string& path,
     uc.lpszHostName = host; uc.dwHostNameLength = 256;
     uc.lpszUrlPath = urlpath; uc.dwUrlPathLength = 2048;
     if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) { error = "bad URL"; return false; }
-    HINTERNET ses = WinHttpOpen(L"SSNE-Native-Launcher", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    HINTERNET ses = WinHttpOpen(L"SSNE-RECOOP-Native", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses) ses = WinHttpOpen(L"SSNE-Native-Launcher", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    if (!ses) ses = WinHttpOpen(L"SSNE-RECOOP-Native", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!ses) { error = "WinHttpOpen failed"; return false; }
     {   // Windows 7 / 8.0: WinHTTP offers only TLS 1.0 by default (GitHub needs 1.2; KB3140245 adds it). Asking for

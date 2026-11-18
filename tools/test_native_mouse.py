@@ -61,7 +61,7 @@ class Pointer:
  def command(self,role,action):
   before_native=self.m.mouse(role);before_ack=self.ack(role)
   seq=self.sequences.get(role,0)+1;self.sequences[role]=seq
-  path=self.m.folder/role/COMMAND_FILE;pending=path.with_suffix('.pending');pending.write_text(str(seq)+' '+action+'\n',encoding='ascii')
+  path=self.m.folder/role/COMMAND_FILE;pending=path.with_suffix('.pending');pending.write_text(str(seq)+' '+action+'\n',encoding='utf8')
   # Windows can deny replacement during the consumer's brief ifstream read.
   # Retry transport publication only; never repeat a native pointer intent.
   deadline=time.monotonic()+2;retries=0
@@ -220,7 +220,7 @@ def main_smoke(p):
  # Current native keyboard focus starts at a different row; real coordinates
  # must choose Options rather than blindly selecting that existing focus.
  initial=p.m.state().get('native_focus');assert initial!=0x41,('Need different initial focus for hit proof',initial)
- for item in (0x3e,0x3f,0x40,0x41,0x42):
+ for item in (0x3e,0x3f,0x15c,0x40,0x41,0x42,0x15a):
   widget=p.widget(item,root=0x3d,allowed=False)
   if widget.get('selectable') and widget.get('allowed'):p.hover(item,root=0x3d)
   else:p.no_action(p.center(widget),label='native_noninteractive_'+hex(item))
@@ -340,26 +340,29 @@ def credits_tests(p):
 
 
 def frontend_tests(p):
- p.expect_root(0x3d);p.click(0x3f);p.m.wait(lambda:p.m.state().get('page')==1)
- for row in range(0x14a,0x14e):p.hover(row)
- p.blank();p.click(0x14a);p.m.wait(lambda:p.m.state().get('page')==2)
- p.click(0x14b);p.m.wait(lambda:p.m.state().get('editing')==2)
+ p.expect_root(0x3d);p.click(0x15c);p.m.wait(lambda:p.m.state().get('page')==1)
+ for row in range(0x14a,0x14d):p.hover(row)
+ p.blank();p.click(0x14c);p.m.wait(lambda:p.m.state().get('page')==14)
+ p.click(0x165);p.m.wait(lambda:p.m.state().get('page')==2)
+ p.click(0x14a);p.m.wait(lambda:p.m.state().get('editing')==2)
  # Text queue coverage is explicitly limited to native editing after a mouse
  # focus; this does not claim SDL_TEXTINPUT dispatch until that shim exists.
  p.m.command('host','text 123456');p.m.command('host','key 1');p.m.wait(lambda:p.m.state().get('editing')==0)
- p.click(0x14c);p.m.wait(lambda:p.m.state().get('editing')==3);p.m.command('host','text '+str(p.m.a.port));p.m.command('host','key 1')
+ p.click(0x14b);p.m.wait(lambda:p.m.state().get('editing')==3);p.m.command('host','text '+str(p.m.a.port));p.m.command('host','key 1')
  p.report['steps'].append({'action':'pointer_focus_native_text_queue','fields':['pin','port'],'scope':'Mouse focus and native text queue only; not SDL text event injection.'})
- p.click(0x14d);p.m.wait(lambda:p.m.state().get('page')==1);p.click(0x14b);p.m.wait(lambda:p.m.state().get('page')==3)
+ p.click(0x14d);p.m.wait(lambda:p.m.state().get('page')==14);p.back();p.m.wait(lambda:p.m.state().get('page')==1)
+ p.click(0x14a);p.m.wait(lambda:p.m.state().get('page')==3);p.click(0x14c);p.m.wait(lambda:p.m.state().get('page')==16)
  p.click(0x14a);p.m.wait(lambda:p.m.state().get('editing')==1);p.m.command('host','text localhost');p.m.command('host','key 1')
  p.click(0x14b);p.m.wait(lambda:p.m.state().get('editing')==2);p.m.command('host','text 12345');p.m.command('host','key 1')
- p.click(0x14c);p.m.wait(lambda:p.m.state().get('page')==5);p.click(0x14c);p.m.wait(lambda:p.m.state().get('editing')==2);p.m.command('host','key 2')
- p.click(0x14d);p.m.wait(lambda:p.m.state().get('page')==8);p.m.delay(2);p.disabled();p.back();p.m.wait(lambda:p.m.state().get('page')==3)
- p.back();p.m.wait(lambda:p.m.state().get('page')==1);p.click(0x14d);p.expect_root(0x3d)
+ p.click(0x14d);p.m.wait(lambda:p.m.state().get('page')==5);p.click(0x14b);p.m.wait(lambda:p.m.state().get('page')==16)
+ p.click(0x14b);p.m.wait(lambda:p.m.state().get('editing')==2);p.m.command('host','key 2')
+ p.back();p.m.wait(lambda:p.m.state().get('page')==3);p.click(0x14b);p.m.wait(lambda:p.m.state().get('page')==8);p.m.delay(2);p.disabled();p.back();p.m.wait(lambda:p.m.state().get('page')==3)
+ p.back();p.m.wait(lambda:p.m.state().get('page')==1);p.back();p.expect_root(0x3d)
 
 
 def local_mode_tests(p):
  for mode in (0xa9,0xaa,0xab,0xac):
-  p.expect_root(0x3d);p.click(0x3f);p.m.wait(lambda:p.m.state().get('page')==1);p.click(0x14c);p.expect_root(0xa7)
+  p.expect_root(0x3d);p.click(0x3f);p.expect_root(0xa7)
   p.click(mode);p.m.wait(lambda:p.m.state().get('native_root')!=0xa7)
   assert not p.m.state().get('active'),public_menu(p.m.state())
   p.report['steps'].append({'action':'original_local_mode_open','mode_id':mode,'menu':public_menu(p.m.state())})
@@ -370,8 +373,7 @@ def local_mode_tests(p):
 
 
 def local_roster_tests(p):
- p.expect_root(0x3d);p.click(0x3f,root=0x3d);p.m.wait(lambda:p.m.state().get('page')==1)
- p.click(0x14c);p.expect_root(0xa7);p.click(0xa9,root=0xa7);p.expect_root(0x59);p.m.delay(.6);p.m.press('host','UISHOT')
+ p.expect_root(0x3d);p.click(0x3f,root=0x3d);p.expect_root(0xa7);p.click(0xa9,root=0xa7);p.expect_root(0x59);p.m.delay(.6);p.m.press('host','UISHOT')
  p.click(0x5d,root=0x59);p.expect_root(0x9a);p.m.delay(.8);p.m.press('host','UISHOT')
  assert not p.m.state().get('active'),('Local roster unexpectedly opened a network session',public_menu(p.m.state()))
  def port0_roster():return any(ident(surface['root'])==0xa0 and ident(surface.get('port',999))==0 for surface in p.observe().get('surfaces',[]))

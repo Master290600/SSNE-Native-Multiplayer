@@ -58,11 +58,14 @@ public:
     Digest finish(){Digest result{};if(api().finish(hash_,result.data(),ULONG(result.size()),0)<0)throw std::runtime_error("SHA-256 finalization failed");return result;}
 };
 inline Digest digest(const std::vector<uint8_t>& bytes,size_t size){Sha256 h;h.add(bytes.data(),size);return h.finish();}
-inline Digest hash_file(const std::filesystem::path& path){
+inline Digest hash_file(const std::filesystem::path& path,const std::atomic<bool>* cancelled=nullptr){
     const auto size=std::filesystem::file_size(path);const auto stamp=std::filesystem::last_write_time(path);
     std::ifstream file(path,std::ios::binary);if(!file)throw std::runtime_error("Cannot read checkpoint identity file");
     Sha256 h;std::array<char,65536> block{};uint64_t read=0;
-    while(file){file.read(block.data(),block.size());const auto n=file.gcount();h.add(block.data(),size_t(n));read+=uint64_t(n);}
+    while(file){
+        if(cancelled && cancelled->load(std::memory_order_relaxed))throw std::runtime_error("Checkpoint identification cancelled");
+        file.read(block.data(),block.size());const auto n=file.gcount();h.add(block.data(),size_t(n));read+=uint64_t(n);
+    }
     if(!file.eof() || read!=size || std::filesystem::file_size(path)!=size || std::filesystem::last_write_time(path)!=stamp)throw std::runtime_error("Checkpoint identity file changed while reading");
     return h.finish();
 }
@@ -71,17 +74,20 @@ struct Identity {
     uint32_t game=0,ram=0,capacity=0,protocol=wire::version;
     bool operator==(const Identity&)const=default;
 };
-inline Identity identify(const std::filesystem::path& data_root){
+inline Identity identify(const std::filesystem::path& data_root,const std::atomic<bool>* cancelled=nullptr){
     std::array<wchar_t,32768> exe{};const auto n=GetModuleFileNameW(nullptr,exe.data(),DWORD(exe.size()));
     if(!n || n>=exe.size())throw std::runtime_error("Cannot locate current game build");
-    Identity id;id.executable=hash_file(std::filesystem::path(exe.data()));
+    Identity id;id.executable=hash_file(std::filesystem::path(exe.data()),cancelled);
     // Bind to actual contents, not timestamps or paths on this computer.
     std::vector<std::filesystem::path> paths;
-    for(const auto& entry:std::filesystem::recursive_directory_iterator(data_root))if(entry.is_regular_file())paths.push_back(entry.path().lexically_relative(data_root));
+    for(const auto& entry:std::filesystem::recursive_directory_iterator(data_root)){
+        if(cancelled && cancelled->load(std::memory_order_relaxed))throw std::runtime_error("Checkpoint identification cancelled");
+        if(entry.is_regular_file())paths.push_back(entry.path().lexically_relative(data_root));
+    }
     std::sort(paths.begin(),paths.end());
     if(paths.empty() || !std::filesystem::is_regular_file(data_root/"sys/main.dol"))throw std::runtime_error("Missing checkpoint game data");
     Sha256 content;
-    for(const auto& path:paths){const auto name=path.generic_u8string();checkpoint::Writer w;w.u64(name.size());content.add(w.bytes.data(),w.bytes.size());content.add(name.data(),name.size());const auto d=hash_file(data_root/path);content.add(d.data(),d.size());}
+    for(const auto& path:paths){const auto name=path.generic_u8string();checkpoint::Writer w;w.u64(name.size());content.add(w.bytes.data(),w.bytes.size());content.add(name.data(),name.size());const auto d=hash_file(data_root/path,cancelled);content.add(d.data(),d.size());}
     id.data=content.finish();return id;
 }
 inline constexpr size_t max_core=128*1024*1024,max_extra=42*1024*1024,header_size=108,max_file=header_size+max_core+max_extra+32;

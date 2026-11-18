@@ -5,6 +5,7 @@
 #include <unordered_map>
 
 #include "gx_internal.h"
+#include "ssne/movie_presentation.h"
 #include "ssne/ppc_context.h"
 
 namespace ssne::gx {
@@ -167,6 +168,9 @@ struct KeyHash {
     }
 };
 std::unordered_map<CacheKey, std::shared_ptr<Texture>, KeyHash> g_cache;
+// Streaming pixels need to survive an in-flight GPU command or software tile
+// job, but have no reason to stay in the static texture cache after their frame.
+decltype(g_cache) g_movie_cache;
 uint64_t g_next_tex_id = 1;
 const Texture* g_bound[8] = {};
 
@@ -198,11 +202,20 @@ void invalidate_textures() {
 
 void texture_cache_clear() {
     g_cache.clear();
+    g_movie_cache.clear();
     for (auto& b : g_bound) b = nullptr;
     g_cfg_dirty = true;
 }
 
 void texture_cache_trim() {
+    if (!g_movie_cache.empty()) {
+        const auto binding = movie_presentation::decoded_texture.load(std::memory_order_acquire);
+        const auto copy = movie_presentation::completed_copy.load(std::memory_order_acquire);
+        const auto expired = std::erase_if(g_movie_cache, [&](const auto& entry) {
+            return !binding || entry.first.addr != uint32_t(copy) || entry.first.sample != uint32_t(copy >> 32);
+        });
+        if (expired) invalidate_textures();
+    }
     if (g_cache.size() > 2048) {
         g_cache.clear();
         for (auto& b : g_bound) b = nullptr;
@@ -263,14 +276,19 @@ const Texture* get_texture(int map) {
     }
     uint32_t total = size;
     for (int k = 1; k <= levels; k++) total += data_size(fmt, std::max(1, w >> k), std::max(1, h >> k));
+    const uint64_t binding = movie_presentation::decoded_texture.load(std::memory_order_acquire);
+    const bool decoder_buffer = binding && !preloaded && !levels && src.addr == uint32_t(binding);
+    const uint64_t copy = decoder_buffer ? movie_presentation::completed_copy.load(std::memory_order_acquire) : 0;
+    const bool streaming = decoder_buffer && src.addr == uint32_t(copy);
+    auto& cache = streaming ? g_movie_cache : g_cache;
     CacheKey key{preloaded ? 0xFFFFFFFFu - (img1 & 0x7FFF) : src.addr, fmt | uint32_t(levels) << 8, uint32_t(w), uint32_t(h),
-                 tlut, fingerprint(src, total, fmt, tlut)};
+                 tlut, streaming ? uint32_t(copy >> 32) : fingerprint(src, total, fmt, tlut)};
     if (prompt_candidate_size(w, h)) key.variant = prompt_variant(key.sample);
-    auto it = g_cache.find(key);
-    if (it == g_cache.end()) {
+    auto it = cache.find(key);
+    if (it == cache.end()) {
         auto t = std::make_shared<Texture>();
         t->w = w; t->h = h;
-        t->id = g_next_tex_id++;
+        t->id = g_next_tex_id++ | (streaming ? movie_presentation::streaming_texture_bit : 0);
         decode(src, fmt, w, h, tlut, t->rgba);
         uint32_t off = size;
         for (int k = 1; k <= levels; k++) {
@@ -285,7 +303,7 @@ const Texture* get_texture(int map) {
         if (prompt_candidate_size(w, h) && levels == 0) {
             key.variant = prompt_apply(*t, key.sample);
         }
-        it = g_cache.insert_or_assign(key, std::move(t)).first;
+        it = cache.insert_or_assign(key, std::move(t)).first;
     }
     g_bound[map] = it->second.get();
     return g_bound[map];

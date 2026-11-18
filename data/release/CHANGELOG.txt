@@ -1,6 +1,12 @@
 SSNE-Native (Serious Sam: Next Encounter Native) - changes since the first public release of Silly ReEncounter
 =========================================================
 
+LOCAL BUILD 226 / PROTOCOL 69 (unpublished)
+  - Clients receive the host's selected Custom Level automatically, including its name and PNG preview.
+  - The original Connecting page shows localized progress and Cancel. Verified maps load without a restart.
+  - DownloadedCustomLevels caches received versions separately; authored packages and original files are preserved.
+  - Matching cached packages skip payload downloads. Changed names/previews and custom-level switches refresh automatically.
+
 After updating, open the launcher and choose "Update Game" once: the game is rebuilt on your PC with the new
 engine (a few minutes, nothing is downloaded except, once, the new compiler - see "Compatibility").
 

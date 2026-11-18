@@ -1,80 +1,14 @@
-SSNE-Native – normaler Launcher mit integriertem Multiplayer (Build 204)
+SSNE-RECOOP-Native 1.2.8 · Multiplayer-Build 242 · Windows x64
 
-Start: SSNE-Native.exe
-Die vorhandene Spielruntime benoetigt einen Installationspfad ohne Umlaute
-oder andere Nicht-ASCII-Zeichen; der bisherige SSNE-Native-Ordner passt.
-1. Eigenes unterstütztes PAL-Disc-Image (G3BP9G) auswählen oder ins Fenster ziehen.
-2. Install Game / Build Game erstellt das vollständige native Spiel inklusive
-   Multiplayer. Der Launcher führt Übersetzung und Multiplayer-Anpassungen
-   selbst aus. Eine zusätzliche Python-Installation ist dafür nicht nötig.
-   Der kostenlose Compiler wird bei Bedarf wie bisher einmal heruntergeladen.
-3. Play startet das Spiel. Dort im Original-Hauptmenü „Mehrspieler“ wählen,
-   um ein Spiel zu erstellen oder beizutreten. Einzelspieler bleibt verfügbar.
-   Für einen zweiten Spieler auf demselben PC SSNE-Native.exe erneut öffnen.
+Spiel installieren
 
-Start-Multiplayer.cmd und Rebuild-Multiplayer.cmd werden nicht benötigt.
-Ein fehlender/überholter Spiel-Build wird auch über Play erstellt und danach
-automatisch gestartet. Rebuild Game erneuert ihn aus den eigenen Spieldaten.
+1. Entpacke das komplette Paket in einen beschreibbaren Ordner, etwa C:\Spiele\SSNE. Verwende einen kurzen Pfad, damit auch vorbereitete Zusatzkarten Platz für ihre Dateinamen haben.
+2. Öffne SSNE-RECOOP-Native.exe und wähle deine eigene europäische GameCube-Disc von Serious Sam: Next Encounter (G3BP9G, Revision 0). Das Spiel lässt sich auch aus einer unterstützten Dolphin-RVZ erstellen.
+3. Wähle „Install Game“ bzw. „Build Game“. Der Launcher entpackt deine Disc-Daten und erstellt SSNE-Native-Game.exe mit dem Spielsymbol im selben Ordner wie der Launcher. Recompiler und Compiler sind im Paket enthalten.
+4. Doppelklicke auf SSNE-Native-Game.exe, um direkt zu spielen. Alternativ kannst du im Launcher auf „Play“ klicken. Den Netzwerk-Multiplayer findest du im Hauptmenü unter „Online“.
 
-Maus-Menues: Ein echter Auswahlwechsel spielt denselben Originalsound wie
-die Tastatur. Bewegungen innerhalb desselben Felds wiederholen ihn nicht.
-Nach einem Update das Spiel neu starten.
+Für die Kartenbearbeitung und einen erneuten Build öffnest du SSNE-RECOOP-Native.exe. Behalte den Ordner Multiplayer mit seinen Laufzeitdateien zusammen mit dem Hauptordner.
 
-Fahrzeuge: Schießen bleibt auf der Feuertaste, Ein-/Aussteigen auf
-„Benutzen“ (standardmäßig E). Das gilt auch für den Host im Koop.
+Offizielle Mehrspieler-Inhalte der PS2-Fassung
 
-Eigene Fadenkreuze im nativen PAL-Spiel:
-PNG-Dateien in crosshairs neben der Spiel-EXE kopieren; beim integrierten
-Multiplayer ist das Multiplayer/crosshairs. Unter F12 > Graphics (Grafik) >
-Fadenkreuz mit „Neu laden“ die Liste aktualisieren, die Textur auswählen und
-„Eigene PNG verwenden“ aktivieren. Vorschau, Größe und Deckkraft helfen bei der
-Anpassung. „Originalfarbe übernehmen“ ist standardmäßig an: Die PNG übernimmt die
-originale Gesundheits-/Zielfarbe. Ausschalten behält ihre eigenen Farben. Bei einer
-weißen PNG ist die Originalfarbe unverfälscht sichtbar. Die Auswahl bleibt lokal
-und wird in den Einstellungen gespeichert.
-„Original-Fadenkreuz verwenden“ oder das Ausschalten stellt das Original wieder her.
-
-Je Bild sind höchstens 1024 Pixel pro Richtung und 4 MiB erlaubt. Ein transparenter
-Hintergrund mit mindestens einem sichtbaren Pixel eignet sich als Fadenkreuz.
-Der sichtbare Alpha-Bereich wird zentriert; die ursprüngliche PNG bleibt unverändert.
-Fehlende, defekte und vollständig transparente Dateien lassen das Original aktiv.
-„Neu laden“ übernimmt auch Änderungen an einer Datei mit unverändertem Namen.
-
-Größe 32 entspricht der originalen Fadenkreuzgröße mit der Skalierung der aktuellen
-Waffe und Spieleransicht. 14 bedeutet 14/32 dieser Größe, keine festen Bildschirmpixel.
-Für kleine Punkt-Texturen ist Größe 14 mit 100 % Deckkraft ein möglicher
-Startwert.
-
-Vorhandene Installation:
-Das native Spiel liegt weiterhin unter Multiplayer, damit die bisherigen
-Einstellungen und Host-Spielstände erhalten bleiben. Spieldaten werden aus
-game_data verwendet. Die alte Einzelspieler-Datei im Hauptordner bleibt
-unverändert. Beide Spieler müssen denselben Multiplayer-Runtime-Build verwenden.
-
-Weitergeben:
-Dieses Launcher-Paket enthält keine Disc-Daten und kein aus der Disc erstelltes
-Spiel. Jeder Spieler benötigt sein eigenes Disc-Image und erstellt das Spiel
-über den Launcher selbst. game_data, persönliche Spielstände und die erzeugten
-Spiel-EXE-Dateien gehören nicht in ein weitergegebenes Paket.
-
-Runtime: Build 204, Protokoll 63. Launcher-Paket: Version 1.2.7.204.
-Die Integration ändert die Start-/Erstellen-Abläufe; sie ist keine erneute
-Abnahme der gesamten Koop-Kampagne.
-
-Mehrspieler > Sitzungsoptionen:
-- Name vor dem Erstellen/Beitreten setzen (bis 24 Zeichen).
-- Gegnerzahl x1 bis x5; Bosse und Story-Figuren bleiben einzeln.
-- Munitionslimit x1 bis x5 oder Unendlich (maximal 32.767 pro Typ).
-- Munition pro Pickup x1 bis x5; Verbrauch bleibt normal.
-Der Host legt die Regeln fest. Clients sehen diese Werte schreibgeschuetzt.
-Neue Faktoren wirken auf kuenftige Spawns/Pickups. Eigene Optionen bleiben gespeichert.
-
-Sprache umstellen: F12 > Sprache fuer Spiel und Menues.
-F12 wechselt sofort; die originalen PAL-Spielmenues uebernehmen die Auswahl
-nach einem Neustart. Automatisch verwendet die bisherige Spielsprache.
-
-Build204: F12-Cheats sind nun fuer den Host verfuegbar. Unverwundbarkeit,
-Munition und Waffen gelten fuer die Gruppe und bleiben mit Insert synchron.
-Fliegen betrifft den Host: Springen steigt, Feuer sinkt. Im Fahrzeug pausiert
-der Flugmodus. Bewegung/Sprunghoehe gelten fuer die Gruppe; Schaden fuer den Host.
-Clients koennen diese Host-Einstellungen ansehen, aber nicht aendern.
+„Build Game“ richtet die 15 zusätzlichen Karten, ihre Vorschaubilder, sechs Skins und das Online-Symbol automatisch ein. Für die Einrichtung genügt dieselbe europäische GameCube-Disc wie für die Kampagne. Alle Teilnehmer einer gemeinsamen Runde sollten Version 1.2.8 verwenden.

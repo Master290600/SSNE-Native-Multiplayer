@@ -28,6 +28,7 @@ GxStats gx_stats();
 
 // Latest displayed frame (from the most recent EFB->XFB copy). Returns false if nothing new since `seq`.
 bool gx_get_frame(std::vector<uint32_t>& rgba, int& w, int& h, uint64_t& seq);
+bool gx_get_frame(std::vector<uint32_t>& rgba, int& w, int& h, uint64_t& seq, float& wide);
 
 struct GxRenderStats { uint64_t triangles, pixels, display_copies, tex_copies, textures_decoded, lines_skipped; };
 GxRenderStats gx_render_stats();

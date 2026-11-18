@@ -31,6 +31,24 @@ int main() try {
     require(input.lx==0 && input.cx>.5f,"Swap sticks has no effect");
     settings.kbm_player=3;settings.pad_player[1]=4;settings.pad_player[2]=0;
     require(port::controller_player(settings,1,false)==3 && port::controller_player(settings,1,true)==2 && port::controller_player(settings,2,true)==-1,"Online controller routed to an absent local player");
+    // Only this test-owned virtual device is sampled by the chat release gate.
+    port::ControllerReleaseGate gate;
+    require(gate.ready(controller),"An unused chat gate blocked normal controller input");
+    SDL_JoystickSetVirtualAxis(joystick,SDL_CONTROLLER_AXIS_TRIGGERRIGHT,-32768);
+    SDL_JoystickSetVirtualButton(joystick,SDL_CONTROLLER_BUTTON_A,1);SDL_JoystickUpdate();
+    gate.suppress();require(!gate.ready(controller),"A button pressed in chat leaked after chat closed");
+    SDL_JoystickSetVirtualButton(joystick,SDL_CONTROLLER_BUTTON_A,0);SDL_JoystickUpdate();
+    require(gate.ready(controller),"Releasing the consumed button did not resume controller input");
+    for(auto trigger:{SDL_CONTROLLER_AXIS_TRIGGERLEFT,SDL_CONTROLLER_AXIS_TRIGGERRIGHT}){
+        SDL_JoystickSetVirtualAxis(joystick,trigger,32767);SDL_JoystickUpdate();
+        gate.suppress();require(!gate.ready(controller),"A trigger pressed in chat leaked after chat closed");
+        SDL_JoystickSetVirtualAxis(joystick,trigger,-32768);SDL_JoystickUpdate();
+        require(gate.ready(controller),"Releasing the consumed trigger did not resume controller input");
+    }
+    SDL_JoystickSetVirtualButton(joystick,SDL_CONTROLLER_BUTTON_B,1);SDL_JoystickUpdate();
+    gate.suppress();require(!gate.ready(controller),"Consumed controller button was not gated");
+    gate.clear();require(gate.ready(controller),"Explicit chat gate reset did not restore input");
+    SDL_JoystickSetVirtualButton(joystick,SDL_CONTROLLER_BUTTON_B,0);SDL_JoystickUpdate();
     SDL_GameControllerClose(controller);SDL_JoystickDetachVirtual(device);SDL_Quit();
-    std::cout<<"Owned virtual controller: move/fire, menu selection, held-input gate, deadzone, stick swap and online/offline routing passed. No video subsystem or physical input used.\n";return 0;
+    std::cout<<"Owned virtual controller: move/fire, menu selection, held-input/chat release gates, deadzone, stick swap and online/offline routing passed. No video subsystem or physical input used.\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';SDL_Quit();return 1;}

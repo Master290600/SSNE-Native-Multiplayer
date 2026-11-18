@@ -1,0 +1,46 @@
+SSNE native multiplayer invitations
+
+Create: Multiplayer > Host game > Internet game > Create invite.
+Choose the game mode and map as usual. In the lobby, open Connection and choose
+Invitation code. Copy the complete code and send it to the people joining.
+
+Join: Multiplayer > Join game > Invitation code. Paste the complete code and
+choose Join. No separate address or PIN is required for this route.
+
+The original LAN browser and address/PIN joining remain available. An Internet
+invitation stays valid while that host session remains open. Creating another
+session generates a new room. Treat the invitation as the session access code.
+
+Internet support runs inside the native game. It uses HTTPS signalling for the
+initial connection, ICE/STUN for direct peer connectivity and a reliable ordered
+UDP stream for the existing authoritative game protocol. Signalling carries
+connection descriptions, not game snapshots, chat or custom-map downloads.
+An optional finite UPnP lease can assist a direct IPv4 path. Closing the session
+or game cancels the network workers and requests removal of owned mappings.
+
+Direct connectivity depends on both networks. Restrictive/symmetric NAT or
+blocked UDP can require an authenticated TURN relay. No public TURN account,
+relay credentials, paid hosting or availability guarantee is bundled. Advanced
+service overrides use the active settings file's .internet sidecar; see
+SSNE-INTERNET.example. A missing sidecar uses the defaults. Invalid Internet
+settings do not disable ordinary LAN play.
+
+Defaults: HTTPS signalling at ntfy.sh and STUN at stun.cloudflare.com:3478.
+These third-party services can be replaced by a compatible deployment. No
+Internet signalling, STUN or UPnP request is started merely by opening menus;
+the user must create or join an Internet invitation. SDP posts disable cache
+and mobile push forwarding. A signalling outage does not stop an established
+peer connection; the signalling subscription retries in the background.
+
+Deutsch
+Erstellen: Mehrspieler > Spiel erstellen > Internet-Spiel > Einladen.
+Danach Modus/Karte waehlen. In der Lobby unter Verbindung > Einladungscode
+den vollstaendigen Code kopieren und an die Mitspieler senden.
+Beitreten: Mehrspieler > Spiel beitreten > Einladungscode > Code eingeben >
+Beitreten. Die manuelle LAN-/IP-Verbindung ist weiterhin nutzbar.
+
+Third-party source components
+libjuice: MPL-2.0; source and license are in vendor/libjuice.
+KCP: MIT; source and license are in vendor/kcp.
+Both are compiled into the existing cooperative-session runtime archive;
+there is no separately launched multiplayer or relay helper executable.

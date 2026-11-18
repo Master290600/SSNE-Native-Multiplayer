@@ -7,6 +7,8 @@
 #endif
 #include <SDL_opengl.h>
 #include <imgui.h>
+#include "movie_view.h"
+#include "ssne/movie_presentation.h"
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl2.h>
 
@@ -29,6 +31,7 @@
 #include <thread>
 #include <vector>
 #include <utility>
+#include <iomanip>
 
 #include "ssne/audio.h"
 #include "ssne/exi.h"
@@ -37,12 +40,24 @@
 #include "ssne/hw.h"
 #include "ssne/input.h"
 #include "ssne/recomp_hooks.h"
+#include "coop/ps2_content_identity.h"
 #include "ssne/runtime.h"
+#include "coop/ps2_profile_bootstrap.inc"
 #include "ssne/scheduler.h"
+#include "ssne/editor_logic_effects.h"
+#include "ssne/editor_logic_use.h"
+#include "ssne/editor_scene_collision.h"
 #include "ssne/thread_util.h"
 #include "settings.h"
+#include "coop/custom_map_session.h"
+#include "coop/editor_collision_probe.h"
 #include "controller_input.h"
 #include "settings_menu.h"
+#include "chat_overlay.h"
+#include "multiplayer_roster.h"
+#include "multiplayer_input.h"
+#include "team_hud_render.h"
+#include "tactical_ping.h"
 #include "settings_menu_i18n.h"
 #include "mod_menu.h"
 #include "png_write.h"
@@ -53,9 +68,12 @@
 #include "crosshair_renderer.h"
 
 #include "ssne/performance.h"
+#include "ssne/native_cutscene.h"
 #include "ssne/game_addresses.h"
 #include "ssne/native_entity.h"
 #include "ssne/native_party.h"
+#include "ssne/native_survival.h"
+#include "ssne/native_boss_hud.h"
 #include "ssne/native_results.h"
 #include "ssne/native_cutscene.h"
 #include "ssne/native_music.h"
@@ -68,11 +86,15 @@
 #include "coop/frame_pacing.h"
 #include "netplay.h"
 #include "coop/native_world.h"
+#include "coop/native_presentation.h"
 #include "coop/native_configuration.h"
 #include "coop/native_bootstrap.h"
 #include "coop/native_session.h"
+#include "coop/editor_logic_debug.h"
+#include "coop/custom_levels_runtime.h"
 #include "coop/native_lobby.h"
 #include "coop/native_frontend.h"
+#include "coop/invite_settings.h"
 #include "coop/startup_save.h"
 #include "test_bot.h"
 #include "netplay_test_script.h"
@@ -85,8 +107,22 @@ namespace {
 
 port::netplay::Session g_net;
 bool g_net_host = false, g_net_client = false;
-std::atomic<bool> g_coop_host{false},g_coop_client{false};
+std::atomic<bool> g_coop_host{false},g_coop_client{false},g_coop_spectating{false};
 std::recursive_mutex g_session_mutex;
+port::ChatOverlay g_chat;
+std::atomic<uint64_t> g_tactical_ping_requested_at{0};
+std::atomic<bool> g_qol_input_allowed{false};
+bool g_roster_allowed=false;
+bool g_roster_held=false;
+port::MultiplayerHold g_roster_input;
+std::shared_ptr<const port::coop::WorldState> g_tactical_host_view;
+uint64_t g_tactical_host_native_epoch=0,g_tactical_host_refresh=0;
+std::atomic<uint64_t> g_chat_session_generation{0};
+bool g_chat_available=false,g_chat_restore_capture=false;
+std::array<bool,SDL_NUM_SCANCODES> g_chat_key_suppressed{};
+Uint32 g_chat_mouse_suppressed=0;
+std::array<port::ControllerReleaseGate,port::Settings::kPadSlots> g_chat_pad_release;
+SDL_Window* g_chat_window=nullptr;
 bool g_native_frontend_enabled=false;
 void setup_native_frontend(const std::string&);
 void session_frontend_frame(PPCContext&,uint64_t);
@@ -98,7 +134,9 @@ std::atomic<bool> g_coop_engine_ready{false};
 port::coop::savefile::Identity g_coop_save_identity;
 unsigned g_coop_capacity=8;
 std::string g_coop_level="Rlevel1_1";
-bool g_coop_start_menu=false,g_coop_start_explicit=false;
+bool g_coop_start_menu=false,g_coop_start_explicit=false,g_survival_start=false;
+std::string g_editor_debug_path,g_editor_debug_token;
+std::string g_custom_catalog_path;
 
 int g_coop_start_slot=0;
 std::optional<port::coop::savefile::State> g_coop_start_save;
@@ -107,7 +145,8 @@ double g_coop_yaw=0,g_coop_pitch=0; // UI thread accumulates until the next inpu
 uint8_t g_coop_weapon=255;
 
 bool network_game(){return g_net_host || g_net_client || g_coop_host || g_coop_client;}
-void stop_network(){std::lock_guard lock(g_session_mutex);g_net.stop();if(g_coop_server)g_coop_server->stop();if(g_coop_peer)g_coop_peer->stop();}
+void halt_invitation_network();
+void stop_network(){std::lock_guard lock(g_session_mutex);g_net.stop();halt_invitation_network();if(g_coop_server)g_coop_server->stop();if(g_coop_peer)g_coop_peer->stop();}
 std::unique_ptr<port::coop::NativeWorld> g_native_world;
 unsigned g_net_players=2;
 uint64_t g_presented_game_frames=0; // UI thread: freshly drawn game images actually presented
@@ -198,6 +237,8 @@ void capture_native_game(PPCContext& context,uint64_t tick) {
             }
 }
 
+#include "performance_scene_fixture.inc"
+
 void guest_main(std::string data_dir) {
     g_guest_running = true;
     static PPCContext ctx;
@@ -235,6 +276,7 @@ void guest_main(std::string data_dir) {
             if(g_coop_host)g_coop_engine=std::make_unique<port::coop::NativeSession>(*g_coop_server,status.capacity,g_coop_level,log_line);
             else g_coop_engine=std::make_unique<port::coop::NativeSession>(*g_coop_peer,log_line);
             if(g_coop_host)g_coop_engine->configure_saves(g_coop_save_identity);
+            if(g_coop_host && g_survival_start)g_coop_engine->configure_survival_start();
             if(g_coop_start_save){g_coop_engine->configure_startup_save(std::move(*g_coop_start_save),g_coop_start_slot);g_coop_start_save.reset();}
             g_coop_engine_ready.store(true,std::memory_order_release);
         } else if((getenv("SSNE_COOP_CAPTURE") && *getenv("SSNE_COOP_CAPTURE")) || (getenv("SSNE_COOP_BOOTSTRAP_LEVEL") && *getenv("SSNE_COOP_BOOTSTRAP_LEVEL"))) {
@@ -252,14 +294,32 @@ void guest_main(std::string data_dir) {
         if(g_native_frontend_enabled){
             setup_native_frontend(data_dir);port::coop::install_native_frontend();
             if(g_coop_host || g_coop_client)ssne::set_authoritative_gameplay(true);
-            ssne::set_game_frame_observer([](PPCContext& c,uint64_t frame){port::native_crosshair_frame();session_frontend_frame(c,frame);});ssne::set_game_tick_observer(session_frontend_tick);
+            {std::string why;if(!ssne::install_editor_logic_effects(why))throw std::runtime_error(why);ssne::set_editor_logic_effects_authoritative(!g_coop_client);}
+            {std::string why;if(!ssne::install_editor_logic_use(why))throw std::runtime_error(why);ssne::set_editor_logic_use_authoritative(!g_coop_client);}
+            {std::string why;if(!ssne::install_editor_scene_collision(why))throw std::runtime_error(why);}
+            ssne::set_game_frame_observer([](PPCContext& c,uint64_t frame){
+                port::native_crosshair_frame();
+                ssne::set_editor_logic_effects_authoritative(!g_coop_client);
+                ssne::set_editor_logic_use_authoritative(!g_coop_client);
+                session_frontend_frame(c,frame);
+                ssne::set_editor_logic_effects_authoritative(!g_coop_client);
+                ssne::set_editor_logic_use_authoritative(!g_coop_client);
+                ssne::editor_logic_effects_frame(c);
+                perf_scene_fixture_frame(c,frame);
+                port::coop::sample_editor_logic_debug(c,frame);
+                port::coop::sample_editor_collision_probe(c,frame);
+            });ssne::set_game_tick_observer(session_frontend_tick);
             ssne::set_game_render_observer([](PPCContext& c){if(g_coop_engine_ready)g_coop_engine->render_begin(c);},[](PPCContext& c){if(g_coop_engine_ready)g_coop_engine->render_end(c);});
         }
         if(!g_native_frontend_enabled) {
             if(g_native_world)ssne::set_game_frame_observer([](PPCContext& c,uint64_t frame){port::native_crosshair_frame();capture_native_game(c,frame);});
             else ssne::set_game_frame_observer([](PPCContext&,uint64_t){port::native_crosshair_frame();});
         }
-        if(g_coop_host || g_coop_client)port::coop::install_native_lobby(g_coop_server.get(),g_coop_peer.get());
+        if(g_coop_host || g_coop_client){
+            port::coop::install_native_lobby(g_coop_server.get(),g_coop_peer.get());
+            // Installation resets the lobby mode; retain an explicit Editor/CLI Survival start.
+            if(g_coop_host && g_survival_start)port::coop::set_native_lobby_survival(true);
+        }
         set_status("Running recompiled game code");
         ssne::scheduler_run_main(ctx, entry);
         set_status("Game code returned from its entry point.");
@@ -280,6 +340,7 @@ void guest_main(std::string data_dir) {
 GLuint g_tex = 0;
 int g_tex_w = 0, g_tex_h = 0;
 uint64_t g_frame_seq = 0;
+float g_software_frame_wide = 1.f;
 // UI-thread copy of exactly the image rectangle submitted by draw_game_view.
 port::GameViewRect g_pointer_image;
 float g_pointer_origin_x=0,g_pointer_origin_y=0;
@@ -288,7 +349,7 @@ std::vector<uint32_t> g_pixels;
 
 bool update_game_texture() {
     int w, h;
-    if (!ssne::gx_get_frame(g_pixels, w, h, g_frame_seq)) return false;
+    if (!ssne::gx_get_frame(g_pixels, w, h, g_frame_seq, g_software_frame_wide)) return false;
     if (!g_tex) {
         glGenTextures(1, &g_tex);
         glBindTexture(GL_TEXTURE_2D, g_tex);
@@ -440,8 +501,12 @@ void update_auto_scale(SDL_Window* win) {
 
 void draw_game_view() {
     GLuint tex=g_tex,fill=0;
-    float factor=ssne::widescreen_frame_factor();uint64_t image_sequence=g_frame_seq;
+    float factor=g_software_frame_wide;uint64_t image_sequence=g_frame_seq;
     if(g_gpu){const auto output=ssne::gpu_renderer_output();tex=output.texture;fill=output.fill;factor=output.wide;image_sequence=output.seq;}
+    const auto movie = ssne::widescreen() > 1.001f ?
+        (g_gpu ? ssne::movie_presentation::displayed_gpu : ssne::movie_presentation::displayed_software) : 0u;
+    const float rendered_factor = factor;
+    if (movie) factor = ssne::widescreen();
     const ImGuiViewport* vp=ImGui::GetMainViewport();
     const auto image=tex?port::fit_game_view(vp->Pos.x,vp->Pos.y,vp->Size.x,vp->Size.y,factor):port::GameViewRect{};
     if(image.x!=g_pointer_image.x || image.y!=g_pointer_image.y || image.width!=g_pointer_image.width || image.height!=g_pointer_image.height || image.wide!=g_pointer_image.wide || vp->Pos.x!=g_pointer_origin_x || vp->Pos.y!=g_pointer_origin_y)++g_pointer_view_generation;
@@ -453,11 +518,12 @@ void draw_game_view() {
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
     dl->AddCallback([](const ImDrawList*, const ImDrawCmd*) { glDisable(GL_BLEND); }, nullptr);  // the game image is opaque
-    if (fill && w < W - 1.f) {  // only the actual image, not its blurred side fill, accepts input
+    if (!movie && fill && w < W - 1.f) {  // only the actual image, not its blurred side fill, accepts input
         float fh = W * 0.75f;
         dl->AddImage((ImTextureID)(intptr_t)fill, ImVec2(vp->Pos.x, vp->Pos.y + (H - fh) * 0.5f), ImVec2(vp->Pos.x + W, vp->Pos.y + (H + fh) * 0.5f));
     }
-    dl->AddImage((ImTextureID)(intptr_t)tex, p0, ImVec2(p0.x + w, p0.y + h));
+    if (movie) port::draw_movie(*dl, (ImTextureID)(intptr_t)tex, p0.x, p0.y, w, h, rendered_factor, movie);
+    else dl->AddImage((ImTextureID)(intptr_t)tex, p0, ImVec2(p0.x + w, p0.y + h));
     dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
     port::draw_mod_overlay(p0.x,p0.y,w,h);
 }
@@ -543,6 +609,10 @@ void update_ports() {
     ssne::set_kbm_port(std::clamp(g_set.kbm_player - 1, 0, 3));
 }
 float g_mouse_dx = 0, g_mouse_dy = 0;
+// SDL can deliver a complete key tap between two held-state snapshots.
+// Preserve its edge separately from the pad's current analog trigger value.
+bool g_keyboard_jump_pressed = false;
+void cancel_keyboard_jump(){g_keyboard_jump_pressed=false;for(unsigned slot=0;slot<8;++slot)ssne::cancel_native_jump_press(slot);}
 bool g_mouse_captured = false;
 bool g_pointer_restore_capture=false;
 Uint32 g_capture_click = 0;  // the mouse button whose click captured the mouse: only captures (update_input)
@@ -813,7 +883,11 @@ WheelPulse g_wheel[2];  // [0] down, [1] up
 
 // One player's controls, gathered from the devices that play it (keyboard / mouse and controllers add up).
 using PlayerInput=port::PlayerInput;
-void pad_input(SDL_GameController* c,PlayerInput& in,bool control,bool held_jump){port::sample_controller(g_set,c,in,control,held_jump);}
+void pad_input(SDL_GameController* c,PlayerInput& in,bool control,bool held_jump){
+    const auto slot=pad_slot(SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(c)));
+    if(slot>=0 && !g_chat_pad_release[slot].ready(c))return;
+    port::sample_controller(g_set,c,in,control,held_jump);
+}
 ssne::PadState to_pad(const PlayerInput& in){return port::map_player_input(g_set,in);}
 
 bool g_test_ui_shot=false;
@@ -896,14 +970,103 @@ ssne::PadState scripted_pad(const ssne::PadState& live) {
 }
 #include "native_mouse_input.inc"
 
-void feed_local_pad(const ssne::PadState& live,int offline_port=0) {
+// UI-thread chat adapter. The guest thread only publishes a session generation;
+// network snapshots are copied under the existing session ownership lease.
+void sync_chat_session() {
+    std::lock_guard lock(g_session_mutex);
+    const bool available=(g_coop_host && g_coop_server && g_coop_server->status().connected) ||
+        (g_coop_client && g_coop_peer && g_coop_peer->status().connected);
+    static uint64_t generation=0;const auto current=g_chat_session_generation.load();
+    if(generation!=current || available!=g_chat_available) {
+        g_chat.reset_session();g_chat_restore_capture=false;generation=current;
+    }
+    g_chat_available=available;
+    bool watching=false;
+    if(g_coop_host && g_coop_server){const auto own=g_coop_server->status().player;const auto people=g_coop_server->participants();watching=own.slot<people.size() && people[own.slot].id==own && people[own.slot].spectator;}
+    else if(g_coop_client && g_coop_peer){const auto own=g_coop_peer->status().player;const auto world=g_coop_peer->latest_world();watching=world && own.slot<world->players.size() && world->players[own.slot].id==own && world->players[own.slot].spectator;}
+    g_coop_spectating=watching;
+}
+void submit_chat_messages() {
+    while(auto message=g_chat.take_submission()) {
+        bool sent=false;
+        {
+            std::lock_guard lock(g_session_mutex);
+            if(g_coop_host && g_coop_server)sent=g_coop_server->send_chat(*message);
+            else if(g_coop_client && g_coop_peer)sent=g_coop_peer->send_chat(*message);
+        }
+        if(!sent){g_chat.send_failed();break;}
+    }
+}
+void chat_capture_transition(bool was_active) {
+    if(!was_active && g_chat.active()) {
+        cancel_keyboard_jump();
+        g_chat_restore_capture=g_mouse_captured;cancel_native_mouse();release_mouse();
+        g_coop_yaw=g_coop_pitch=0;ssne::mod_aim_input(false,false);
+    } else if(was_active && !g_chat.active()) {
+        const bool restore=g_chat_restore_capture && g_chat_available && (g_focused || getenv("SSNE_TEST_HIDDEN")) &&
+            ssne::player_control_active() && !port::menu_open() && !port::mod_menu_open() && g_set.mouse_look;
+        g_chat_restore_capture=false;cancel_native_mouse();
+        if(restore){g_mouse_captured=true;if(!getenv("SSNE_TEST_HIDDEN"))SDL_SetRelativeMouseMode(SDL_TRUE);}
+    }
+}
+bool handle_chat_event(const SDL_Event& event) {
+    if(event.type==SDL_WINDOWEVENT && (event.window.event==SDL_WINDOWEVENT_FOCUS_LOST || event.window.event==SDL_WINDOWEVENT_MINIMIZED)){
+        g_chat_restore_capture=false;g_chat.close();
+    }
+    bool released=false;
+    if(event.type==SDL_KEYUP && unsigned(event.key.keysym.scancode)<SDL_NUM_SCANCODES) {
+        auto& suppressed=g_chat_key_suppressed[event.key.keysym.scancode];released=suppressed;suppressed=false;
+    }
+    if(event.type==SDL_MOUSEBUTTONUP) {
+        const auto mask=SDL_BUTTON(event.button.button);released=(g_chat_mouse_suppressed&mask)!=0;g_chat_mouse_suppressed&=~mask;
+    }
+    const bool was_active=g_chat.active();
+    const bool can_open=!port::menu_open() && !port::mod_menu_open() && !port::coop::native_frontend_text_active() && !ImGui::GetIO().WantTextInput;
+    const bool open_requested=port::multiplayer_event_slots(g_set,port::MP_CHAT,event,true)!=0;
+    const bool consumed=g_chat.handle_event(event,g_chat_available,can_open,open_requested);
+    if(consumed && event.type==SDL_KEYDOWN && unsigned(event.key.keysym.scancode)<SDL_NUM_SCANCODES)
+        g_chat_key_suppressed[event.key.keysym.scancode]=true;
+    if(consumed && event.type==SDL_MOUSEBUTTONDOWN)g_chat_mouse_suppressed|=SDL_BUTTON(event.button.button);
+    if(consumed && event.type==SDL_CONTROLLERBUTTONDOWN) {
+        const auto slot=pad_slot(event.cbutton.which);if(slot>=0)g_chat_pad_release[slot].suppress();
+    }
+    if(consumed && event.type==SDL_CONTROLLERAXISMOTION &&
+       (event.caxis.axis==SDL_CONTROLLER_AXIS_TRIGGERLEFT || event.caxis.axis==SDL_CONTROLLER_AXIS_TRIGGERRIGHT) && event.caxis.value>4000) {
+        const auto slot=pad_slot(event.caxis.which);if(slot>=0)g_chat_pad_release[slot].suppress();
+    }
+    submit_chat_messages();chat_capture_transition(was_active);
+    return consumed || released;
+}
+void draw_multiplayer_chat() {
+    std::vector<port::coop::ChatMessage> messages;
+    {
+        std::lock_guard lock(g_session_mutex);
+        if(g_coop_host && g_coop_server)messages=g_coop_server->chat_messages();
+        else if(g_coop_client && g_coop_peer)messages=g_coop_peer->chat_messages();
+    }
+    if(!g_chat_available){g_chat.draw({},0,ImVec2{},ImVec2{});return;}
+    const auto* viewport=ImGui::GetMainViewport();
+    ImVec2 origin=g_pointer_image.valid()?ImVec2(g_pointer_image.x,g_pointer_image.y):viewport->Pos;
+    ImVec2 size=g_pointer_image.valid()?ImVec2(g_pointer_image.width,g_pointer_image.height):viewport->Size;
+    if(g_set.top_bar){origin.y+=28.f;size.y=std::max(1.f,size.y-28.f);}
+    const auto language=g_set.game_language>=0?unsigned(g_set.game_language):port::native_crosshair_language();
+    const bool was_active=g_chat.active();g_chat.draw(messages,language,origin,size);
+    submit_chat_messages();chat_capture_transition(was_active);
+}
+
+
+#include "multiplayer_qol.inc"
+
+void feed_local_pad(const ssne::PadState& live,int offline_port=0,uint16_t pressed=0) {
     std::lock_guard session_lock(g_session_mutex);
 
     auto p=(getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_TEST_DEVICE_INPUT"))?live:scripted_pad(live);
     p=port::coop::native_results_input(p,ssne::native_results_presenting());
     p.buttons|=take_native_menu_pad_pulse();
     if(port::menu_open() || port::mod_menu_open())p={};
-    if(port::coop::native_frontend_input(p)){g_coop_yaw=g_coop_pitch=0;if(g_coop_host)g_coop_server->submit_host_input({});else if(g_coop_client)g_coop_peer->submit_input({});ssne::set_pad(0,{});if(offline_port)ssne::set_pad(offline_port,{});if(g_coop_local_player.load()>0)ssne::set_pad(g_coop_local_player.load(),{});return;}
+    if(port::menu_open() || port::mod_menu_open() || g_chat.active() || ssne::local_pause_menu_open() || ssne::local_information_open() || ssne::native_results_presenting())pressed=0;
+    if(g_coop_client && g_coop_engine_ready.load(std::memory_order_acquire))g_coop_engine->set_local_ui_pad(p);
+    if(port::coop::native_frontend_input(p)){if(g_coop_client && g_coop_engine_ready.load(std::memory_order_acquire))g_coop_engine->set_local_ui_pad({});g_coop_yaw=g_coop_pitch=0;if(g_coop_host)g_coop_server->submit_host_input({});else if(g_coop_client)g_coop_peer->submit_input({});ssne::set_pad(0,{});if(offline_port)ssne::set_pad(offline_port,{});if(g_coop_local_player.load()>0)ssne::set_pad(g_coop_local_player.load(),{});return;}
     // Track edges across scenes: a confirmation held while leaving credits
     // must be released before it can start a new campaign in the lobby.
     static bool start_down=false;
@@ -962,36 +1125,63 @@ void feed_local_pad(const ssne::PadState& live,int offline_port=0) {
             }
         }
         skip_down=down;
-        port::coop::ControlInput input;input.pad=p;
+        port::coop::ControlInput input;input.pad=p;input.pressed=pressed;
         input.weapon=std::exchange(g_coop_weapon,uint8_t(255));
         if(g_coop_engine_ready.load(std::memory_order_acquire))input.preferences=g_coop_engine->local_preferences();
         input.yaw=int32_t(std::round(std::clamp(g_coop_yaw,-2.,2.)*1000000.));
         input.pitch=int32_t(std::round(std::clamp(g_coop_pitch,-2.,2.)*1000000.));
         g_coop_yaw=g_coop_pitch=0;
+        if(ssne::local_pause_menu_open()){input.weapon=255;input.yaw=input.pitch=0;}
         if(g_coop_host)g_coop_server->submit_host_input(input);
-        else {if(ssne::local_pause_menu_open() || ssne::local_information_open()){input.pad={};input.yaw=input.pitch=0;}g_coop_peer->submit_input(input);ssne::set_pad(g_coop_local_player.load(),p);}
+        else {if(ssne::local_pause_menu_open() || ssne::local_information_open()){input.pad={};input.pressed=0;input.yaw=input.pitch=0;}g_coop_peer->submit_input(input);ssne::set_pad(g_coop_local_player.load(),p);}
     } else if(g_net_host || g_net_client) { if(!(g_net_client && g_test_bot && ssne::netplay_world_ready())) g_net.submit_pad(p); }
-    else ssne::set_pad(offline_port,p);
+    else {ssne::set_pad(offline_port,p);if(pressed&ssne::PAD_L)ssne::queue_native_jump_press(unsigned(offline_port));}
 }
 
 
 // Device conversion and scripted pads share this dispatcher. In particular,
 // neutral releases must reach the frontend after the network role is cleared.
-void route_local_pads(const std::array<ssne::PadState,4>& pads){
+void route_local_pads(const std::array<ssne::PadState,4>& pads,uint16_t pressed=0){
     std::lock_guard session_lock(g_session_mutex);
     const bool network=network_game();const int own=std::clamp(g_set.kbm_player-1,0,3);
     for(int port=0;port<4;++port){
-        if(port==own && (network || g_native_frontend_enabled))feed_local_pad(pads[port],port);
-        else if(!network)ssne::set_pad(port,pads[port]);
+        if(port==own && (network || g_native_frontend_enabled))feed_local_pad(pads[port],port,pressed);
+        else if(!network){ssne::set_pad(port,pads[port]);if(port==own && (pressed&ssne::PAD_L))ssne::queue_native_jump_press(unsigned(port));}
     }
 }
 
+// Hidden local tests push SDL events into this process only. Unlike the held
+// key snapshot fixture, DOWN+UP in one batch exercises the real event latch.
+void queue_test_key_events(SDL_Window* window){
+    static const char* path=getenv("SSNE_TEST_KEY_EVENT_FILE");
+    if(!path || !getenv("SSNE_TEST_HIDDEN") || !getenv("SSNE_TEST_DEVICE_INPUT"))return;
+    static uint64_t last=0,polls=0,down=0,up=0,mouse_down=0,mouse_up=0;static uint64_t last_batch=0;
+    std::ifstream stream(std::filesystem::u8path(path));uint64_t sequence=0;std::string action;int scan=0;unsigned count=0;
+    const auto poll=++polls;uint64_t first=0;unsigned accepted=0;
+    while(count++<128 && (stream>>sequence>>action>>scan)){
+        if(sequence<=last)continue;
+        const bool mouse=action=="MDOWN" || action=="MUP";
+        if(mouse?(scan<1 || scan>5):(scan<=SDL_SCANCODE_UNKNOWN || scan>=SDL_NUM_SCANCODES || (action!="DOWN" && action!="UP")))continue;
+        SDL_Event event{};
+        if(mouse){event.type=action=="MDOWN"?SDL_MOUSEBUTTONDOWN:SDL_MOUSEBUTTONUP;event.button.windowID=SDL_GetWindowID(window);event.button.button=uint8_t(scan);event.button.state=action=="MDOWN"?SDL_PRESSED:SDL_RELEASED;const auto pos=ImGui::GetIO().MousePos;event.button.x=int(pos.x);event.button.y=int(pos.y);}
+        else{event.type=action=="DOWN"?SDL_KEYDOWN:SDL_KEYUP;event.key.type=event.type;event.key.windowID=SDL_GetWindowID(window);
+        event.key.state=action=="DOWN"?SDL_PRESSED:SDL_RELEASED;event.key.repeat=0;event.key.keysym.scancode=SDL_Scancode(scan);event.key.keysym.sym=SDL_GetKeyFromScancode(SDL_Scancode(scan));}
+        if(SDL_PushEvent(&event)!=1)break;
+        if(!accepted++)first=sequence;last=sequence;last_batch=poll;if(mouse){if(action=="MDOWN")++mouse_down;else ++mouse_up;}else if(action=="DOWN")++down;else ++up;
+    }
+    if(last_batch!=poll)return;
+    std::ofstream ack("jump-key-event-state.json.pending",std::ios::trunc);
+    ack<<"{\"accepted_sequence\":"<<last<<",\"poll\":"<<poll<<",\"down_count\":"<<down<<",\"up_count\":"<<up<<",\"mouse_down_count\":"<<mouse_down<<",\"mouse_up_count\":"<<mouse_up<<",\"last_poll_first_sequence\":"<<first<<",\"last_poll_last_sequence\":"<<last<<",\"last_poll_events\":"<<accepted<<"}";ack.close();
+    if(ack){std::remove("jump-key-event-state.json");std::rename("jump-key-event-state.json.pending","jump-key-event-state.json");}
+}
+
 void update_input(float dt) {
-    if(getenv("SSNE_TEST_HIDDEN") && !getenv("SSNE_TEST_DEVICE_INPUT")){std::array<ssne::PadState,4> pads{};pads[std::clamp(g_set.kbm_player-1,0,3)]=port::menu_open()?ssne::PadState{}:scripted_pad({});route_local_pads(pads);return;}
+    const bool keyboard_jump_press=std::exchange(g_keyboard_jump_pressed,false);
+    if(getenv("SSNE_TEST_HIDDEN") && !getenv("SSNE_TEST_DEVICE_INPUT")){std::array<ssne::PadState,4> pads{};pads[std::clamp(g_set.kbm_player-1,0,3)]=(port::menu_open() || g_chat.active())?ssne::PadState{}:scripted_pad({});route_local_pads(pads);return;}
     apply_virtual_autopress();
     update_ports();
-    if (port::menu_open() || port::mod_menu_open()) {
-        ssne::mod_aim_input(false,false);g_coop_yaw=g_coop_pitch=0;  // the game gets neutral controllers while the menu is open
+    if (port::menu_open() || port::mod_menu_open() || g_chat.active()) {
+        cancel_keyboard_jump();ssne::mod_aim_input(false,false);g_coop_yaw=g_coop_pitch=0;  // the game gets neutral controllers while the menu is open
         g_mouse_dx = g_mouse_dy = 0;
         g_wheel[0] = g_wheel[1] = WheelPulse{};
         route_local_pads({});
@@ -1027,12 +1217,17 @@ void update_input(float dt) {
         }
         static bool initialized=false;if(!initialized){g_mouse_captured=true;initialized=true;}
     }
-    const Uint8* k = test_devices?test_keys.data():SDL_GetKeyboardState(nullptr);
+    const Uint8* live_keys = test_devices?test_keys.data():SDL_GetKeyboardState(nullptr);
+    std::array<Uint8,SDL_NUM_SCANCODES> chat_filtered_keys{};
+    std::copy_n(live_keys,SDL_NUM_SCANCODES,chat_filtered_keys.data());
+    for(unsigned code=0;code<SDL_NUM_SCANCODES;++code)if(g_chat_key_suppressed[code])chat_filtered_keys[code]=0;
+    const Uint8* k=chat_filtered_keys.data();
     Uint32 presentation_buttons=g_presentation_mouse_buttons;
     if(g_presentation_pointer_active)for(unsigned i=0;i<2;++i)if(g_presentation_click[i].step(dt))presentation_buttons|=SDL_BUTTON(i?SDL_BUTTON_RIGHT:SDL_BUTTON_LEFT);
     Uint32 mb = test_devices?test_mouse:(g_presentation_pointer_active?presentation_buttons:(g_mouse_captured?SDL_GetMouseState(nullptr,nullptr):0));
     if(test_devices && getenv("SSNE_NATIVE_MOUSE_COMMAND") && g_presentation_pointer_active)mb|=presentation_buttons;
     if(g_native_pointer_active && !(test_devices && !getenv("SSNE_NATIVE_MOUSE_COMMAND")))mb=0;
+    mb&=~g_chat_mouse_suppressed;
     // Text events own keyboard editing; held letters must not also move native menu focus.
     bool kb_ok = !ImGui::GetIO().WantCaptureKeyboard && !port::coop::native_frontend_text_active();
     bool wheel_on[2] = {g_wheel[0].step(dt), g_wheel[1].step(dt)};
@@ -1046,7 +1241,7 @@ void update_input(float dt) {
     // Those inputs, if still held when control changes, only count once released: firing or jumping as a cutscene
     // starts doesn't skip it, the Esc that paused doesn't close the pause menu, the click that starts a level
     // doesn't also fire.
-    const bool control = ssne::player_control_active() && !ssne::native_results_presenting() && !g_presentation_pointer_active;
+    const bool control = (ssne::player_control_active() || (g_coop_spectating && !ssne::local_pause_menu_open() && !ssne::local_information_open() && !port::coop::native_frontend_visible())) && !ssne::native_results_presenting() && !g_presentation_pointer_active;
     static bool was_control = true;
     static Uint32 held_mouse = 0;
     static bool held_jump = false, held_esc = false, held_pad_jump[kPadSlots] = {};
@@ -1080,6 +1275,8 @@ void update_input(float dt) {
             if (b.type == port::Bind::MOUSE && control && (mb & ~held_mouse & SDL_BUTTON(b.code))) act[a] = 1;
             if (b.type == port::Bind::WHEEL && control && wheel_on[b.code > 0 ? 1 : 0]) act[a] = 1;
         }
+    const bool jump_tap=keyboard_jump_press && kb_ok && control && !held_jump && !ssne::player_in_vehicle() && !g_coop_spectating;
+    if(jump_tap)act[port::ACT_L]=1;
     if(ssne::native_results_presenting() && kb_ok && (k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_KP_ENTER]))act[port::ACT_A]=1;
     if (!control) {
         for (int a : {port::ACT_X, port::ACT_Y})
@@ -1155,18 +1352,9 @@ void update_input(float dt) {
     for (int p = 0; p < 4; p++) {
         ssne::PadState ps = to_pad(players[p]);
         if (p == 0) apply_autopress(ps);
-        // Flying (cheat): the game's debug flight goes down with L (jump) and up with R (fire); swapped, so jump
-        // flies up and fire down (single player or the authoritative host: port 0).
-        if (p == std::clamp(g_set.kbm_player-1,0,3) && ssne::cheat_flying()) {
-            std::swap(ps.trigger_l, ps.trigger_r);
-            uint16_t lr = ps.buttons & (ssne::PAD_L | ssne::PAD_R);
-            ps.buttons &= uint16_t(~(ssne::PAD_L | ssne::PAD_R));
-            if (lr & ssne::PAD_L) ps.buttons |= ssne::PAD_R;
-            if (lr & ssne::PAD_R) ps.buttons |= ssne::PAD_L;
-        }
         pads[p]=ps;
     }
-    route_local_pads(pads);
+    route_local_pads(pads,jump_tap?ssne::PAD_L:0);
 }
 
 // ---------------------------------------------------------------- audio
@@ -1686,18 +1874,34 @@ int main(int argc, char** argv) {
     unsigned player_skin=0,enemy_multiplier=1,ammo_capacity=0,ammo_pickup_multiplier=1;
     uint16_t g_lan_port=27341;
     std::string memcard;  // default: saves/MemoryCardA.<USA|EUR>.raw next to the executable (by the disc's region)
-    std::string base_dir;
+    std::string base_dir,custom_downloads;
     {
         char* base = SDL_GetBasePath();
         base_dir = base ? base : "";
         SDL_free(base);
     }
+    // Explorer and the launcher share the same settings, cards and crosshairs.
+    const auto install_root = std::filesystem::u8path(base_dir);
+    std::error_code layout_error;
+    const bool root_install = !base_dir.empty() && std::filesystem::is_regular_file(
+        install_root / "Multiplayer" / "native-build.json", layout_error);
+    if (root_install) {
+        base_dir += "Multiplayer/";
+        if (argc == 1) {
+            std::filesystem::current_path(std::filesystem::u8path(base_dir), layout_error);
+            if (layout_error) {
+                fprintf(stderr, "Cannot enter the Multiplayer directory: %s\n", layout_error.message().c_str());
+                return 1;
+            }
+        }
+    }
     for(int i=1;i<argc;++i) {
         std::string a=argv[i];
-        if(a=="--player-skin"){
+        if(a=="--custom-downloads" && i+1<argc)custom_downloads=argv[++i];
+        else if(a=="--player-skin"){
             if(i+1>=argc){fprintf(stderr,"Missing player skin.\n");return 1;}
             char* end=nullptr;const auto value=std::strtol(argv[++i],&end,10);
-            if(!argv[i][0] || !end || *end || value<0 || value>10){fprintf(stderr,"Player skin must be 0..10.\n");return 1;}player_skin=unsigned(value);
+            if(!argv[i][0] || !end || *end || value<0 || value>16){fprintf(stderr,"Player skin must be 0..16 (PS2 skins require installed content).\n");return 1;}player_skin=unsigned(value);
         }
         else if(a=="--ammo-capacity"){
             if(i+1>=argc){fprintf(stderr,"Missing ammo capacity.\n");return 1;}
@@ -1712,6 +1916,16 @@ int main(int argc, char** argv) {
             if(i+1>=argc || (std::string(argv[i+1]).size()!=1 || argv[i+1][0]<'1' || argv[i+1][0]>'5')){fprintf(stderr,"Enemy multiplier must be 1..5.\n");return 1;}
             enemy_multiplier=unsigned(argv[++i][0]-'0');
         }
+        else if(a=="--custom-levels"){
+            if(i+1>=argc){fprintf(stderr,"Missing custom catalogue path.\n");return 1;}
+            g_custom_catalog_path=argv[++i];
+        }
+        else if(a=="--editor-debug" || a=="--editor-debug-token"){
+            if(i+1>=argc){fprintf(stderr,"Missing editor diagnostic argument.\n");return 1;}
+            (a=="--editor-debug"?g_editor_debug_path:g_editor_debug_token)=argv[++i];
+        }
+        else if(a=="--survival"){g_survival_start=true;g_coop_host=true;g_coop_start_explicit=true;}
+        else if(a=="--survival-project-resources"){ssne::configure_native_survival_project_resources();}
         else if(a=="--coop-host")g_coop_host=true;
         else if(a=="--coop-join" && i+1<argc){g_coop_client=true;lan_address=argv[++i];}
         else if(a=="--player-name" && i+1<argc){
@@ -1774,10 +1988,56 @@ int main(int argc, char** argv) {
             if (g_set.fps_limit != 0) g_set.fps_limit = std::max(g_set.fps_limit, port::kMinFpsLimit);
         }
     }
+    if (root_install && custom_downloads.empty()) {
+        const auto path = (install_root / "DownloadedCustomLevels").u8string();
+        custom_downloads.assign(path.begin(), path.end());
+    }
+    if (root_install && data_dir.empty() && g_custom_catalog_path.empty()) {
+        // Direct game starts prepare the same catalogue that Play would mount.
+        try {
+            const auto original = install_root / "game_data";
+            const auto catalog = gc::custom::scan(install_root / "CustomLevels");
+            if (!catalog.levels.empty()) {
+                const auto target = gc::custom::prepared_cache_path(install_root, original, catalog);
+                const auto prepared = gc::custom::prepare_data(original, catalog, target);
+                const auto path = prepared.data_dir.u8string();
+                data_dir.assign(path.begin(), path.end());
+            } else {
+                const auto path = original.u8string();
+                data_dir.assign(path.begin(), path.end());
+            }
+        } catch (const std::exception& e) {
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Serious Sam - Next Encounter", e.what(), nullptr);
+            return 1;
+        }
+    }
     data_dir=port::startup::data_directory(base_dir,data_dir);
+    // Hidden native tests isolate downloads just like their private card/data.
+    const auto* downloads=getenv("SSNE_CUSTOM_DOWNLOADS");
+    port::coop::configure_custom_map_downloads(downloads && *downloads?std::filesystem::u8path(downloads):custom_downloads.empty()?std::filesystem::u8path(base_dir)/"DownloadedCustomLevels":std::filesystem::u8path(custom_downloads));
+    try {
+        auto catalog=g_custom_catalog_path.empty()
+            ? gc::custom::read_prepared_catalog(std::filesystem::u8path(data_dir))
+            : gc::custom::read_catalog_file(std::filesystem::u8path(g_custom_catalog_path),std::filesystem::u8path(data_dir));
+        port::coop::configure_custom_levels(std::move(catalog));
+    } catch(const std::exception& e) {fprintf(stderr,"Cannot load custom level catalogue: %s\n",e.what());return 1;}
+    {std::ifstream fst(std::filesystem::u8path(data_dir+"/sys/fst.bin"),std::ios::binary|std::ios::ate);if(fst&&fst.tellg()>0&&fst.tellg()<4*1024*1024){std::string bytes(size_t(fst.tellg()),'\0');fst.seekg(0);fst.read(bytes.data(),bytes.size());if(bytes.find("EditorSurvivalResources.ssw")!=std::string::npos&&std::filesystem::is_regular_file(std::filesystem::u8path(data_dir+"/files/EditorSurvivalResources.ssw")))ssne::configure_native_survival_project_resources();}}
     {std::ifstream boot(std::filesystem::u8path(data_dir+"/sys/boot.bin"),std::ios::binary);char id[6]{};boot.read(id,6);g_native_frontend_enabled=boot && std::string(id,6)=="G3BP9G";}
     if(g_native_frontend_enabled)ssne::native_party_extended_memory(true);
+    if(!g_editor_debug_path.empty()){
+        if(!g_native_frontend_enabled){fprintf(stderr,"Editor logic diagnostics require the PAL game revision.\n");return 1;}
+        try{port::coop::configure_editor_logic_debug(g_editor_debug_path,g_editor_debug_token,g_coop_level);}
+        catch(const std::exception& e){fprintf(stderr,"Cannot start editor diagnostics: %s\n",e.what());return 1;}
+    }
+
     if(g_net_host || g_net_client){fprintf(stderr,"Use --coop-host or --coop-join with this integration build.\n");return 1;}
+    if(g_native_frontend_enabled && std::filesystem::exists(std::filesystem::u8path(data_dir)/"files/ps2-skin-content.txt")) {
+        // Offline play and the ordinary local multiplayer carousel need the
+        // verified character/map extension before any network session exists.
+        try { (void)port::coop::ps2_content_fingerprint(std::filesystem::u8path(data_dir),0); }
+        catch(const std::exception& e) {fprintf(stderr,"Cannot load PS2 content: %s\n",e.what());return 1;}
+        port::coop::install_ps2_profile_defaults();
+    }
     ssne::set_fatal_handler(throw_fatal);
     if (memcard.empty()) {
         // One card per region, like Dolphin (a PAL save isn't a USA save): the disc ID's 4th letter is the region.
@@ -1824,6 +2084,7 @@ int main(int argc, char** argv) {
         if(g_coop_host){g_coop_server=std::make_unique<port::coop::AuthoritativeServer>(g_coop_capacity);started=g_coop_server->start(g_lan_port,g_lan_pin,fingerprint,coop_player_name.empty()?"Host":coop_player_name,player_skin);if(started)for(unsigned i=0;i<g_initial_bots;++i)g_coop_server->add_bot(g_bot_skill);g_lan_addresses=port::netplay::local_ipv4_addresses();}
         else {g_coop_peer=std::make_unique<port::coop::AuthoritativeClient>();started=g_coop_peer->start(lan_address,g_lan_port,g_lan_pin,fingerprint,coop_player_name.empty()?"Player":coop_player_name,player_skin);}
         if(!started){fprintf(stderr,"Cannot start authoritative coop connection.\n");return 1;}
+        if(g_coop_host)native_session_fingerprint=fingerprint;
         ssne::set_authoritative_gameplay(true);ssne::gpu_set_nonblocking_frames(true);ssne::mouse_aim_set_multiplayer(true);
         if(g_coop_host && getenv("SSNE_TEST_HIDDEN")) {
             if(const char* flags=getenv("SSNE_NETPLAY_MOD_FLAGS"))ssne::mod_shared_options(uint32_t(atoi(flags)),3.f);
@@ -1834,8 +2095,8 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     timeBeginPeriod(1);  // 1 ms sleeps for the audio/VI/alarm timers (default is ~15.6 ms)
 #endif
-    if(g_coop_host || g_coop_client){const auto path=getenv("SSNE_PERF_LOG");const std::string output=path?path:g_coop_host?"performance-host.jsonl":"performance-client.jsonl";
-        if(!g_performance.open(output,g_coop_host?"host":"client"))fprintf(stderr,"Performance log could not be opened: %s\n",output.c_str());}
+    if(g_coop_host || g_coop_client || (perf_scene_fixture_enabled() && getenv("SSNE_PERF_LOG"))){const auto path=getenv("SSNE_PERF_LOG");const std::string output=path?path:g_coop_host?"performance-host.jsonl":"performance-client.jsonl";
+        if(!g_performance.open(output,g_coop_host?"host":g_coop_client?"client":"singleplayer"))fprintf(stderr,"Performance log could not be opened: %s\n",output.c_str());}
     g_log_file = fopen(g_coop_host?"ssne-coop-host.log":g_coop_client?"ssne-coop-client.log":g_net_host?"ssne-net-host.log":g_net_client?"ssne-net-client.log":"ssne.log", "w");
 
     ssne::set_log_sink([](const char* line) { log_line(line); });
@@ -1872,6 +2133,7 @@ int main(int argc, char** argv) {
     SDL_Window* win = SDL_CreateWindow("Serious Sam: Next Encounter Native", wx, wy, ww, wh,
                                        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (hidden_test?SDL_WINDOW_HIDDEN:0) |
                                            (g_set.win_max ? SDL_WINDOW_MAXIMIZED : 0));
+    g_chat_window=win;
     SDL_GLContext gl = SDL_GL_CreateContext(win);
     bool core = gl != nullptr;
     if (!gl) {  // no GL 3.3 core: fall back to a basic context and the software renderer
@@ -1938,6 +2200,7 @@ int main(int argc, char** argv) {
         port::menu_select_tab(atoi(t));
     }
     auto toggle_menu = [&] {
+        cancel_keyboard_jump();g_chat.close();g_chat_restore_capture=false;
         port::mod_menu_set_open(false);
         port::menu_set_open(!port::menu_open());
         if(hidden_test)log_line(std::string("[settings-test] open=")+(port::menu_open()?"1":"0"));
@@ -1958,9 +2221,10 @@ int main(int argc, char** argv) {
             for(const auto& player:people)if(player.connected && player.ready)++d.ready_players;
             d.local_ready=status.player.slot<people.size() && people[status.player.slot].connected && people[status.player.slot].ready;
         }
+        if(perf_scene_fixture_enabled() && !g_coop_host && !g_coop_client){d.local_ready=ssne::player_control_active() && mem_read32(ssne::game_address(0x802DB0E0))==4;d.ready_players=d.local_ready?1:0;}
         const auto gpu=ssne::gpu_renderer_stats();const auto output=ssne::gpu_renderer_output();
         d.gpu_ms=g_auto.gpu_ms;d.gpu_timer_valid=g_auto.gpu_ms>0;d.gpu_cpu_ms=gpu.frame_ms;d.pending=0;d.dropped=ssne::gpu_dropped_frames();d.draws=gpu.draws;d.copies=gpu.tex_copies;d.uploads=gpu.uploads;d.shader_programs=gpu.programs;
-        d.width=output.w;d.height=output.h;d.scale=ssne::gpu_renderer_scale();d.limit=g_set.fps_limit;d.fov=g_set.fov;d.vsync=g_set.vsync;d.paused=ssne::paused();d.focused=(SDL_GetWindowFlags(win)&SDL_WINDOW_INPUT_FOCUS)!=0;d.minimized=(SDL_GetWindowFlags(win)&SDL_WINDOW_MINIMIZED)!=0;d.background=background;
+        d.width=output.w;d.height=output.h;d.scale=ssne::gpu_renderer_scale();d.limit=g_set.fps_limit;d.fov=g_set.fov;d.vsync=g_set.vsync;d.paused=ssne::paused();d.presentation_busy=ssne::local_information_open() || ssne::local_pause_menu_open() || ssne::native_movie_presenting() || ssne::native_cutscene_presenting() || ssne::native_results_presenting() || port::menu_open() || port::mod_menu_open();d.focused=(SDL_GetWindowFlags(win)&SDL_WINDOW_INPUT_FOCUS)!=0;d.minimized=(SDL_GetWindowFlags(win)&SDL_WINDOW_MINIMIZED)!=0;d.background=background;
         g_performance.sample(d);
     };
 
@@ -1969,9 +2233,14 @@ int main(int argc, char** argv) {
     bool crosshair_reload=false;
     double swap_ms = 100;  // how long the last SwapWindow blocked (vsync); ~0 when it doesn't wait
     while (!quit) {
+        flush_native_invitation_clipboard();
+        sync_chat_session();
+        sync_multiplayer_qol();
         sync_native_mouse_mode();
         SDL_Event e;
         bool changed = false;  // settings changed by hotkeys/menu this frame
+        queue_test_key_events(win);
+        if(native_quit_requested.exchange(false,std::memory_order_acq_rel)){SDL_Event requested{};requested.type=SDL_QUIT;SDL_PushEvent(&requested);}
         while (SDL_PollEvent(&e)) {
             if (port::menu_handle_event(e, g_set, changed)) continue;  // rebinding in progress
             if (e.type == SDL_KEYDOWN || e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEWHEEL) g_input_pad = false;
@@ -1981,6 +2250,8 @@ int main(int argc, char** argv) {
                 if (slot >= 0) g_last_pad = g_pads[slot];
             }
             ImGui_ImplSDL2_ProcessEvent(&e);
+            if(handle_multiplayer_qol_event(e))continue;
+            if(handle_chat_event(e))continue;
             if(handle_native_mouse_event(e))continue;
             switch (e.type) {
             case SDL_QUIT: quit = true; break;
@@ -1998,9 +2269,12 @@ int main(int argc, char** argv) {
                     const unsigned edit_key=(sc==SDL_SCANCODE_RETURN || sc==SDL_SCANCODE_KP_ENTER)?1:sc==SDL_SCANCODE_ESCAPE?2:sc==SDL_SCANCODE_BACKSPACE?3:sc==SDL_SCANCODE_DELETE?4:0;
                     if(edit_key)port::coop::native_frontend_edit_key(edit_key);break;
                 }
+                if(!e.key.repeat && !port::menu_open() && !port::mod_menu_open() && !g_chat.active() && !ImGui::GetIO().WantCaptureKeyboard &&
+                   ssne::player_control_active() && !ssne::player_in_vehicle() && !ssne::native_results_presenting() && !g_presentation_pointer_active && !g_coop_spectating)
+                    for(const auto& binding:g_set.kb[port::ACT_L])if(binding.type==port::Bind::KEY && binding.code==sc)g_keyboard_jump_pressed=true;
                 if (sc == SDL_SCANCODE_F12 && (e.key.keysym.mod & KMOD_SHIFT)) { if (!e.key.repeat) take_screenshot(base_dir); break; }
                 if (sc == SDL_SCANCODE_F12 && !e.key.repeat) { toggle_menu(); break; }
-                if(sc==SDL_SCANCODE_INSERT && !e.key.repeat){port::mod_menu_set_open(!port::mod_menu_open());release_mouse();if(getenv("SSNE_TEST_HIDDEN"))log_line("[mod-menu-test] open="+std::to_string(port::mod_menu_open()));break;}
+                if(sc==SDL_SCANCODE_INSERT && !e.key.repeat){cancel_keyboard_jump();port::mod_menu_set_open(!port::mod_menu_open());release_mouse();if(getenv("SSNE_TEST_HIDDEN"))log_line("[mod-menu-test] open="+std::to_string(port::mod_menu_open()));break;}
                 if(sc==SDL_SCANCODE_ESCAPE && port::mod_menu_open()){port::mod_menu_set_open(false);break;}
                 if (sc == SDL_SCANCODE_ESCAPE && port::menu_open()) { toggle_menu(); break; }
                 if (sc == SDL_SCANCODE_F1 && !e.key.repeat) {
@@ -2046,9 +2320,10 @@ int main(int argc, char** argv) {
                 }
                 if (sc == SDL_SCANCODE_F2) release_mouse();
                 if(!port::menu_open() && port::coop::native_lobby_visible() && sc==SDL_SCANCODE_C){
-                    if(!e.key.repeat && g_coop_host && g_coop_engine_ready.load(std::memory_order_acquire))g_coop_engine->request_lobby_campaign(true);
+                    if(!e.key.repeat && g_coop_host)port::coop::native_frontend_lobby_map();
                     break;
                 }
+                if(!port::menu_open() && port::coop::native_lobby_visible() && sc==SDL_SCANCODE_R){if(!e.key.repeat)port::coop::native_frontend_lobby_ready();break;}
                 if(!port::menu_open() && sc==SDL_SCANCODE_RETURN && !(e.key.keysym.mod & KMOD_ALT) && (g_coop_host || g_coop_client)){
                     const auto world=g_coop_client?g_coop_peer->latest_world():nullptr;
                     const auto vote=g_coop_host?g_coop_server->skip_vote():world?world->vote:port::coop::SkipVote{};
@@ -2058,6 +2333,7 @@ int main(int argc, char** argv) {
                     }
                     if(port::coop::native_lobby_visible()){
                         if(!e.key.repeat && g_coop_host && g_coop_engine_ready.load(std::memory_order_acquire))g_coop_engine->request_lobby_campaign(false);
+                        else if(!e.key.repeat && g_coop_client)port::coop::native_frontend_lobby_ready();
                         break;
                     }
                 }
@@ -2068,7 +2344,7 @@ int main(int argc, char** argv) {
                 break;
             }
             case SDL_MOUSEBUTTONDOWN:
-                if (!hidden_test && !g_mouse_captured && !port::menu_open() && !port::mod_menu_open() && ssne::player_control_active() && !port::menu_mouse_wants_pointer() && g_set.mouse_look && !ImGui::GetIO().WantCaptureMouse &&
+                if (!hidden_test && !g_mouse_captured && !port::menu_open() && !port::mod_menu_open() && !g_chat.active() && ssne::player_control_active() && !port::menu_mouse_wants_pointer() && g_set.mouse_look && !ImGui::GetIO().WantCaptureMouse &&
                     have_game_image()) {
                     g_mouse_captured = true;
                     g_capture_click = SDL_BUTTON(e.button.button);
@@ -2096,7 +2372,7 @@ int main(int argc, char** argv) {
                 close_pad(e.cdevice.which);
                 break;
             case SDL_WINDOWEVENT:
-                if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) { cancel_native_mouse();release_mouse();g_focused=false; }
+                if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) { cancel_keyboard_jump();g_chat.close();g_chat_restore_capture=false;g_chat_key_suppressed.fill(false);g_chat_mouse_suppressed=0;cancel_native_mouse();release_mouse();g_focused=false; }
                 if (e.window.event == SDL_WINDOWEVENT_MOVED || e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
                     e.window.event == SDL_WINDOWEVENT_MAXIMIZED || e.window.event == SDL_WINDOWEVENT_RESTORED)
                     remember_window(win);
@@ -2106,7 +2382,7 @@ int main(int argc, char** argv) {
                     apply_split(win);
                 }
                 if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) g_focused = true;
-                if (e.window.event == SDL_WINDOWEVENT_MINIMIZED) {cancel_native_mouse();release_mouse();g_focused=false;}
+                if (e.window.event == SDL_WINDOWEVENT_MINIMIZED) {cancel_keyboard_jump();cancel_native_mouse();release_mouse();g_focused=false;}
                 if (e.window.event == SDL_WINDOWEVENT_CLOSE) quit = true;
                 break;
             default: break;
@@ -2151,12 +2427,12 @@ int main(int argc, char** argv) {
         bool new_frame = false;
         if (g_gpu) {
             g_loop_phase = "running GPU frames";
-            new_frame = ssne::gpu_renderer_run(2);
+            {ssne::perf::Scope submit("gpu_submit");new_frame = ssne::gpu_renderer_run(2);}
             if (!new_frame && swap_ms < 2.0) {
                 // Vsync off (or not honored by the driver): instead of spinning a CPU core on UI redraws the game
                 // thread could use, sleep until the game queues its next frame (the UI still redraws >= 200 Hz).
                 g_loop_phase = "waiting for a frame";
-                if (ssne::gpu_renderer_wait(5)) new_frame = ssne::gpu_renderer_run(2);
+                if (ssne::gpu_renderer_wait(5)) {ssne::perf::Scope submit("gpu_submit");new_frame = ssne::gpu_renderer_run(2);}
             }
             update_auto_scale(win);
             static uint32_t next_stats = SDL_GetTicks() + 10000;
@@ -2187,6 +2463,8 @@ int main(int argc, char** argv) {
         flush_crosshair_test_imgui();
         ImGui::NewFrame();
         draw_game_view();
+        draw_multiplayer_chat();
+        draw_multiplayer_qol();
         port::menu_ui::set_language(g_set.game_language>=0?unsigned(g_set.game_language):port::native_crosshair_language());
         draw_overlay(data_dir, dt);
         {
@@ -2246,7 +2524,7 @@ int main(int argc, char** argv) {
         // Present a new game image, the menus / log / messages, and every vblank in display sync (the game ticks with
         // it); otherwise only every 100 ms (the info bar), so that frame rate tools see the game's real rate.
         static uint32_t last_present = 0;
-        bool present = new_frame || port::menu_open() || port::mod_menu_open() || ssne::paused() || g_show_overlay || SDL_GetTicks() < g_toast_until ||
+        bool present = new_frame || port::menu_open() || port::mod_menu_open() || g_chat.active() || ssne::paused() || g_show_overlay || SDL_GetTicks() < g_toast_until ||
                        !have_game_image() || ssne::vi_host_sync() || (g_set.sync_display && g_set.vsync && g_set.fps_limit == 60) ||
                        SDL_GetTicks() - last_present >= 100;
         if (!present) {
@@ -2291,6 +2569,15 @@ int main(int argc, char** argv) {
         SDL_GL_SwapWindow(win);
         auto swap_t1 = std::chrono::steady_clock::now();
         swap_ms = std::chrono::duration<double, std::milli>(swap_t1 - swap_t0).count();
+        ssne::perf::record(ssne::perf::index("swap"),swap_t1-swap_t0);
+        // Count intervals only when a new game image was actually presented.
+        // UI-only swaps and reused images must not inflate the measured FPS.
+        if(new_frame){
+            static std::chrono::steady_clock::time_point last_game_present{};
+            if(last_game_present!=std::chrono::steady_clock::time_point{})
+                ssne::perf::record(ssne::perf::index("present_interval"),swap_t1-last_game_present);
+            last_game_present=swap_t1;
+        }
         {   // Display sync: the swap returned at a vertical blank; tick the game's VI with it when the display runs at
             // ~60 Hz and every swap waits for vsync (checked continuously; any irregularity falls back to the timer).
             static auto last_swap = swap_t1;

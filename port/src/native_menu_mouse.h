@@ -25,6 +25,8 @@ struct NativeMenuMouseSnapshot {
     uint64_t surface_generation=0, geometry_generation=0;
 };
 void queue_native_menu_pointer(const NativeMenuPointerEvent&);
+// Observe queued GUI work without consuming it or changing its generation.
+bool native_menu_pointer_pending();
 // The display thread supplies the same factor used to fit the displayed image.
 void set_native_menu_mouse_display(float wide);
 NativeMenuMouseSnapshot native_menu_mouse_snapshot();
@@ -57,6 +59,9 @@ struct NativeMenuMouseServices {
     std::function<std::vector<NativeMenuMouseRegion>(PPCContext&)> regions;
     std::function<bool(uint32_t gui,uint32_t node,uint16_t root,uint16_t id)> model_region;
     std::function<int(uint32_t gui,uint32_t node,uint16_t root,uint16_t id)> model_owner;
+    // Opt in only when a diagnostic consumer needs the copied widget JSON.
+    // Hit testing, snapshots and native interactions do not depend on it.
+    bool diagnostics=false;
 };
 void configure_native_menu_mouse(NativeMenuMouseServices);
 // Hidden diagnostics expose only copied numeric state, never live UI-thread RAM.

@@ -1,37 +1,23 @@
-# SSNE-Native-Multiplayer
+# SSNE-RECOOP-Native
 
 Unofficial Windows native port of **Serious Sam: Next Encounter** with integrated
 multiplayer. Based on Silly ReEncounter and SSNE-Native. The launcher builds the
 game locally from your own supported GameCube disc image.
 
-## Download and play
+## Download and play on Windows
 
-1. Download the Windows ZIP from [Releases](https://github.com/Master290600/SSNE-Native-Multiplayer/releases/latest).
-   Use the launcher ZIP listed under **Assets**; GitHub's **Source code** archives are for development.
-2. Extract it into an ASCII path such as `C:/Games/SSNE-Native-Multiplayer`.
-3. Run `SSNE-Native.exe` and select your own **European/PAL GameCube image,
-   G3BP9G (English/French/German)**. ISO, GCM and RVZ are supported.
-4. Choose **Install Game / Build Game**, then **Play**. The required compiler is
-   downloaded automatically from its official, checksum-pinned release. No Python
-   installation or separate multiplayer CMD is required for players.
-5. In the original game menu choose **Mehrspieler / Multiplayer** to host or join.
-   Both players need the same runtime build. The current package uses **build 204,
-   protocol 63**.
+1. Download the Windows x64 launcher ZIP under **Assets** on the [1.2.8 release page](https://github.com/Master290600/SSNE-Native-Multiplayer/releases/tag/v1.2.8).
+2. Extract the complete ZIP into a writable folder with a short ASCII path, such as `C:/Games/SSNE`.
+3. Run `SSNE-RECOOP-Native.exe`, select your own European GameCube disc image (G3BP9G, revision 0, English/French/German), and choose **Install Game** or **Build Game**. The package includes the compiler and recompiler.
+4. Choose **Play** or open `SSNE-Native-Game.exe` in the installation folder. Choose **Online** in the main menu to host or join. All participants should use version 1.2.8 (multiplayer build 242, protocol 70).
 
-The release contains the launcher, tools, native runtime/build kit, patch recipe,
-licenses and source. Original disc images, extracted media, full generated game
-translations, built game executables and personal saves are created locally.
+Build Game also installs the 15 official PS2 multiplayer maps, their previews, six player skins and the Online menu icon from the included content pack. Your European GameCube disc is the only disc you need.
 
-This is an experimental multiplayer build. Component tests and focused host/client
-checks do not certify every campaign level or every network condition. See
-[release notes](docs/RELEASE-NOTES-204.md) for the tested scope and limitations.
+Upgrading from v1.2.7.204 requires a manual update. Close the game and launcher, extract the complete 1.2.8 Windows ZIP into your installation folder, then open `SSNE-RECOOP-Native.exe` and choose **Build Game**. The older updater expects the previous launcher name and protocol.
 
-Use **F12 > Game and menu language** to choose English, German or French.
-F12 changes immediately; the original PAL game menus apply the choice after
-restarting. Automatic follows the original game setting.
+Open **F12 > Game and menu language** for English, German or French. F12 applies the choice immediately. Restart the game to apply the language to the original PAL menus.
 
-Launcher updates use this repository's releases. Developer build instructions are
-in [docs/BUILDING.md](docs/BUILDING.md), credits in [docs/CREDITS.md](docs/CREDITS.md).
+[Build from source](docs/BUILDING.md) · [Credits](docs/CREDITS.md)
 
 ## About the native port
 
@@ -43,29 +29,16 @@ runs with a PC port that handles graphics (OpenGL), sound, keyboard, mouse and g
 SSNE-Native is a fork of [Silly ReEncounter](https://github.com/takoshero96/Silly-ReEncounter) by takoshero96,
 which made all of this possible. It adds a Linux version, fixes and PC-style controls (see
 [What SSNE-Native adds](#what-ssne-native-adds)). Its full name is **Serious Sam: Next Encounter Native**; the programs are
-`SSNE-Native` (the launcher) and `SSNE-Native-Game` (until 1.2 they kept the original names `SillyReEncounter` and
+`SSNE-RECOOP-Native` (the launcher) and `SSNE-Native-Game` (until 1.2 they kept the original names `SillyReEncounter` and
 `SSNE-Native-Game`).
 
 **This repository contains no game code and no game data.** You need your own copy of the game.
 
 ## Normal Windows launcher with native multiplayer
 
-The integrated Windows package for the supported European/PAL `G3BP9G` disc uses
-**SSNE-Native.exe > Install/Build Game > Play** for both singleplayer and
-multiplayer. Choose **Multiplayer** in the original game main menu to host or
-join. A missing/outdated native build is also created by Play and then started
-automatically. No separate multiplayer CMD or Python installation is needed.
-Existing multiplayer settings and the host memory card stay in `Multiplayer/`.
-Mouse focus changes use the original game navigation sound; repeated movement
-within the selected control stays silent and the original SFX volume is respected.
-Other disc regions and the Linux launcher keep their standard build path.
-The existing native game runtime still needs an ASCII installation path; the
-launcher/backend Unicode tests do not imply Unicode support in game file I/O.
+The launcher builds the game in the installation folder. Multiplayer settings and the host memory card are kept in `Multiplayer/`. Use **Online** for network play and **Multiplayer** for local split-screen.
 
-The launcher applies the reviewed sparse PAL translation recipe natively and
-verifies the runtime kit, compiler, recompiler, symbols and owned disc. Build
-caches are separate from the standard game. Cancelled/failed builds retain the
-previous playable executable. See [the integrated package guide](data/release/NATIVE-MULTIPLAYER.txt).
+Hosts can copy an invitation code from the lobby. Friends can join with the code or find a local host in the LAN server browser. The lobby shows the map, players, ready status and session rules. In a match, press **T** to chat, **Enter** to send and **Esc** to cancel. F12 includes multiplayer key bindings and the team display.
 
 ### Custom crosshair PNGs
 
@@ -95,17 +68,14 @@ size; **14** means 14/32 of that size, rather than 14 fixed screen pixels.
 - A GPU with **OpenGL 3.3** and an up-to-date driver, and about **3 GB** of free disk space.
 - **Linux:** a C++ compiler, which builds the game on your PC. `clang` is recommended (faster), `g++` works too:
   `sudo pacman -S clang` (Arch), `sudo apt install clang` (Debian/Ubuntu), `sudo dnf install clang` (Fedora).
-- **Windows:** an internet connection for the first install; the launcher downloads the free LLVM-MinGW compiler
-  once (about 146 MB) from its official GitHub release.
+- **Windows:** the 1.2.8 launcher package includes the LLVM-MinGW compiler for the local game build.
 
 ## How to play
 
-1. **Download the launcher package** for your system from
-   [Releases](https://github.com/SashexSRB/SSNE-Native/releases) (`...-Linux-x86_64.tar.gz` or
-   `...-Windows-x64.zip`) and unpack it into a folder you can write to: the game data, saves and settings are
+1. **Unpack the launcher package** for your system into a folder you can write to: the game data, saves and settings are
    kept next to it. The package contains the launcher and the build kit, but no game code. To build it yourself,
    see [docs/BUILDING.md](docs/BUILDING.md).
-2. **Start the launcher**: `SSNE-Native` (Linux) or `SSNE-Native.exe` (Windows).
+2. **Start the launcher**: `SSNE-RECOOP-Native` (Linux) or `SSNE-RECOOP-Native.exe` (Windows).
 3. **Select Disc**: pick your disc image, or drag it onto the launcher window. The launcher checks that it is the
    right game:
    - *Verified*: a known good dump.
@@ -130,7 +100,7 @@ Everything made from your disc (`game_data`, `SSNE-Native-Game`) is only for you
 
 ## Controls
 
-**Keyboard and mouse** (change them in F12 â€º Keyboard & Mouse, up to three keys or buttons per control):
+**Keyboard and mouse** (change them in F12 › Keyboard & Mouse, up to three keys or buttons per control):
 
 | Key | Action | Key | Action |
 |---|---|---|---|
@@ -139,7 +109,7 @@ Everything made from your disc (`game_data`, `SSNE-Native-Game`) is only for you
 | E | use, enter / exit vehicles | R | reload, switch ammo type |
 | Right mouse | sniper rifle zoom (hold) | Q | next weapon; **hold** for the weapon wheel |
 | Mouse wheel | next / previous weapon | F | previous weapon |
-| 1 â€“ 9 | weapons (see below) | Tab | NETRICSA |
+| 1 – 9 | weapons (see below) | Tab | NETRICSA |
 | Esc / Enter | pause | | |
 
 - **Weapon wheel:** hold Q, move the mouse towards a weapon, release Q to take it.
@@ -153,9 +123,9 @@ Everything made from your disc (`game_data`, `SSNE-Native-Game`) is only for you
 
 **Gamepad** (Xbox layout by default; PlayStation, Switch Pro and most others work): A jump (also selects in menus),
 X use, B back, RT fire, LB / RB switch weapons, Y = the GameCube's Z, Start pause, Back = settings menu.
-F12 â€º Gamepad has a "GameCube layout" button, rumble settings and the on-screen button style.
+F12 › Gamepad has a "GameCube layout" button, rumble settings and the on-screen button style.
 
-**Hotkeys** (also listed in F12 â€º Hotkeys):
+**Hotkeys** (also listed in F12 › Hotkeys):
 
 | Key | Action |
 |---|---|
@@ -175,20 +145,17 @@ F12 â€º Gamepad has a "GameCube layout" button, rumble settings and the on-s
 - **Where things are kept** (next to the game): `settings.ini`, memory card saves in `saves/`, save states in
   `states/`, screenshots in `Screenshots/`, and compiled shaders in `shadercache/` (safe to delete).
 - **First start:** the game's shaders are compiled in the background, shown by a "Preparing shaders" box in the
-  bottom-right corner (F12 â€º Graphics can hide it). The frame rate can dip until it's done; later starts load them
+  bottom-right corner (F12 › Graphics can hide it). The frame rate can dip until it's done; later starts load them
   from `shadercache/`.
-- **Frame rate:** gameplay on foot follows your frame rate limit (F10, lowest 40). Menus, cutscenes and vehicles always run
-  at the original 60 fps, because their animations and the jeep's physics depend on it.
-- **Slow on your PC?** F12 â€º Graphics â€º Presets â€º Low. Automatic resolution (on by default) already lowers the
+- **Frame rate:** use F10 to change the gameplay frame-rate limit. NETRICSA's blue background animation follows elapsed game time.
+- **Slow on your PC?** F12 › Graphics › Presets › Low. Automatic resolution (on by default) already lowers the
   internal resolution when the GPU can't keep up.
 - **Updates install themselves** (1.2): when it starts, the launcher checks for a newer release on GitHub and offers
   to install it, then restarts and rebuilds the game if the engine changed. `check_updates=0` in `launcher.ini`
   turns the check off.
 - **Launcher lettering**: uses Boink LET (the font of the game's menus) if it's installed on your PC.
-- **Widescreen** (16:9 / 21:9 / automatic, which follows the window's shape; F8) applies in gameplay; menus (also pause, NETRICSA and briefings) and cutscenes
-  stay 4:3, because the game places 3D models into 2D menu layouts. A blurred copy of the picture fills the sides
-  (F12 â€º Graphics â€º Fill the sides of 4:3 screens). The HUD moves out to the screen edges (F12 â€º Graphics).
-- **Cheats** (single player or multiplayer host, F12 â€º Cheats; experimental, they can break the game): invulnerable, infinite ammo, all
+- **Widescreen:** choose 16:9, 21:9 or Automatic (F8). NETRICSA retains the selected aspect ratio when switching between a mission briefing and a weapon entry. The level score screen also supports widescreen. F12 has additional HUD and side-fill options.
+- **Cheats** (single player or multiplayer host, F12 › Cheats; experimental, they can break the game): invulnerable, infinite ammo, all
   weapons with full ammo, faster movement (up to 300%), higher jumps (up to 500%), flying, more weapon damage (up to
   1000%) and unlock everything (the 10 lost levels, the gallery and the game's treasure cheats, without
   collecting the treasure; nothing is written to the memory card). They work at once, also in a running level.
@@ -196,11 +163,11 @@ F12 â€º Gamepad has a "GameCube layout" button, rumble settings and the on-s
   clients can view these settings. Jump raises the flying player; fire lowers them.
 - **Local multiplayer** (split screen for 2-4 players): plug in a controller per player and choose MultiPlayer;
   every player presses A to join. Co-operative is for 2 players, Deathmatch, Hold the Flag and Pass the Bomb for up
-  to 4. F12 â€º Players sets who plays which player (keyboard & mouse, controllers 1-4) and how two players share the
+  to 4. F12 › Players sets who plays which player (keyboard & mouse, controllers 1-4) and how two players share the
   screen (side by side or top and bottom). Each view keeps its HUD at its own edges in widescreen, and rumble goes to
   the controller of the player who is hit. Works over the internet with Parsec or Steam Remote Play Together: the
   remote players' controllers show up like your own.
-- **Sharpest image:** F12 â€º Graphics â€º Internal resolution â€º Native renders at exactly your screen or window
+- **Sharpest image:** F12 › Graphics › Internal resolution › Native renders at exactly your screen or window
   resolution (e.g. 1920x1080 in widescreen gameplay on a 1080p screen); Automatic picks a multiple of 640x448.
 - **Pause in the background** (on by default): switching to another window pauses and silences the game.
 - **Graphics thread and GPU vertex processing:** the game's graphics commands are processed on their own CPU thread,
@@ -233,9 +200,9 @@ See [docs/BUILDING.md](docs/BUILDING.md).
 
 | Part | Path | What it does |
 |---|---|---|
-| Launcher (`SSNE-Native`) | `launcher/` | Disc selection and verification, install, builds the game with the build kit, starts it |
+| Launcher (`SSNE-RECOOP-Native`) | `launcher/` | Disc selection and verification, install, builds the game with the build kit, starts it |
 | Disc library | `libgc/` | ISO/GCM and Dolphin formats, file system, DOL, SHA-1, verification |
-| Recompiler (`ssne-recomp`) | `recomp/` | Translates the game's PowerPC `main.dol` to C++ (all 489,232 instructions, 7,919 functions) |
+| Recompiler (`build-kit/SSNE-RECOOP-Native`) | `recomp/` | Translates the game's PowerPC `main.dol` to C++ (all 489,232 instructions, 7,919 functions) |
 | Runtime | `runtime/` | CPU state, memory, hardware (GX graphics on OpenGL, AX audio, controllers, memory card), threads |
 | PC port (`SSNE-Native-Game`) | `port/` | SDL2 window, audio, input, F12 settings menu, F1 statistics |
 | Tools | `tools/` | `gctool` (disc images), headless runner, GPU frame replay, release scripts |

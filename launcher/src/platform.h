@@ -8,6 +8,7 @@ namespace platform {
 
 // Native "Open file" dialog. Returns empty string if cancelled/unavailable. UTF-8 paths.
 std::string open_file_dialog(const char* title);
+std::string open_png_dialog(const char* title);
 // Directory containing the running executable (UTF-8, no trailing slash).
 std::string exe_dir();
 // Read environment values without losing Unicode on Windows.

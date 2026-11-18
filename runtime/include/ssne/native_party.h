@@ -5,6 +5,7 @@
 #include <array>
 #include <optional>
 #include <string>
+#include <functional>
 namespace ssne {
 void native_party_stabilize_idle(PPCContext&,uint32_t actor,const std::array<float,3>& before);
 struct NativeSegmentHit {std::array<float,3> position{},normal{};uint32_t flags=0;};
@@ -18,6 +19,11 @@ bool native_party_prepare_spawn(PPCContext&,uint32_t actor,unsigned request);
 void native_party_spawn_completed(uint32_t actor);
 uint64_t native_party_spawn_revision(uint32_t actor);
 bool native_party_request_join_spawn(PPCContext&,uint32_t actor,std::string& error);
+// Full original cooperative death/restart lifecycle, unlike join placement.
+// Authority guest thread only. A false waiting result stays inactive and is
+// retried by native_party_retry_waiting; readiness requires a completed spawn
+// revision, no pending placement and a healthy nondead native actor.
+bool native_party_request_respawn(PPCContext&,uint32_t actor,std::string& error);
 void native_party_cancel_join_spawn(uint32_t actor);
 bool native_party_spawn_waiting(uint32_t actor);
 bool native_party_retry_spawn(PPCContext&,uint32_t actor);
@@ -47,8 +53,13 @@ unsigned native_party_view_last();
 uint32_t native_party_controller_offset(uint32_t slot);
 void native_party_controller_channel(PPCContext& ctx);
 uint32_t native_party_view_engine(uint32_t engine);
+// Fresh owner/type/range check for the dedicated relocated view-only block.
+bool native_party_render_layout_safe(uint32_t engine);
 uint32_t native_party_view_slot(uint32_t slot);
 uint32_t native_party_frame_view_mask(uint32_t canonical);
+// Guest-thread session lifetime only. A missing/failing gate keeps legacy updates.
+void native_party_set_camera_update_gate(const void* owner,std::function<bool()> gate);
+void native_party_clear_camera_update_gate(const void* owner);
 uint32_t native_party_frame_camera(uint32_t engine,unsigned physical_slot);
 void native_party_initialize_player_masks(PPCContext&,uint32_t engine);
 uint32_t native_party_pickup_flags(uint32_t pickup);

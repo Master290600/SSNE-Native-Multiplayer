@@ -3,6 +3,7 @@
 #include "native_presentation.h"
 #include "client_presentation.h"
 #include "native_lifecycle.h"
+#include "native_particles.h"
 #include "ssne/native_entity.h"
 #include "ssne/runtime.h"
 #include "ssne/game_addresses.h"
@@ -291,6 +292,7 @@ std::unique_ptr<NativeWorld::PreparedLifetimes> NativeWorld::prepare_lifetimes(c
         std::array<float,3> spawn;for(auto& v:spawn)v=u2f(in.u32());if(flags&8)r.spawn=spawn;
         if(!r.id || r.id>=next || flags>31 || (r.factory_spawn && !r.spawn) || !readable(r.address,0x4C) || !readable(r.vtable,4))return fail("Invalid saved native lifetime");
         if(r.registered && mem_read32(r.address+0x48)!=r.vtable)return fail("Saved native lifetime does not match restored game memory");
+        if(r.registered && r.vtable==native_particles_vtable){EntityState verified;if(!capture_native_particles(r.address,verified,error))return {};}
         if(r.spawn)for(float v:spawn)if(!std::isfinite(v) || std::abs(v)>1000000.f)return fail("Invalid saved native spawn position");
         if(!records.emplace(r.address,r).second || !by_id.emplace(r.id,r.address).second)return fail("Duplicate saved native lifetime identity");
     }
@@ -333,9 +335,12 @@ std::vector<NativeWorld::PlayerBinding> NativeWorld::player_bindings() const {
         if(slot<ssne::native_party_capacity() && (mem_read32(ssne::native_party_registry()+slot*4)==address || ssne::native_party_spawn_waiting(address)))out.push_back({address,slot});
     }return out;
 }
+uint64_t NativeWorld::current_epoch() const {std::lock_guard lock(impl_->mutex);return impl_->epoch;}
 NativeWorldSample NativeWorld::capture(uint64_t tick) const {return capture(tick,false);}
 NativeWorldSample NativeWorld::capture_bindings() const {return capture(0,true);}
-NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only) const {
+NativeWorldSample NativeWorld::capture_before_pose_preparation(uint64_t tick) const {return capture(tick,false,true);}
+NativeWorldSample NativeWorld::capture_for_publication(uint64_t tick,bool defer_actor_poses) const {return capture(tick,false,defer_actor_poses,true);}
+NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only,bool defer_actor_poses,bool connected_players_only) const {
     auto& state=*impl_;std::lock_guard lock(state.mutex);NativeWorldSample sample;
     sample.epoch=state.epoch;sample.tick=tick;sample.created=state.created;sample.registered=state.registered;sample.removed=state.removed;
     sample.mode=mem_read32(ssne::game_address(0x802DB1BC));sample.scene=mem_read32(ssne::game_address(0x802DB0E0));
@@ -344,7 +349,8 @@ NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only) const {
         if(!record.registered || !readable(address,0x4C) || mem_read32(address+0x48)!=record.vtable)continue;
         const bool trigger=mem_read32(0x80000000u)==0x47334250u && record.vtable==0x80209758u;
         const bool button=mem_read32(0x80000000u)==0x47334250u && record.vtable==0x80208B60u;
-        const bool script=trigger || button;
+        const bool particles=mem_read32(0x80000000u)==0x47334250u && record.vtable==native_particles_vtable;
+        const bool script=trigger || button || particles;
         const bool marker=mem_read32(0x80000000u)==0x47334250u && native_marker_class(record.vtable);
         const bool brush=mem_read32(0x80000000u)==0x47334250u && record.vtable==0x80206868u;
         const bool model_destructible=record.vtable==0x80206348u;
@@ -356,10 +362,14 @@ NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only) const {
         const bool detached_rotor=record.vtable==0x8020B228u && readable(address,0x118) && !mem_read32(address+0xDC);
         bool player=record.vtable==player_vtable();bool pickup=record.pickup || pickup_vtable(record.vtable);
         if(!player && !record.actor && !pickup && !brush && !script && !projectile && !marker && !corpse && !detached_rotor && !piece && !destructible){sample.unmapped.push_back({address,record.vtable});continue;}
-        if(!readable(address,player?0x790:pickup?0x184:projectile?projectile_type->size:brush?0x13C:trigger?0xA8:button?0x68:0xD4))continue;
+        if(!readable(address,player?0x790:pickup?0x184:projectile?projectile_type->size:brush?0x13C:trigger?0xA8:button?0x68:particles?0x64:0xD4))continue;
+        if(player && connected_players_only){
+            const auto slot=mem_read32(address+0x17C);
+            if(slot>=max_players || !state.owners[slot].generation)continue;
+        }
         auto xyz=position(address);if(!xyz)continue;
-        EntityState entity;entity.id=record.id;entity.kind=destructible?EntityKind::Destructible:corpse || detached_rotor || piece?EntityKind::Physics:player?EntityKind::Player:pickup?EntityKind::Pickup:projectile?EntityKind::Projectile:brush?EntityKind::Door:trigger?EntityKind::Mission:button?EntityKind::Switch:marker?EntityKind::Physics:EntityKind::Enemy;
-        entity.definition=piece?5:destructible?(model_destructible?2:1):detached_rotor?4:corpse?3:player?2:pickup?mem_read32(address+0x180):projectile?projectile_type->definition:brush || script?1:marker?(record.vtable==0x802054A0u?1:2):record.definition;
+        EntityState entity;entity.id=record.id;entity.kind=destructible?EntityKind::Destructible:corpse || detached_rotor || piece?EntityKind::Physics:player?EntityKind::Player:pickup?EntityKind::Pickup:projectile?EntityKind::Projectile:brush?EntityKind::Door:trigger || particles?EntityKind::Mission:button?EntityKind::Switch:marker?EntityKind::Physics:EntityKind::Enemy;
+        entity.definition=particles?native_particles_definition:piece?5:destructible?(model_destructible?2:1):detached_rotor?4:corpse?3:player?2:pickup?mem_read32(address+0x180):projectile?projectile_type->definition:brush || script?1:marker?(record.vtable==0x802054A0u?1:2):record.definition;
         if((corpse || detached_rotor || piece) && !record.factory_spawn){auto& stored=state.records.at(address);stored.spawn=*xyz;stored.factory_spawn=true;}
         entity.properties["position"]=*xyz;
         if(brush)entity.properties["brush_index"]=int64_t(mem_read32(address+0x50));
@@ -430,7 +440,7 @@ NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only) const {
             entity.properties[prefix+"visible"]=int64_t(binding->model?mem_read8(binding->model+0x2D):0);
             if(binding->model){
                 for(unsigned row=0;row<3;++row){std::array<float,4> values{};
-                    for(unsigned col=0;col<4;++col){values[col]=u2f(mem_read32(binding->matrix+row*16+col*4));if(!std::isfinite(values[col]) || std::abs(values[col])>1000000.f){sample.error="Invalid native render matrix";return sample;}}
+                    for(unsigned col=0;col<4;++col){values[col]=u2f(mem_read32(binding->matrix+row*16+col*4));if(!std::isfinite(values[col]) || std::abs(values[col])>1000000.f){sample.error="Invalid native render matrix: object="+std::to_string(address)+" kind="+std::to_string(unsigned(entity.kind))+" definition="+std::to_string(entity.definition)+" model_index="+std::to_string(model_index)+" matrix="+std::to_string(binding->matrix)+" row="+std::to_string(row)+" col="+std::to_string(col)+" bits="+std::to_string(mem_read32(binding->matrix+row*16+col*4));return sample;}}
                     entity.properties[prefix+"row"+std::to_string(row)]=values;
                 }
             }
@@ -443,7 +453,7 @@ NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only) const {
             entity.properties["part_mask"]=int64_t(mem_read32(binding->model+0x30));entity.properties["part_flags"]=int64_t(mem_read32(address+0x1C));
             if(!validate_native_npc_piece(entity,sample.error))return sample;
         }
-        if(player)for(unsigned part=0;part<4;++part)if(auto binding=native_body_pose_binding(address,part);binding && binding->model){
+        if(player && !defer_actor_poses)for(unsigned part=0;part<4;++part)if(auto binding=native_body_pose_binding(address,part);binding && binding->model){
             const auto prefix="body"+std::to_string(part)+"_bone_";
             std::vector<float> values;bool finite=true;
             for(unsigned i=0;i<binding->count*12;++i){auto f=u2f(mem_read32(binding->matrices+i*4));finite&=std::isfinite(f) && std::abs(f)<=10000.f;values.push_back(f);}
@@ -474,6 +484,9 @@ NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only) const {
             if(!index || *index<0){sample.error="Native script level index not ready";return sample;}
             entity.properties["script_index"]=*index;
             entity.properties["script_enabled"]=int64_t(mem_read32(address+0x4C));
+            if(particles) {
+                if(!capture_native_particles(address,entity,sample.error))return sample;
+            } else {
             std::vector<int64_t> references;
             for(unsigned i=0;i<(trigger?11u:1u);++i) {
                 auto reference=native_script_reference(mem_read32(address+0x58+i*4));
@@ -488,6 +501,7 @@ NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only) const {
             } else {
                 entity.properties["switch_enabled"]=int64_t(mem_read32(address+0x60));
                 entity.properties["switch_available"]=int64_t(mem_read32(address+0x64));
+            }
             }
         }
         if(brush) {
@@ -507,7 +521,7 @@ NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only) const {
             std::array<float,3> rotation,scale;bool valid_pose=true;
             for(unsigned i=0;i<3;++i){rotation[i]=u2f(mem_read32(address+0x2C+i*4));scale[i]=u2f(mem_read32(address+0x68+i*4));valid_pose&=std::isfinite(rotation[i]) && std::abs(rotation[i])<=10000 && std::isfinite(scale[i]) && scale[i]>0 && scale[i]<=100;}
             if(valid_pose){entity.properties["enemy_rotation"]=rotation;entity.properties["enemy_scale"]=scale;}
-            if(auto binding=corpse?native_corpse_pose_binding(address):native_enemy_pose_binding(address)) {
+            if(auto binding=defer_actor_poses?std::optional<NativeEnemyPoseBinding>{}:corpse?native_corpse_pose_binding(address):native_enemy_pose_binding(address)) {
                 std::vector<float> pose;bool finite=true;
                 for(unsigned i=0;i<binding->count*12;++i){const auto f=u2f(mem_read32(binding->matrices+i*4));finite&=std::isfinite(f) && std::abs(f)<=10000.f;pose.push_back(f);}
                 if(finite){entity.properties["enemy_bone_count"]=int64_t(binding->count);entity.properties["enemy_bone_layout"]=int64_t(binding->layout);entity.properties["enemy_bone_matrices"]=std::move(pose);}

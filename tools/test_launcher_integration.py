@@ -14,7 +14,12 @@ from test_native_mouse_multiplayer import MultiplayerMenus,host_create,client_jo
 LAUNCHER_COMMAND='launcher-command.txt'
 LAUNCHER_STATE='launcher-test-state.json'
 PROCESS_LOG='launcher-processes.jsonl'
-MP_REL=Path('Multiplayer/SSNE-Native-Multiplayer-Game.exe')
+MP_REL=Path('SSNE-Native-Game.exe')
+LEGACY_REL=Path('Multiplayer/SSNE-Native-Multiplayer-Game.exe')
+
+def play_target(base):
+ manifest=json.loads((base/'Multiplayer/release-manifest.json').read_text(encoding='utf-8-sig'))
+ return base/(MP_REL if manifest.get('project_executable')==MP_REL.name else LEGACY_REL)
 SETTINGS='[graphics]\nrenderer=gpu\nscale=1\naspect=3\nhud_edges=1\nside_fill=1\nvsync=0\nwindow_w=960\nwindow_h=540\ntop_bar=0\nfullscreen=0\nfov=73\nfps_limit=60\n[audio]\nmuted=1\n[general]\npause_unfocused=0\n'
 
 
@@ -229,6 +234,8 @@ def copy_package(a,report):
   shutil.copytree(seed/'game_data',base/'game_data')
   for name in ('SSNE-Native-Multiplayer-Game.exe','SSNE-Native-Multiplayer.exe'):
    if (seed/'Multiplayer'/name).exists():shutil.copy2(seed/'Multiplayer'/name,mp/name)
+  for name in (MP_REL, Path('Multiplayer/native-build.json')):
+   if (seed/name).is_file():shutil.copy2(seed/name,base/name)
   # Retain a real recipe/build stamp if the staged package contains one.
   source=seed/'build-kit/built-with.txt'
   if source.exists():shutil.copy2(source,base/'build-kit/built-with.txt')
@@ -240,9 +247,9 @@ def copy_package(a,report):
    if not source.is_file():continue
    relative=source.relative_to(a.overlay)
    if any(part in ('work','native-multiplayer-work','downloads','__pycache__','.git') for part in relative.parts):continue
-   if relative.parts[0] not in ('build-kit','source-multiplayer','Multiplayer') and relative.name not in (a.launcher_name,'known_dumps.txt') and source.suffix.lower()!='.dll':continue
-   if relative.parts[0]=='Multiplayer' and relative.name not in ('release-manifest.json','skins.bin','SSNE-Native-Multiplayer-Game.exe','SSNE-Native-Multiplayer.exe'):continue
-   if a.case!='adopt' and relative.name in ('SSNE-Native-Multiplayer-Game.exe','SSNE-Native-Multiplayer.exe'):continue
+   if relative.parts[0] not in ('build-kit','source-multiplayer','Multiplayer') and relative.name not in (a.launcher_name,'known_dumps.txt',MP_REL.name) and source.suffix.lower()!='.dll':continue
+   if relative.parts[0]=='Multiplayer' and relative.name not in ('release-manifest.json','native-build.json','skins.bin','SSNE-Native-Multiplayer-Game.exe','SSNE-Native-Multiplayer.exe'):continue
+   if a.case!='adopt' and relative.name in (MP_REL.name,'native-build.json','SSNE-Native-Multiplayer-Game.exe','SSNE-Native-Multiplayer.exe'):continue
    destination=base/relative;destination.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source,destination);copied.append(relative.as_posix())
   report['integration_overlay']=str(a.overlay);report['overlay_files']=copied
  for directory in (base/'saves',mp/'saves'):directory.mkdir(exist_ok=True)
@@ -255,10 +262,9 @@ def copy_package(a,report):
   assert not target.exists() and not (base/'game_data').exists()
   assert not any(path.is_file() for path in (base/'build-kit').rglob('*') if any(part in ('work','native-multiplayer-work') for part in path.relative_to(base/'build-kit').parts))
  if a.case=='repair':
-  # Remove only the two resolved private-copy game names, preventing a valid
-  # compatibility alias from satisfying repair without a real cold rebuild.
+  # Rebuild the root game and both compatibility aliases in the private install.
   report['private_repair_removed']=[]
-  for path in (target,mp/'SSNE-Native-Multiplayer.exe'):
+  for path in (target,base/LEGACY_REL,mp/'SSNE-Native-Multiplayer.exe'):
    assert path.resolve().is_relative_to(base.resolve())
    if path.exists():path.unlink();report['private_repair_removed'].append(str(path))
  report['private_base']=str(base);report['cold_no_game_exe_or_extracted_data']=a.case=='cold';report['translated_game_cache_seeded']=keep_private_cache;report['cache_seed_scope']='Only the separate repair case may copy objects from a completed passing private cold build.'
@@ -283,7 +289,7 @@ def wait_main(m,p,role='host'):
 
 
 def native_smoke(a,h,launch,report):
- target=h.base/MP_REL;host=ExistingProcess(launch['pid']);h.children.append(host);assert same_path(host.image_path(),target),('Actual child image mismatch',host.image_path(),target)
+ target=play_target(h.base);host=ExistingProcess(launch['pid']);h.children.append(host);assert same_path(host.image_path(),target),('Actual child image mismatch',host.image_path(),target)
  argv=list(launch.get('argv',[]))
  if argv and same_path(argv[0],target):argv=argv[1:]
  assert '--data' in argv and same_path(argv[argv.index('--data')+1],h.base/'game_data'),launch
@@ -307,7 +313,7 @@ def native_smoke(a,h,launch,report):
   m.wait(lambda:bool(card_paths()),10);cards=card_paths()
   assert same_path(cards[-1],game_args.card),('Actual default card path mismatch',cards,game_args.card);report['effective_memcard_path']=cards[-1]
   if a.smoke in ('menu','singleplayer'):
-   pointer.click(0x3f,root=0x3d);m.wait(lambda:m.state().get('page')==1,15);report['native_multiplayer_home_observed']=True;pointer.click(0x14d);pointer.expect_root(0x3d)
+   pointer.click(0x15c,root=0x3d);m.wait(lambda:m.state().get('page')==1,15);report['native_multiplayer_home_observed']=True;pointer.back();pointer.expect_root(0x3d)
   if a.smoke=='host-client':
    host_create(pointer);client_join_and_roles(pointer);begin_campaign(pointer);report['new_artifact_both_gameplay_ready']={role:m.performance(role) for role in ('host','client')};leave_sessions(pointer)
   elif a.smoke=='singleplayer':
@@ -328,7 +334,7 @@ def native_smoke(a,h,launch,report):
 def main():
  parser=argparse.ArgumentParser(description=__doc__)
  for name in ('package','disc','card','output'):parser.add_argument('--'+name,type=Path,required=True)
- parser.add_argument('--resume-built-from',type=Path,help='Resume Play after a prior completed cold build stopped only at its metadata comparison; prior build proof is retained.');parser.add_argument('--ascii-package-path',action='store_true',help='Run the pinned197 game under an ASCII package path with spaces; Unicode backend proof is separate.');parser.add_argument('--repair-from-cold',type=Path,help='Repair only: copy the verified private package/cache from a prior passed cold-case output.');parser.add_argument('--build-via-play',action='store_true',help='Repair only: click Play once and require build followed by exactly one automatic native-game launch.');parser.add_argument('--overlay',type=Path,help='Frozen integration overlay applied to a private copy of --package.');parser.add_argument('--launcher-name',default='SSNE-Native.exe');preparation=parser.add_mutually_exclusive_group();preparation.add_argument('--prepare-only',action='store_true',help='Only copy the private sandbox and write preparation.json; no launch/build/test acceptance.');preparation.add_argument('--use-prepared',action='store_true',help='Run a previously prepared sandbox at --output without making another package copy.');parser.add_argument('--case',choices=('cold','adopt','repair'),default='cold');parser.add_argument('--smoke',choices=('menu','host-client','singleplayer'),default='host-client');parser.add_argument('--reference-exe',type=Path);parser.add_argument('--disc-sha1',default='70296be19673cc0216f45f6040541a81e507497d');parser.add_argument('--port',type=int,default=27980);parser.add_argument('--build-timeout',type=int,default=1800);a=parser.parse_args()
+ parser.add_argument('--resume-built-from',type=Path,help='Resume Play after a prior completed cold build stopped only at its metadata comparison; prior build proof is retained.');parser.add_argument('--ascii-package-path',action='store_true',help='Run the pinned197 game under an ASCII package path with spaces; Unicode backend proof is separate.');parser.add_argument('--repair-from-cold',type=Path,help='Repair only: copy the verified private package/cache from a prior passed cold-case output.');parser.add_argument('--build-via-play',action='store_true',help='Repair only: click Play once and require build followed by exactly one automatic native-game launch.');parser.add_argument('--overlay',type=Path,help='Frozen integration overlay applied to a private copy of --package.');parser.add_argument('--launcher-name',default='SSNE-RECOOP-Native.exe');preparation=parser.add_mutually_exclusive_group();preparation.add_argument('--prepare-only',action='store_true',help='Only copy the private sandbox and write preparation.json; no launch/build/test acceptance.');preparation.add_argument('--use-prepared',action='store_true',help='Run a previously prepared sandbox at --output without making another package copy.');parser.add_argument('--case',choices=('cold','adopt','repair'),default='cold');parser.add_argument('--smoke',choices=('menu','host-client','singleplayer'),default='host-client');parser.add_argument('--reference-exe',type=Path);parser.add_argument('--disc-sha1',default='70296be19673cc0216f45f6040541a81e507497d');parser.add_argument('--port',type=int,default=27980);parser.add_argument('--build-timeout',type=int,default=1800);a=parser.parse_args()
  for name in ('package','disc','card','output'):setattr(a,name,getattr(a,name).resolve())
  if a.reference_exe:a.reference_exe=a.reference_exe.resolve()
  if a.overlay:a.overlay=a.overlay.resolve()
@@ -367,7 +373,11 @@ def main():
   elif a.case=='adopt':
    assert initial.get('ready') and initial.get('game_built'),('Known installed artifact was not immediately adopted',initial);report['adopted_without_build']=not any(event.get('kind')=='spawn' for event in h.events())
    assert report['adopted_without_build']
-  target=base/MP_REL;report['built_exe_sha256']=digest(target);report['built_pe_sections']=pe_sections(target)
+  target=play_target(base);report['built_exe_sha256']=digest(target);report['built_pe_sections']=pe_sections(target)
+  if a.case!='adopt' or target==base/MP_REL:
+   assert target==base/MP_REL and digest(base/LEGACY_REL)==digest(base/'Multiplayer/SSNE-Native-Multiplayer.exe')==report['built_exe_sha256']
+   receipt=base/'Multiplayer/native-build.json'
+   if receipt.exists():assert json.loads(receipt.read_bytes())['project_executable']==MP_REL.name
   if a.reference_exe:
    report['reference_exe_sha256']=digest(a.reference_exe);compare_pe(target,a.reference_exe,report)
   marker=automatic_launch_marker

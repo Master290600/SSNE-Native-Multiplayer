@@ -1,6 +1,6 @@
-# Mehrspieler direkt im Originalmenü – Build 197
+# Mehrspieler direkt im Originalmenü – aktueller lokaler Stand
 
-`Start-Multiplayer.cmd` oder `Multiplayer/SSNE-Native-Multiplayer.exe` startet jetzt unmittelbar das Spiel. Es gibt keinen vorgeschalteten Launcher und keinen zweiten Spielprozess. Im Hauptmenü führt **Mehrspieler** zu **Spiel erstellen**, **Spiel beitreten**, **Lokal spielen** und **Zurück**.
+Das normale `SSNE-RECOOP-Native.exe` erstellt über **Install Game / Build Game** das native Spiel inklusive Multiplayer. **Play** startet es direkt; ein zusätzlicher Multiplayer-Launcher oder ein CMD-Skript ist nicht erforderlich. Im originalen Hauptmenü führt **Mehrspieler** zu **Spiel erstellen**, **Spiel beitreten**, **Lokal spielen** und **Zurück**. Jeder Spieler benötigt sein eigenes unterstütztes PAL-Disc-Image (G3BP9G).
 
 Die Seiten verwenden die native GUI des PAL-Spiels: dieselben Menüvorlagen, Schriften, Farben, Hintergrundanimationen, Auswahlgeräusche und Zurück-Funktion. Die Sprache folgt `SystemSetup.Language`, also der im Spiel gewählten Sprache Englisch, Deutsch oder Französisch. Die originalen Seiten für Spielmodus, Regeln, Charaktere und Karten bleiben erhalten.
 
@@ -12,11 +12,23 @@ Textfelder lassen sich mit Tastatur, Einfügen aus der Zwischenablage und Enter/
 
 In der Lobby öffnet die GameCube-Taste **Y** die native Bot-Verwaltung; **X** zeigt die Verbindung. Mit der PC-Standardbelegung sind das **F** beziehungsweise **Q**. Bei geänderter Belegung gelten die im F12-Menü zugewiesenen Tasten für X/Y. Im originalen Pausenmenü stehen zusätzlich **Verbindung** und beim Host **Bots**. Dort kann man die Sitzung verlassen und im selben Spielprozess zum Hauptmenü zurückkehren. Ein Host kann anschließend eine neue Sitzung erstellen. Die Schwierigkeit gilt für neu hinzugefügte Bots. Details und Grenzen der KI stehen in GAME-BOTS.md.
 
-Unter **Verbindung** lässt sich der AFK-Modus für den eigenen Spieler starten oder beenden. Die Verbindungsseite bleibt auch auf dem Ergebnisbildschirm mit **X** erreichbar, bei PC-Standardbelegung mit **Q**. Ein Host kann dort den AFK-Modus beenden und anschließend die originale Weiter-Funktion selbst bestätigen. Nach etwa 15 Sekunden auf einem aktiven Ergebnisbildschirm betätigt der Host automatisch diese native Weiter-Funktion. Auch eine offen gelassene Verbindungsseite wird vor dem automatischen Wechsel geschlossen. Clients folgen dem autoritativen Levelwechsel.
+Der AFK-Modus für den eigenen Spieler lässt sich über eine selbst zugewiesene Taste starten oder beenden: **F12 → Hotkeys → AFK an/aus**. Diese Aktion hat zunächst keine Tastenbelegung. Die Verbindungsseite bleibt auch auf dem Ergebnisbildschirm mit **X** erreichbar, bei PC-Standardbelegung mit **Q**. Ein Host kann den AFK-Modus mit seiner zugewiesenen Taste beenden und anschließend die originale Weiter-Funktion selbst bestätigen. Nach etwa 15 Sekunden auf einem aktiven Ergebnisbildschirm betätigt der Host automatisch diese native Weiter-Funktion. Auch eine offen gelassene Verbindungsseite wird vor dem automatischen Wechsel geschlossen. Clients folgen dem autoritativen Levelwechsel.
 
 Während einer Client-Sitzung ist die lokale Speicherkarte gegen durchgereichte Host-Speicherungen isoliert. Beim Verlassen werden die lokalen Profile und Einstellungen wiederhergestellt. Die bisherigen F12-Werkzeuge, das Insert-Modmenü und die erweiterten Startparameter bleiben verfügbar.
 
-## Prüfung
+## Per Einladungscode über das Internet spielen
+
+Unter **Mehrspieler → Spiel erstellen → Internet-Spiel → Einladen** eine Sitzung erstellen und danach wie gewohnt Modus und Karte wählen. In der Lobby unter **Verbindung → Einladungscode** den vollständigen Code kopieren und an die Mitspieler senden. Diese wählen **Mehrspieler → Spiel beitreten → Einladungscode**, fügen den Code ein und bestätigen **Beitreten**. Für diesen Weg werden weder eine gesonderte IP-Adresse noch eine PIN eingegeben. Der Code gilt nur für die aktuelle Host-Sitzung; eine neue Sitzung erzeugt einen neuen Code. Den Code wie den Zugang zur Sitzung behandeln.
+
+Die normalen LAN-Suche und IP-/PIN-Verbindung bleiben verfügbar. Internet-Verbindungen laufen im nativen Spiel: HTTPS vermittelt zunächst die Verbindungsdaten, ICE/STUN sucht einen direkten UDP-Weg und optionales UPnP kann eine befristete eigene Routerfreigabe anlegen. Spieldaten, Chat und Custom-Maps verwenden anschließend dieselbe autoritative Sitzung. Ein Fehler beim Internetaufbau lässt sich abbrechen oder erneut versuchen; die LAN-Wege bleiben verfügbar.
+
+Ohne eigene Konfiguration werden die öffentlichen Drittanbieter-Dienste `https://ntfy.sh` für die Vermittlung und `stun.cloudflare.com:3478` für STUN verwendet. Dafür muss kein eigener VPS bereitgestellt werden. Ihre Verfügbarkeit und eine direkte Verbindung durch jeden Router werden nicht garantiert. Restriktives oder symmetrisches NAT beziehungsweise blockiertes UDP kann einen authentifizierten TURN-Relay erfordern. Ein TURN-Dienst und Zugangsdaten werden nicht mitgeliefert; optionale eigene Dienste können über die `.internet`-Datei neben den aktiven Einstellungen konfiguriert werden. Siehe `NATIVE-INVITATIONS.txt` und `SSNE-INTERNET.example` im Paket. Erst Erstellen oder Beitreten einer Internet-Einladung startet diese Netzwerkanfragen.
+
+Diese Beschreibung bestätigt keinen Test über das öffentliche Internet, zwischen unterschiedlichen PCs oder einen vollständigen Kampagnendurchlauf.
+
+## Historischer Prüfstand ab Build 197
+
+Die folgenden Prüfnotizen dokumentieren ihre jeweils genannten älteren Builds. Sie ersetzen keine Abnahme des aktuellen Internetpfads.
 
 Die automatischen Menütests verwenden verborgene Fenster, private Kartenkopien und Eingaben ausschließlich in den Testprozessen. Sie prüfen die normalen nativen Menüwege. Sprachtests wählen die originale Sprach-Laderoutine über einen nur im verborgenen Testbetrieb wirksamen Parameter. Die Anleitung behauptet weder einen Internettest noch einen erneuten vollständigen Kampagnendurchlauf.
 
@@ -326,7 +338,9 @@ Host-/Client-Prüfung. Abschließende Ergebnisse stehen unter
 `tools/test_native_mouse_language.py` prüft die originale Sprachauswahl beim
 Erststart mit einer neuen privaten Karte, ohne erzwungene Sprachwahl.
 
-## Erstellen und Weitergeben
+## Historische Erstellung und Weitergabe (Build 197)
+
+Dieser Abschnitt bewahrt den früheren manuellen CMD-Ablauf. Aktuell werden Erstellen und Starten über das normale `SSNE-RECOOP-Native.exe` erledigt, wie in der Einleitung beschrieben.
 
 Die Multiplayer-Anpassungen liegen im mitgelieferten Runtime-Kit und in
 `source-multiplayer`. Das gewöhnliche Einzelspieler-Erstellen durch

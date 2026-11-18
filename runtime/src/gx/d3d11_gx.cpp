@@ -292,6 +292,16 @@ void SSNE_GLAPI TexImage2D_(GLenum,GLint level,GLint fmt,GLsizei w,GLsizei h,GLi
     if(level<0||unsigned(level)>=t.levels||unsigned(w)!=std::max(1u,t.w>>level)||unsigned(h)!=std::max(1u,t.h>>level))throw std::runtime_error("DX11 invalid texture mip level");
     if(data){if(type!=UNSIGNED_BYTE&&type!=UNSIGNED_INT_24_8)throw std::runtime_error("DX11 unsupported texture upload");s().context->UpdateSubresource(t.resource.Get(),level,nullptr,data,4*(s().unpack_row?s().unpack_row:w),0);}
 }
+void SSNE_GLAPI TexSubImage2D_(GLenum, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
+                                GLenum fmt, GLenum type, const void* data) {
+    auto& t = s().textures.at(s().textures_bound[s().unit]);
+    if (type != UNSIGNED_BYTE || fmt != RGBA || level < 0 || unsigned(level) >= t.levels ||
+        x < 0 || y < 0 || w < 0 || h < 0 || unsigned(x) + unsigned(w) > std::max(1u, t.w >> level) ||
+        unsigned(y) + unsigned(h) > std::max(1u, t.h >> level))
+        throw std::runtime_error("DX11 invalid RGBA subimage");
+    D3D11_BOX box{UINT(x),UINT(y),0,UINT(x+w),UINT(y+h),1};
+    s().context->UpdateSubresource(t.resource.Get(), UINT(level), &box, data, 4*(s().unpack_row ? s().unpack_row : w), 0);
+}
 void SSNE_GLAPI TexImage2DMultisample_(GLenum,GLsizei samples,GLenum fmt,GLsizei w,GLsizei h,GLboolean){allocate(s().textures.at(s().textures_bound[s().unit]),w,h,samples,fmt);}
 void SSNE_GLAPI TexParameteri_(GLenum,GLenum p,GLint v){auto& t=s().textures.at(s().textures_bound[s().unit]);parameter(t.sampling,p,v);
     // GL texture MAX_LEVEL still applies when a separate sampler is bound.
@@ -457,6 +467,7 @@ void* gx_proc(const char* name){
 #define PROC(ret,n,args) if(strcmp(name,"gl" #n)==0)return reinterpret_cast<void*>(&n##_);
     SSNE_GL_FUNCS(PROC)
 #undef PROC
+    if(strcmp(name,"glTexSubImage2D")==0)return reinterpret_cast<void*>(&TexSubImage2D_);
     if(strcmp(name,"glTexImage2DMultisample")==0)return reinterpret_cast<void*>(&TexImage2DMultisample_);
     if(strcmp(name,"glSamplerParameterf")==0)return reinterpret_cast<void*>(&SamplerParameterf_);
     if(strcmp(name,"glProgramParameteri")==0)return reinterpret_cast<void*>(&ProgramParameteri_);

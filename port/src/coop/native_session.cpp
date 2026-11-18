@@ -2,21 +2,27 @@
 #include <type_traits>
 #include <utility>
 #include "native_session.h"
+#include "custom_levels_runtime.h"
+#include "custom_map_session.h"
+#include "native_boss_hud_mission.h"
 #include "native_lifecycle.h"
 #include "native_vehicle.h"
 #include "native_presentation.h"
 #include "native_lobby.h"
 #include "native_frontend.h"
+#include "../native_menu_mouse.h"
 #include "native_checkpoint.h"
 #include "checkpoint_codec.h"
 #include <stdexcept>
 #include "afk_combat.h"
 #include "ssne/game_addresses.h"
 #include "ssne/native_party.h"
+#include "ssne/native_entity.h"
 #include "ssne/replica_simulation.h"
 #include "ssne/runtime.h"
 #include "ssne/weapon_groups.h"
 #include "ssne/gx_gpu.h"
+#include "ssne/gx.h"
 #include "ssne/recomp_hooks.h"
 #include "ssne/native_results.h"
 #include "ssne/native_cutscene.h"
@@ -45,6 +51,35 @@ unsigned collider_stress_phase=0;uint32_t collider_stress_original=0;
 uint64_t carry_pickups_complete_frame=0;
 bool env_present(const char* name){auto value=getenv(name);return value && *value;}
 bool env_requested(const char* name){auto value=getenv(name);return value && *value && std::string(value)!="0";}
+void copy_custom_identity(Properties& target,const Properties& source){
+    for(auto it=target.begin();it!=target.end();)if(it->first.starts_with("Session.Custom."))it=target.erase(it);else ++it;
+    for(const auto& [key,value]:source)if(key.starts_with("Session.Custom."))target[key]=value;
+}
+// Startup-only readback diagnostics. Ordinary logs and profiling do not need a
+// second full native-world capture or retained copies of every enemy skeleton.
+bool native_diagnostics_enabled(){
+    static const bool enabled=[] {
+        const auto* eager=getenv("SSNE_NATIVE_DIAGNOSTICS_EAGER");
+        return (eager && !strcmp(eager,"1")) || env_present("SSNE_COOP_CAMPAIGN_VERIFY") || env_requested("SSNE_COOP_TRACE_LIFETIMES");
+    }();
+    return enabled;
+}
+// Exact-frame integration probes retain their original publication boundary.
+// Ordinary scene fixtures and performance sampling deliberately do not opt out.
+bool host_exact_publication_probe(){
+    static const bool requested=[] {
+        if(!env_requested("SSNE_TEST_HIDDEN"))return false;
+        for(const auto* name:{"SSNE_TEST_COMPARE_HOST_CAPTURE","SSNE_COOP_CAMPAIGN_COMMAND","SSNE_COOP_TEST_LIFETIME_CHECKPOINT","SSNE_TEST_HISTORICAL_CHECKPOINT","SSNE_TEST_COMPOSED_CHECKPOINT","SSNE_COOP_TEST_WORLD_LINK","SSNE_COOP_TEST_NEXT_LEVEL","SSNE_COOP_TEST_LEVEL_DURING_WAIT","SSNE_COOP_TEST_WORLD_LINK_DURING_WAIT","SSNE_COOP_TEST_CARRY_PICKUPS","SSNE_COOP_TEST_CUTSCENE","SSNE_COOP_TEST_MUSIC_CHANGER","SSNE_COOP_TEST_SPEECH","SSNE_COOP_TEST_PICKUP","SSNE_COOP_TEST_WEAPON","SSNE_TEST_RESULTS_POST_SAVE"})if(env_present(name))return true;
+        return false;
+    }();
+    return requested;
+}
+bool host_frame_pipeline_probe(){
+    if(host_exact_publication_probe() || env_requested("SSNE_COOP_CAPTURE_RAM"))return true;
+    if(!env_requested("SSNE_TEST_HIDDEN"))return false;
+    for(const auto* name:{"SSNE_TEST_RUNTIME_CHECKPOINT","SSNE_TEST_PUBLIC_SAVE","SSNE_TEST_STORY_CHECKPOINT","SSNE_TEST_SESSION_CHECKPOINT","SSNE_TEST_EFFECT_CHECKPOINT","SSNE_TEST_MUSIC_CHECKPOINT"})if(env_present(name))return true;
+    return false;
+}
 #include "native_versus.inc"
 // Opt-in stage timings, collected on the guest thread without GPU synchronization.
 struct NativeStageTimer {
@@ -140,7 +175,9 @@ bool test_native_lifetime_checkpoint(const NativeWorld& source,const NativeWorld
 }
 #include "native_session_state.inc"
 NativeSession::NativeSession(AuthoritativeServer& server,unsigned capacity,std::string level,Log log):server_(&server),log_(std::move(log)),capacity_(capacity),level_(std::move(level)) {
-    ssne::set_native_results_save_host(true);
+    ssne::set_native_results_save_host(true);observe_auto_aim_lifetimes();
+    ssne::native_party_set_camera_update_gate(this,[this]{return connected_camera_updates_safe();});
+    ssne::set_host_frame_pipeline_gate(this,[this]{return host_frame_pipeline_safe();});
     ssne::set_native_movie_vote_gate(true);
     for(unsigned slot=0;slot<std::min(capacity,4u);++slot){setup_["GameSetup.Player"+std::to_string(slot+1)+".Profile"]=int64_t(slot);setup_["GameSetup.Player"+std::to_string(slot+1)+".Pos"]=int64_t(slot);}
     for(unsigned slot=capacity;slot<4;++slot)setup_["GameSetup.Player"+std::to_string(slot+1)+".Profile"]=int64_t(-1);
@@ -149,15 +186,162 @@ NativeSession::NativeSession(AuthoritativeServer& server,unsigned capacity,std::
     // parties. The participant roster presents network names/health/AFK instead.
     setup_["GameSetup.DisplayNamesAbovePlayersHeads"]=int64_t(0);
 }
-NativeSession::NativeSession(AuthoritativeClient& client,Log log):client_(&client),log_(std::move(log)){ssne::set_native_results_save_host(false);}
-NativeSession::~NativeSession(){ssne::set_native_movie_vote_gate(false);clear_native_afk_manual_aim();ssne::disable_native_rocket_effect_capture();}
+NativeSession::NativeSession(AuthoritativeClient& client,Log log):client_(&client),log_(std::move(log)){ssne::set_native_results_save_host(false);observe_auto_aim_lifetimes();}
+NativeSession::~NativeSession(){
+    cancel_save_identity_.store(true,std::memory_order_relaxed);
+    ssne::forget_native_boss_hud();clear_auto_aim_overrides();if(auto_aim_subscription_)ssne::stop_observing_native_entities(auto_aim_subscription_);ssne::clear_host_frame_pipeline_gate(this);ssne::native_party_clear_camera_update_gate(this);ssne::set_native_movie_vote_gate(false);clear_native_afk_manual_aim();ssne::disable_native_rocket_effect_capture();
+}
+void NativeSession::clear_auto_aim_overrides(){
+    for(auto& lease:afk_aim_leases_){end_native_auto_aim_override(lease.binding);lease={};}
+    end_native_auto_aim_override(client_afk_auto_aim_);
+    clear_native_afk_manual_aim();
+}
+void NativeSession::clear_level_controls(PPCContext* context){
+    if(context)ssne::forget_network_pause_panel(*context);
+    // LevelExit runs before the original actor/pool teardown. Retire leases
+    // there, while their owners still exist; never restore old camera/menu
+    // state into a newly loaded actor that happens to reuse the same address.
+    if(spectator_view_.active()){
+        ssne::gx_sync();std::string why;if(!spectator_view_.end(why))report("Spectator level-exit cleanup: "+why);
+    }
+    if(context){
+        const auto own=server_?server_->status().player:client_->status().player;
+        bool consume=false;std::string why;
+        if(!spectator_menu_.update(*context,epoch_,own.slot,{},false,consume,why) && !why.empty())report("Spectator level-exit menu cleanup: "+why);
+    }
+    spectator_menu_.reset();spectator_.reset();spectator_target_.reset();spectator_reported_.reset();
+    spectator_players_={};spectator_previous_=0;local_watching_=false;spectator_render_frames_=0;
+    survival_clock_ms_=0;survival_clock_tick_=survival_native_epoch_=0;survival_spawn_counter_=survival_kills_=0;survival_monsters_.clear();survival_.reset(survival_.config());
+    clear_auto_aim_overrides();client_auto_aim_binding_={};
+    afk_bots_={};game_bots_={};afk_inputs_={};afk_follow_slots_={};afk_native_active_={};afk_states_={};
+    afk_respawn_wait_={};native_life_wait_={};afk_decisions_={};afk_epoch_=0;afk_next_decision_={};
+    characters_={};join_placements_={};host_ready_=client_ready_=false;
+    ready_retry_next_={};ready_retry_epoch_=0;ready_retry_owner_={};
+    host_capture_clock_.reset();host_idle_publication_clock_.reset();host_capture_epoch_=0;host_capture_entities_=0;host_idle_reported_.reset();
+    set_local_ui_pad({});
+    for(unsigned slot=0;slot<max_players;++slot){
+        ssne::cancel_native_jump_press(slot);ssne::native_party_set_input(slot,{});
+        if(slot<4)ssne::set_pad(slot,{});ssne::netplay_mouse(int(slot),0,0);
+    }
+    // Protocol AFK/voluntary spectator preferences survive campaign changes.
+    // Native results, death waits and forced round locks have their own exit
+    // lifecycle; no stale local menu or input may survive alongside them.
+    if(log_)log_("[coop-level-controls-reset] epoch="+std::to_string(epoch_));
+}
+void NativeSession::observe_auto_aim_lifetimes(){
+    auto_aim_subscription_=ssne::observe_native_entities([this](const auto& notice){
+        using Event=ssne::NativeEntityNotice::Event;
+        if(notice.event==Event::LevelExit){clear_level_controls(notice.context);return;}
+        if(notice.event!=Event::Removing)return;
+        for(auto& lease:afk_aim_leases_)if(lease.binding.actor==notice.object){end_native_auto_aim_override(lease.binding);lease={};}
+        if(client_afk_auto_aim_.actor==notice.object)end_native_auto_aim_override(client_afk_auto_aim_);
+        if(client_auto_aim_binding_.actor==notice.object)client_auto_aim_binding_={};
+    });
+}
+bool NativeSession::update_client_auto_aim(PPCContext& context,PlayerId owner,uint64_t epoch,bool connected,bool ready,bool afk,uint32_t actor,std::string& error){
+    if(!connected || !owner.generation){end_native_auto_aim_override(client_afk_auto_aim_);return true;}
+    if(owner!=client_auto_aim_owner_){
+        end_native_auto_aim_override(client_afk_auto_aim_);client_auto_aim_owner_=owner;
+        client_auto_aim_initialized_=false;client_auto_aim_mode_=0;client_auto_aim_binding_={};
+    }
+    if(client_auto_aim_epoch_!=epoch){end_native_auto_aim_override(client_afk_auto_aim_);client_auto_aim_binding_={};client_auto_aim_epoch_=epoch;}
+    if(!ready){end_native_auto_aim_override(client_afk_auto_aim_);return true;}
+    NativeAutoAimLease current;std::string pending;
+    if(client_auto_aim_binding_.actor==actor && native_auto_aim_lease_matches(client_auto_aim_binding_)){
+        current=client_auto_aim_binding_;current.saved_mode=mem_read32(current.variable+0x24);
+    }else if(!read_native_auto_aim_binding(actor,current,pending))return true; // Native spawn/profile is still being prepared.
+    const bool rebound=client_auto_aim_binding_.actor!=current.actor || client_auto_aim_binding_.aim!=current.aim || client_auto_aim_binding_.variable!=current.variable || client_auto_aim_binding_.profile!=current.profile;
+    if(client_afk_auto_aim_.actor && (!afk || !native_auto_aim_lease_matches(client_afk_auto_aim_)))end_native_auto_aim_override(client_afk_auto_aim_);
+    if(!client_auto_aim_initialized_ || rebound){
+        // Seed once for this connection, then carry the human's later choice
+        // across native actor recreation and level changes.
+        std::array<uint8_t,8> preference;preference.fill(255);preference[0]=uint8_t(client_auto_aim_mode_);
+        if(!apply_native_preferences(context,actor,preference,error))return false;
+        if(!read_native_auto_aim_binding(actor,current,error))return false;
+        client_auto_aim_initialized_=true;
+        if(log_)log_("[coop-client-auto-aim-default] slot="+std::to_string(owner.slot)+" generation="+std::to_string(owner.generation)+" mode="+std::to_string(client_auto_aim_mode_));
+    }
+    if(afk){
+        if(!begin_native_auto_aim_override(context,actor,client_afk_auto_aim_,error))return false;
+    }else client_auto_aim_mode_=mem_read32(current.variable+0x24);
+    client_auto_aim_binding_=current;return true;
+}
+bool NativeSession::connected_camera_updates_safe(){
+    if(local_watching_ || (server_ && server_->status().player.slot<max_players && server_->participants()[server_->status().player.slot].spectator))return false;
+    if(!server_ || client_ || !queued_ || !host_ready_ || level_loading_ || startup_save_ ||
+       active_cutscene_object_ || active_movie_sequence_ || native_.current_epoch()!=epoch_)return false;
+    {std::lock_guard lock(save_mutex_);if(save_busy_ && !awaiting_save_identity_locked())return false;}
+    for(const auto& placement:join_placements_)if(placement.player.generation || placement.actor || placement.requested)return false;
+    return true;
+}
+bool NativeSession::host_frame_pipeline_safe(){
+    // Called only on the guest thread. Do not consume commands or retain a RAM
+    // binding: a failed or cancelled dispatch must run the next legacy frame.
+    if(!connected_camera_updates_safe() || host_frame_pipeline_probe() ||
+       ssne::savestate_pending() || native_frontend_pending_actions() || port::native_menu_pointer_pending() || native_lobby_visible() ||
+       ssne::native_results_presenting() || ssne::native_cutscene_presenting() || ssne::native_movie_presenting())return false;
+    {std::lock_guard lock(lobby_mutex_);if(lobby_campaign_request_)return false;}
+    const auto demand=server_->publication_demand();
+    if(!demand.all_ready || demand.host.slot!=0 || !demand.host.generation || demand.host!=players_[0])return false;
+    const auto published=server_->latest_world();
+    if(!published || published->epoch!=epoch_ || published->level!=level_ || published->vote.cutscene)return false;
+    const auto phase=published->mission.find("Session.NativePhase");
+    if(phase==published->mission.end() || phase->second!=Property(std::string("gameplay")))return false;
+    const auto bots=server_->bot_mask();unsigned human_peers=0;
+    for(unsigned slot=0;slot<max_players;++slot){
+        const auto owner=demand.owners[slot];const auto& person=published->players[slot];
+        if(owner!=players_[slot] || (person.connected?person.id:PlayerId{})!=owner)return false;
+        if(owner.generation){
+            if(slot>=capacity_ || !person.ready || !person.character || person.character!=characters_[slot])return false;
+            if(slot && !(bots&(1u<<slot)))++human_peers;
+        }
+    }
+    // Include accepted but not yet assigned sockets in the join exclusion.
+    // Publication demand counts them before a PlayerId/ready bit exists.
+    if(demand.tcp_peers!=human_peers)return false;
+    return true;
+}
 NativeSession::CombatFeedback NativeSession::combat_feedback() const {const auto own=server_?server_->status().player:client_->status().player;std::lock_guard lock(combat_mutex_);if(own!=combat_owner_)return {};auto result=combat_feedback_;result.flash=std::chrono::steady_clock::now()<combat_flash_until_;return result;}
 std::array<NativeSession::ParticipantHealth,max_players> NativeSession::participant_health() const {std::lock_guard lock(combat_mutex_);return participant_health_;}
 bool NativeSession::request_lobby_campaign(bool resume){if(!server_)return false;std::lock_guard lock(lobby_mutex_);if(lobby_campaign_request_)return false;lobby_campaign_request_=resume;return true;}
 void NativeSession::accept_confirmed_hit(const ssne::NativeConfirmedHit& hit,PlayerId own){if(hit.slot!=own.slot || hit.generation!=own.generation)return;std::lock_guard lock(combat_mutex_);if(combat_owner_!=own){combat_owner_=own;combat_feedback_={};}++combat_feedback_.hits;combat_feedback_.kills+=hit.after<=0;combat_feedback_.last_damage=hit.amount;combat_flash_until_=std::chrono::steady_clock::now()+std::chrono::milliseconds(350);if(log_)log_("[coop-own-hit-feedback] sequence="+std::to_string(hit.sequence)+" slot="+std::to_string(own.slot)+" generation="+std::to_string(own.generation)+" hits="+std::to_string(combat_feedback_.hits)+" kills="+std::to_string(combat_feedback_.kills));}
+bool NativeSession::maintain_idle_host_locals(PPCContext& context,const HostPublicationDemand& demand,uint64_t epoch,bool connected_only){
+    // This is a fresh, bounded player binding read, never a retained address or
+    // a world snapshot. Ambiguous/transitioning bindings force the old capture.
+    const auto bindings=native_.player_bindings();std::array<ParticipantHealth,max_players> health{};
+    std::array<uint32_t,max_players> actors{};
+    for(const auto& binding:bindings){
+        if(binding.slot>=capacity_ || binding.slot>=max_players)return false;
+        const auto who=demand.owners[binding.slot];if(connected_only && !who.generation)continue;
+        if(actors[binding.slot] || mem_read32(ssne::native_party_registry()+binding.slot*4)!=binding.actor || ssne::native_party_spawn_waiting(binding.actor))return false;
+        actors[binding.slot]=binding.actor;
+        if(who.generation){
+            if(players_[binding.slot]!=who || !characters_[binding.slot] || native_.local_address(characters_[binding.slot])!=binding.actor)return false;
+            const float hp=u2f(mem_read32(binding.actor+0xCC));if(!std::isfinite(hp))return false;
+            health[binding.slot]={who,hp,true};
+            auto& row=health[binding.slot];row.character=characters_[binding.slot];row.epoch=epoch;
+            row.armor=u2f(mem_read32(binding.actor+0x390));
+            row.armor_known=std::isfinite(row.armor) && row.armor>=0 && row.armor<=1000000.f;
+            row.position_known=true;
+            for(unsigned axis=0;axis<3;++axis){row.position[axis]=u2f(mem_read32(binding.actor+0x20+axis*4));row.position_known&=std::isfinite(row.position[axis]) && std::abs(row.position[axis])<=1000000.f;}
+        }
+    }
+    for(unsigned slot=0;slot<capacity_;++slot)if(demand.owners[slot].generation && !actors[slot])return false;
+    // These are local repairs, not replayed weapon/effect events. The bomb
+    // setter itself compares the displayed text and is idempotent when clean.
+    for(auto actor:actors)if(actor){std::string why;if(!refresh_native_bomb_ammo_hud(context,actor,why))return false;}
+    const auto hits=ssne::native_confirmed_hit_history();
+    if(replica_hit_epoch_!=epoch){replica_hit_epoch_=epoch;replica_hit_sequence_=0;std::lock_guard lock(combat_mutex_);combat_feedback_={};}
+    for(const auto& hit:hits)if(hit.sequence>replica_hit_sequence_){accept_confirmed_hit(hit,demand.host);replica_hit_sequence_=hit.sequence;}
+    {std::lock_guard lock(combat_mutex_);participant_health_=health;}
+    return true;
+}
 void NativeSession::report(const std::string& error){if(error!=last_error_){last_error_=error;if(log_)log_("[coop-engine] "+error);}}
 void NativeSession::capture_fixture(const NativeWorldSample& sample,const PPCContext& context) {
     if(fixture_dumped_ || !env_requested("SSNE_COOP_CAPTURE_RAM") || sample.scene!=4 || sample.tick<600)return;
+    // Hidden fixture-only arming lets a test enter an authored vehicle before
+    // saving matching RAM, CPU, locked cache and relocated party ownership.
+    if(env_requested("SSNE_TEST_HIDDEN"))if(const auto* trigger=std::getenv("SSNE_COOP_CAPTURE_TRIGGER"))if(*trigger && !std::ifstream(trigger,std::ios::binary).good())return;
     auto required=std::min(capacity_,ssne::native_party_capacity());
     // Private two-peer fixtures need the matching relocated party component,
     // without waiting for every configured slot to become occupied.
@@ -204,9 +388,22 @@ void NativeSession::capture_fixture(const NativeWorldSample& sample,const PPCCon
 bool NativeSession::initialize(PPCContext& ctx,const NativeBootstrapRequest& request,uint32_t presentation_scene) {
     if(mem_read32(ssne::game_address(0x802DB0E0))!=3)return false;
     auto profile=read_native_configuration(native_global_configuration(),"PlayerProfiles.Profile0");
-    if(!profile.values.contains("PlayerProfiles.Profile0.ID"))return false;
+    // Loading SDKFlips can reenter here before the original frontend Open has
+    // finished. Otherwise its later-created GUIs keep the queued game waiting.
+    if(server_ && !presentation_scene){
+        const auto survival=request.game_setup.find("Session.Survival.Active");
+        if(survival!=request.game_setup.end() && survival->second==Property(int64_t(1)) &&
+           !native_frontend_startup_ready())return false;
+    }
+    if(!profile.values.contains("PlayerProfiles.Profile0.ID")){auto survival=request.game_setup.find("Session.Survival.Active");if(server_ && survival!=request.game_setup.end() && survival->second==Property(int64_t(1)))native_frontend_start_profile(ctx);return false;}
     if(server_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES")){static bool dumped=false;if(!dumped){dump_native_profiles("native-profiles-boot.tsv");dumped=true;}}
+    if(!configure_survival_session(request.game_setup))return false;
     auto resolved=request;
+    if(presentation_scene==3){
+        for(auto it=resolved.game_setup.begin();it!=resolved.game_setup.end();){
+            if(it->first.starts_with("Session.Custom."))it=resolved.game_setup.erase(it);else ++it;
+        }
+    }
     if(server_ && request.level=="continue"){
         const auto saved=profile.values.find("PlayerProfiles.Profile0.Level");
         if(saved==profile.values.end() || !std::holds_alternative<std::string>(saved->second)){report("Saved host campaign level is unavailable");return false;}
@@ -214,6 +411,11 @@ bool NativeSession::initialize(PPCContext& ctx,const NativeBootstrapRequest& req
         if(level.empty() || level.size()>64 || std::any_of(level.begin(),level.end(),[](unsigned char c){return !std::isalnum(c) && c!='_';})){report("Saved host campaign level is invalid");return false;}
         resolved.level=level;resolved.game_setup["GameSetup.RulesCoop.Level"]=level;
         if(log_)log_("[coop-native-campaign-resume] level="+level);
+    }
+    std::string content_error;
+    if(presentation_scene!=3 && (server_ ? !bind_custom_level_identity(resolved.level,resolved.mode,resolved.game_setup,content_error)
+               : !verify_custom_level_identity(resolved.level,resolved.mode,resolved.game_setup,content_error,!presentation_scene))){
+        report(content_error);return false;
     }
     ssne::native_party_configure(request.mode==1?capacity_:4);
     std::string error;if(capacity_>2)ssne::native_party_prepare_lobby(ctx);
@@ -223,14 +425,35 @@ bool NativeSession::initialize(PPCContext& ctx,const NativeBootstrapRequest& req
     if(server_)ssne::set_native_hit_identity_resolver(native_.hit_identity_resolver());
     if(presentation_scene){
         if(presentation_scene==3)mem_write32(ctx.r[13]-0x69d4,0);
-        if(!write_native_configuration(ctx,native_global_configuration(),resolved.game_setup,"GameSetup",error)){report(error);return false;}
+        if(!write_native_configuration(ctx,native_global_configuration(),native_game_setup_fields(resolved.game_setup),"GameSetup",error)){report(error);return false;}
         const bool adopted=server_ && presentation_scene==3 && attach_existing_native_lobby(ctx);
         if(!adopted && !queue_native_coop_presentation(ctx,presentation_scene,error)){report(error);return false;}
     }else if(!queue_native_coop_level(ctx,resolved,error)){report(error);return false;}
-    level_=resolved.level;if(auto prefix=native_rules_prefix(resolved.mode))setup_[std::string(prefix)+".Level"]=level_;queued_=true;report("native level queued: "+level_);return true;
+    level_=resolved.level;copy_custom_identity(setup_,resolved.game_setup);if(auto prefix=native_rules_prefix(resolved.mode))setup_[std::string(prefix)+".Level"]=level_;queued_=true;report("native level queued: "+level_);return true;
+}
+bool NativeSession::custom_content_ok(PPCContext& ctx,const WorldState& state){
+    if(custom_level_rejected_)return false;
+    if(!state.revision || state.level.empty())return true;
+    if(!custom_map_session_)custom_map_session_=std::make_unique<CustomMapSession>(server_,client_,log_);
+    if(!custom_map_session_->client_ready(ctx,state))return false;
+    if(state.epoch==custom_content_epoch_ && state.revision==custom_content_revision_)return true;
+    const bool menu=state.mission.contains("Session.NativePhase") && state.mission.at("Session.NativePhase")==Property(std::string("menu"));
+    const auto selected=selected_custom_map_alias(state);
+    if(menu && selected.empty()){custom_content_epoch_=state.epoch;custom_content_revision_=state.revision;return true;}
+    std::string error;const auto mode_field=state.mission.find(menu?"Session.Lobby.Mode":"Session.GameMode");
+    const auto* mode=mode_field==state.mission.end()?nullptr:std::get_if<int64_t>(&mode_field->second);
+    const auto scene_field=state.mission.find("Session.Presentation.Scene");
+    const auto* scene=scene_field==state.mission.end()?nullptr:std::get_if<int64_t>(&scene_field->second);
+    const bool gameplay=!scene || (*scene!=3 && *scene!=5);
+    const auto selected_mode=mode && *mode!=5?unsigned(*mode):1u;
+    if(verify_custom_level_identity(selected,selected_mode,state.mission,error,gameplay && !menu)){custom_content_epoch_=state.epoch;custom_content_revision_=state.revision;return true;}
+    custom_level_rejected_=true;client_ready_=false;report(error);
+    native_frontend_custom_level_error(error);return false;
 }
 void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
+    if(client_ && custom_level_rejected_)return;
     NativeStageTimer timing("tick",log_);
+    advance_survival_clock(ctx,tick);
     // Each installation must leave its title scene before its native level loader
     // is available. This internal bootstrap pulse is never a remote menu request.
     ssne::PadState bootstrap;
@@ -245,36 +468,66 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
         {std::lock_guard lock(lobby_mutex_);menu_request=std::exchange(lobby_campaign_request_,std::nullopt);}
         if(menu_request && queued_ && mem_read32(ssne::game_address(0x802DB0E0))==3) {
             std::string error;
-            if(!*menu_request || mem_read32(ctx.r[13]-0x69d4)!=1){
-                if(!open_native_lobby_level_selection(ctx,error))report("Cannot open level selection: "+error);
+            if(native_lobby_has_level()){
+                if(!start_native_lobby_level(error))report(error);
             }else{
-                NativeBootstrapRequest request{"continue",setup_};
-                auto profile=read_native_configuration(native_global_configuration(),"PlayerProfiles.Profile0");auto saved=profile.values.find("PlayerProfiles.Profile0.Level");if(saved!=profile.values.end())if(auto level=std::get_if<std::string>(&saved->second))request.level=*level;
-                if(queue_native_coop_level(ctx,request,error)){level_=request.level;setup_["GameSetup.RulesCoop.Level"]=level_;report("lobby campaign queued: "+level_);}
-                else report("Cannot start lobby campaign: "+error);
+                if(!open_native_lobby_level_selection(ctx,error))report("Cannot open level selection: "+error);
             }
         }
         if(auto selected=take_native_lobby_level()){
+            const bool survival=selected->mode==5;const unsigned selected_mode=survival?1:selected->mode;
             auto selected_setup=setup_;
             auto native_rules=read_native_configuration(native_global_configuration(),"GameSetup");
-            if(native_rules.error.empty())for(const auto& [key,value]:native_rules.values)if(key.starts_with(std::string(native_rules_prefix(selected->mode))+"."))selected_setup[key]=value;
+            if(native_rules.error.empty())for(const auto& [key,value]:native_rules.values)if(key.starts_with(std::string(native_rules_prefix(selected_mode))+"."))selected_setup[key]=value;
             selected_setup["GameSetup.RulesCoop.LevelSet"]=selected->level_set;
             selected_setup["GameSetup.RulesCoop.Difficulty"]=selected->difficulty;
-            ssne::native_party_configure(selected->mode==1?capacity_:4);
-            NativeBootstrapRequest request{selected->level,std::move(selected_setup),selected->mode};
+            for(auto it=selected_setup.begin();it!=selected_setup.end();)if(it->first.starts_with("Session.Survival.") || it->first=="Session.CustomMode")it=selected_setup.erase(it);else ++it;
+            if(survival){
+                selected_setup["Session.Survival.Active"]=int64_t(1);selected_setup["Session.CustomMode"]=int64_t(5);
+                // The original arena setup owns these enums. Coop has no such
+                // CVars; carry their selected values as explicit session rules.
+                for(const auto* name:{"WeaponSet","AllowPowerUps"}){
+                    const auto key=std::string("GameSetup.RulesFragmatch.")+name;
+                    const auto value=native_rules.values.find(key);
+                    selected_setup[std::string("Session.Survival.")+name]=value==native_rules.values.end()?Property(int64_t(std::string(name)=="AllowPowerUps")):value->second;
+                }
+            }
+            if(!configure_survival_session(selected_setup)){server_->cancel_lobby_game();cancel_native_lobby_level_selection();return;}
+            ssne::native_party_configure(selected_mode==1?capacity_:4);
+            NativeBootstrapRequest request{selected->level,std::move(selected_setup),selected_mode};
+            // Private authored-vehicle fixtures use the ordinary initialized
+            // host/lobby path without changing profile unlocks or menu data.
+            if(env_requested("SSNE_TEST_HIDDEN"))if(const auto* target=std::getenv("SSNE_TEST_VEHICLE_LEVEL")){
+                const std::string level=target;
+                if(level!="Clevel5_1" && level!="Alevel10_4" && level!="Clevel6_1")throw std::runtime_error("Invalid private vehicle fixture level");
+                request.level=level;if(log_)log_("[coop-test-vehicle-level] target="+level+" original_selection="+selected->level);
+            }
             std::string error;
-            if(queue_native_coop_level(ctx,request,error)){
+            if(bind_custom_level_identity(request.level,request.mode,request.game_setup,error) && queue_native_coop_level(ctx,request,error)){
                 level_=request.level;setup_=std::move(request.game_setup);setup_[std::string(native_rules_prefix(request.mode))+".Level"]=level_;
                 report("original lobby selection queued: "+level_+" difficulty="+std::to_string(selected->difficulty));
-            }else{cancel_native_lobby_level_selection();report("Cannot start selected campaign level: "+error);}
+            }else{server_->cancel_lobby_game();cancel_native_lobby_level_selection();report("Cannot start selected campaign level: "+error);}
         }
         for(auto event:server_->take_events()) {
+            ssne::cancel_native_jump_press(event.player.slot);
             if(log_)log_("[coop-native-membership] slot="+std::to_string(event.player.slot)+" generation="+std::to_string(event.player.generation)+" joined="+std::to_string(event.kind==ConnectionEvent::Kind::Joined));
             if(event.kind==ConnectionEvent::Kind::Joined){
                 players_[event.player.slot]=event.player;native_.set_player_owner(event.player.slot,event.player);
                 if(queued_ && host_ready_ && mem_read32(ssne::game_address(0x802DB0E0))==4){join_placements_[event.player.slot]={event.player};if(log_)log_("[coop-native-join-placement-pending] slot="+std::to_string(event.player.slot)+" generation="+std::to_string(event.player.generation));}
             }
-            else {ssne::native_party_cancel_join_spawn(join_placements_[event.player.slot].actor);join_placements_[event.player.slot]={};players_[event.player.slot]={};characters_[event.player.slot]=0;native_.set_player_owner(event.player.slot,{});}
+            else {
+                auto& aim=afk_aim_leases_[event.player.slot];std::string ignored;set_native_afk_manual_aim(ctx,aim.binding.actor,false,ignored);end_native_auto_aim_override(aim.binding);aim={};
+                // A reserved actor survives its connection. Publish stops for
+                // its sustained voices before dropping the logical binding;
+                // other players' ongoing shots keep their own slot/lane IDs.
+                if(const auto actor=native_.local_address(characters_[event.player.slot]);actor && !level_loading_ && mem_read32(ssne::game_address(0x802DB0E0))==4){
+                    // Release the original controller/HUD/driver links before
+                    // the inactive reservation disappears from publication.
+                    std::string why;if(!release_native_vehicle_driver(ctx,actor,why))ssne::fatal(why.c_str());
+                    for(unsigned weapon:{2u,4u}){if(!ssne::stop_native_weapon_loops_for_actor(ctx,actor,weapon,why))report(why);}
+                }
+                ssne::native_party_cancel_join_spawn(join_placements_[event.player.slot].actor);join_placements_[event.player.slot]={};players_[event.player.slot]={};characters_[event.player.slot]=0;native_.set_player_owner(event.player.slot,{});
+            }
         }
         if(!queued_ && (tick>=30 || (level_=="lobby" && mem_read32(ssne::game_address(0x802DB0E0))==3))){
             const bool menu=level_=="lobby";
@@ -286,14 +539,50 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
         }
         // An inactive waiting actor may not receive its normal native update.
         // Retry on the authoritative guest tick independently of actor activity.
-        if(queued_ && mem_read32(ssne::game_address(0x802DB0E0))==4)ssne::native_party_retry_waiting(ctx);
-        auto controls=server_->take_controls();
+        if(queued_ && mem_read32(ssne::game_address(0x802DB0E0))==4){
+            // A native respawn may reuse the same camera and model addresses.
+            // Finish any render lease before pending retries or watch exit can
+            // reset them, so its rollback cannot restore the retired life.
+            if(spectator_view_.active()){
+                ssne::gx_sync();std::string why;if(!spectator_view_.end(why)){report("Spectator respawn cleanup: "+why);return;}
+            }
+            ssne::native_party_retry_waiting(ctx);
+        }
+        // Capture the host's local UI tap before gameplay consumption drains
+        // pressed edges, including taps already released by this guest tick.
+        ControlInput host_ui_input;
+        auto controls=server_->take_controls(&host_ui_input);
+        auto spectator_people=server_->participants();
+        for(unsigned slot=0;slot<capacity_;++slot){
+            if(spectator_players_[slot]!=controls[slot].id){spectator_players_[slot]=controls[slot].id;spectator_previous_&=uint8_t(~(1u<<slot));}
+            const bool was=(spectator_previous_&(1u<<slot))!=0;
+            if(was!=controls[slot].spectator)ssne::cancel_native_jump_press(slot);
+            if(!was && controls[slot].spectator && queued_ && mem_read32(ssne::game_address(0x802DB0E0))==4){
+                const auto actor=mem_read32(ssne::native_party_registry()+slot*4);
+                if(ssne::native_player_collision_radius(actor)){
+                    std::string why;bool released=release_native_vehicle_driver(ctx,actor,why) && ssne::release_native_spectator_objectives(ctx,actor,why);
+                    if(released)for(unsigned weapon:{2u,4u})if(!ssne::stop_native_weapon_loops_for_actor(ctx,actor,weapon,why)){released=false;break;}
+                    if(!released){
+                        report("Spectator activation denied: "+why);
+                        if(!server_->cancel_spectator_activation(controls[slot].id))return; // Forced elimination waits for safe native cleanup.
+                        controls=server_->take_controls();spectator_people=server_->participants();
+                    }
+                }
+            }
+            if(was && !controls[slot].spectator && controls[slot].ready && queued_ && mem_read32(ssne::game_address(0x802DB0E0))==4){
+                const auto actor=mem_read32(ssne::native_party_registry()+slot*4);std::string why;
+                const bool full=survival_enabled_ || (mem_read32(ctx.r[13]-0x69d4)==1 && ssne::native_player_collision_radius(actor) && (mem_read32(actor+0x328) || u2f(mem_read32(actor+0xCC))<=0.f));
+                const bool spawned=full?ssne::native_party_request_respawn(ctx,actor,why):ssne::native_party_request_join_spawn(ctx,actor,why);
+                if(!spawned && !ssne::native_party_spawn_waiting(actor))report("Spectator rejoin: "+why);
+            }
+            if(controls[slot].spectator)spectator_previous_|=uint8_t(1u<<slot);else spectator_previous_&=uint8_t(~(1u<<slot));
+        }
         if(native_lobby_visible() && (controls[0].input.pressed&ssne::PAD_B)){
             back_native_lobby(ctx);controls[0].input.pad.buttons&=~ssne::PAD_B;controls[0].input.pressed&=~ssne::PAD_B;
         }
         if(native_lobby_visible())for(unsigned slot=0;slot<capacity_;++slot)
             if(controls[slot].id.generation)native_lobby_character_input(ctx,slot,controls[slot].input.pressed);
-        uint8_t occupied=0,connected=0;for(unsigned slot=0;slot<capacity_;++slot){if(controls[slot].ready)occupied|=uint8_t(1u<<slot);if(controls[slot].id.generation)connected|=uint8_t(1u<<slot);}
+        uint8_t occupied=0,connected=0;for(unsigned slot=0;slot<capacity_;++slot){const auto actor=mem_read32(ssne::native_party_registry()+slot*4);if(controls[slot].ready && !controls[slot].spectator && !ssne::native_party_spawn_waiting(actor))occupied|=uint8_t(1u<<slot);if(controls[slot].id.generation)connected|=uint8_t(1u<<slot);}
         ssne::native_party_set_occupancy(occupied,connected);
         ssne::native_party_refresh_occupancy(ctx);
         if(queued_ && mem_read32(ssne::game_address(0x802DB0E0))==4 && !server_->skip_vote().cutscene){
@@ -311,8 +600,12 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
         update_afk_controls(ctx,tick,controls);
         for(unsigned slot=0;slot<capacity_;++slot) {
             const auto actor=mem_read32(ssne::native_party_registry()+slot*4);const bool waiting=ssne::native_party_spawn_waiting(actor);
-            auto input=controls[slot].afk?afk_inputs_[slot]:controls[slot].input;
-            if(controls[slot].afk && afk_native_active_[slot]){
+            // AFK owns gameplay, while the human retains the local native UI.
+            // Include the opening Start edge before Pause becomes visible.
+            const bool host_afk_ui=slot==0 && (controls[slot].afk || controls[slot].spectator) && (ssne::local_pause_menu_open() || ssne::local_information_open() || native_frontend_visible() || ssne::native_results_presenting() || (host_ui_input.pad.buttons&ssne::PAD_START));
+            auto input=host_afk_ui?host_ui_input:controls[slot].afk?afk_inputs_[slot]:controls[slot].input;
+            if(host_afk_ui)input.yaw=input.pitch=0;
+            if(controls[slot].afk && afk_native_active_[slot] && !host_afk_ui){
                 auto& pending=afk_inputs_[slot];
                 const float seconds=u2f(mem_read32(ctx.r[13]-0x7A08u));
                 input.yaw=consume_afk_turn(pending.yaw,seconds);
@@ -327,7 +620,7 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
                 pending.pad.stick_x=input.pad.stick_x;pending.pad.stick_y=input.pad.stick_y;
             }
             if(slot && controls[slot].ready && !controls[slot].afk && !waiting){std::string why;if(!apply_native_preferences(ctx,actor,input.preferences,why)){report(why);return;}}
-            auto pad=waiting?ssne::PadState{}:input.pad;
+            auto pad=waiting && !host_afk_ui?ssne::PadState{}:input.pad;
             if(!waiting && controls[slot].ready && !controls[slot].afk && input.weapon>=16 && input.weapon<25)
                 ssne::coop_weapon_group(slot,int(input.weapon)-16);
             if(slot==0 && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TEST_ADAPTIVE_LEVEL")) {
@@ -357,6 +650,8 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
                 ssne::native_test_fire_request(began.time_since_epoch().count()!=0 && now-began<std::chrono::seconds(12));
             }
             if(tick%120==0 && log_)log_("[coop-control] tick="+std::to_string(tick)+" slot="+std::to_string(slot)+" ready="+std::to_string(controls[slot].ready)+" sequence="+std::to_string(controls[slot].sequence)+" buttons="+std::to_string(pad.buttons)+" x="+std::to_string(pad.stick_x)+" y="+std::to_string(pad.stick_y));
+            if(slot==0)pad=spectator_input(ctx,epoch_,server_->status().player,spectator_people,pad);
+            else if(controls[slot].spectator)pad={};
             if(slot==0 && !queued_)pad=bootstrap;
             if(native_lobby_visible())pad={}; // Character edges were consumed by the owner's panel above.
             // Remote players never operate shared menus, including while loading.
@@ -364,17 +659,30 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
             if(slot)pad.buttons&=~ssne::PAD_START;
             // AFK governs gameplay; the authority still owns its human result UI.
             if(slot==0 && ssne::native_results_presenting())pad=controls[0].input.pad;
+            const bool jump_gameplay=queued_ && !level_loading_ && controls[slot].ready && !controls[slot].spectator && !waiting && !host_afk_ui &&
+                mem_read32(ssne::game_address(0x802DB0E0))==4 && !native_lobby_visible() && (slot!=0 || (!ssne::local_pause_menu_open() && !ssne::local_information_open())) &&
+                !ssne::native_results_presenting() && !ssne::native_cutscene_presenting() && !ssne::native_movie_presenting() &&
+                ssne::native_player_collision_radius(actor) && !mem_read32(actor+0x328) && !mem_read32(actor+0x370) && !(mem_read32(actor+0x6C4)>=0x80000000u && mem_read32(actor+0x6C4)<ssne::guest_ram_end());
+            if(!jump_gameplay)ssne::cancel_native_jump_press(slot);
+            else if(!controls[slot].afk && (input.pressed&ssne::PAD_L))ssne::queue_native_jump_press(slot);
             ssne::native_party_set_input(slot,pad);if(slot<4)ssne::set_pad(slot,pad);
             ssne::netplay_mouse(int(slot),waiting?0:input.yaw/1000000.,waiting?0:input.pitch/1000000.);
         }
         ssne::si_poll();
     } else {
         auto state=client_->latest_world();auto status=client_->status();
-        const auto own_actor=mem_read32(ssne::native_party_registry()+status.player.slot*4);
-        {std::string why;if(!refresh_native_aim_preferences(ctx,own_actor,true,why)){report(why);return;}}
-        uint64_t preference_bits=0;const auto preferences=capture_native_preferences(own_actor);for(unsigned i=0;i<preferences.size();++i)preference_bits|=uint64_t(preferences[i])<<(i*8);local_preferences_.store(preference_bits);
+        const auto own_actor=status.player.slot<ssne::native_party_capacity()?mem_read32(ssne::native_party_registry()+status.player.slot*4):0;
+        const bool own_ready=state && status.player.slot<max_players && state->players[status.player.slot].id==status.player && state->players[status.player.slot].ready;
+        const bool own_afk=own_ready && state->players[status.player.slot].afk && !state->players[status.player.slot].spectator;
+        {std::string why;if(!update_client_auto_aim(ctx,status.player,state?state->epoch:0,status.connected,queued_ && client_ready_ && !level_loading_ && own_ready && mem_read32(ssne::game_address(0x802DB0E0))==4,own_afk,own_actor,why) || !refresh_native_aim_preferences(ctx,own_actor,true,why)){report(why);return;}}
+        uint64_t preference_bits=0;auto preferences=capture_native_preferences(own_actor);
+        // Never transport the temporary AFK value as a new human preference:
+        // the first returning input can precede the client's non-AFK snapshot.
+        if(client_afk_auto_aim_.actor)preferences[0]=uint8_t(client_afk_auto_aim_.saved_mode);
+        for(unsigned i=0;i<preferences.size();++i)preference_bits|=uint64_t(preferences[i])<<(i*8);local_preferences_.store(preference_bits);
         if(!status.connected || !state->revision || state->level.empty()){weapon_sounds_.clear();ssne::clear_native_cutscene_presentation();replica_cutscene_id_=0;std::string why;ssne::stop_native_replica_speech(ctx,why);ssne::stop_native_weapon_loops(ctx,why);stop_native_vehicle_audio(ctx,why);return;}
-        capacity_=status.capacity;
+        if(!custom_content_ok(ctx,*state))return;
+        capacity_=status.capacity;if(!configure_survival_session(state->mission))return;
         if(auto flags=state->mission.find("Session.Mods.Flags");flags!=state->mission.end())if(auto value=std::get_if<int64_t>(&flags->second)){const auto rate=state->mission.find("Session.Mods.FireMultiplier");if(rate!=state->mission.end())if(auto multiplier=std::get_if<float>(&rate->second))ssne::mod_shared_options(uint32_t(*value),*multiplier);}
         if(mem_read32(ssne::game_address(0x802DB0E0))>=3){
             std::string error;
@@ -382,7 +690,7 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
         }
         if(status.player.slot<max_players && !state->players[status.player.slot].character)client_ready_=false;
         uint8_t occupied=0,connected=0;
-        for(unsigned slot=0;slot<capacity_;++slot){const auto& player=state->players[slot];players_[slot]=player.connected?player.id:PlayerId{};native_.set_player_owner(slot,players_[slot]);if(player.connected)connected|=uint8_t(1u<<slot);if(player.connected && player.ready)occupied|=uint8_t(1u<<slot);}
+        for(unsigned slot=0;slot<capacity_;++slot){const auto& player=state->players[slot];players_[slot]=player.connected?player.id:PlayerId{};native_.set_player_owner(slot,players_[slot]);if(player.connected)connected|=uint8_t(1u<<slot);if(player.connected && player.ready && !player.spectator)occupied|=uint8_t(1u<<slot);}
         ssne::native_party_set_occupancy(occupied,connected);
         ssne::native_party_refresh_occupancy(ctx);
         const auto presentation=state->mission.find("Session.Presentation.Scene");
@@ -393,7 +701,7 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
         // skeletons. Wait for the host's model list before starting the loader.
         if(!queued_ && tick>=30 && state->mission.contains("Session.CharacterModels")) {
             // Host metadata includes GameSetup separately from mission variables.
-            Properties setup;for(const auto& [key,value]:state->mission)if(key.starts_with("GameSetup."))setup[key]=value;
+            Properties setup;for(const auto& [key,value]:state->mission)if(key.starts_with("GameSetup.") || key.starts_with("Session.Survival.") || key.starts_with("Session.Custom."))setup[key]=value;
             if(initialize(ctx,{state->level,setup,state->mission.contains("Session.GameMode")?uint32_t(std::get<int64_t>(state->mission.at("Session.GameMode"))):1u},presentation_scene)){loading_epoch_=state->epoch;level_loading_=true;}
         }
         if(queued_ && presentation_scene) {
@@ -405,6 +713,7 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
             const bool credits_done=presentation_scene==5 && native_credits_finishing() && (scene==3 || pending==3);
             if(!credits_done && scene!=presentation_scene && pending!=presentation_scene && (scene==3 || scene==4 || scene==5)) {
                 std::string error;
+                end_native_auto_aim_override(client_afk_auto_aim_);
                 native_frontend_prepare_results_close(ctx);
                 if(!ssne::clear_native_replica_results(ctx,error) || !ssne::stop_native_weapon_loops(ctx,error) || !stop_native_vehicle_audio(ctx,error)){report(error);return;}
                 weapon_sounds_.clear();weapon_sound_order_=0;replica_effect_time_={};replica_hud_clock_={};
@@ -423,7 +732,7 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
         if(queued_ && !presentation_scene && (return_to_game || state->level!=level_ || (loading_epoch_ && state->epoch!=loading_epoch_))) {
             const auto scene=mem_read32(ssne::game_address(0x802DB0E0));
             if(scene==3 || scene==4 || scene==5) {
-                Properties setup;for(const auto& [key,value]:state->mission)if(key.starts_with("GameSetup."))setup[key]=value;
+                Properties setup;for(const auto& [key,value]:state->mission)if(key.starts_with("GameSetup.") || key.starts_with("Session.Survival.") || key.starts_with("Session.Custom."))setup[key]=value;
                 std::string error;
                 // Retire the old shared result UI while its native animation
                 // targets still belong to the old level. Close any result modal first.
@@ -435,6 +744,7 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
                     if(!ssne::stop_native_weapon_loops(ctx,error) || !stop_native_vehicle_audio(ctx,error)){report(error);return;}
                     weapon_sounds_.clear();weapon_sound_order_=0;replica_effect_time_={};replica_hud_clock_={};
                 }
+                end_native_auto_aim_override(client_afk_auto_aim_);
                 const bool was_loading=level_loading_;level_loading_=true;
                 // Only an existing gameplay scene needs proof that its old
                 // actors were destroyed. Leaving the initial lobby has no
@@ -454,8 +764,10 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
             // Keep the GUI's local input separate from gameplay authority.
             // The replica handlers consume Start/Tab in both controller banks.
             const bool own_ui=slot==status.player.slot && queued_ && local_scene==4;
-            auto pad=own_ui?ssne::get_pad(slot):slot==0?bootstrap:ssne::PadState{};
+            auto pad=own_ui?local_ui_pad():slot==0?bootstrap:ssne::PadState{};
+            if(own_ui)pad=spectator_input(ctx,state->epoch,status.player,state->players,pad);
             auto native_pad=pad;if(own_ui)native_pad.buttons&=~(ssne::PAD_START|ssne::PAD_Z);
+            // Raw SDL UI input has its own snapshot; both guest PAD banks stay sanitized.
             ssne::native_party_set_input(slot,native_pad);ssne::set_pad(slot,pad);
         }
     }
@@ -481,11 +793,12 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
             live_humans[slot]=!controls[slot].afk && !wait.actor && !dead && std::isfinite(hp) && hp>0 && !ssne::native_party_spawn_waiting(actor);
         }
     }else native_life_wait_={};
-    for(unsigned slot=0;slot<capacity_;++slot){auto& lease=afk_aim_leases_[slot];if(!lease.actor)continue;
+    for(unsigned slot=0;slot<capacity_;++slot){auto& lease=afk_aim_leases_[slot];if(!lease.binding.actor)continue;
         const auto actor=mem_read32(ssne::native_party_registry()+slot*4);
-        if(!controls[slot].afk || !controls[slot].ready || lease.player!=controls[slot].id || lease.actor!=actor){
-            std::string manual_error;set_native_afk_manual_aim(context,lease.actor,false,manual_error);
-            if(lease.actor==actor && lease.player==controls[slot].id && actor>=0x80000000u && actor<=ssne::guest_ram_end()-0x790u && mem_read32(actor+0x37C)==lease.aim && log_)log_("[coop-afk-auto-aim-restored] slot="+std::to_string(slot)+" enabled="+std::to_string(mem_read32(lease.aim+0x48)));
+        if(!controls[slot].afk || !controls[slot].ready || lease.player!=controls[slot].id || lease.binding.actor!=actor || lease.epoch!=native_.current_epoch() || !native_auto_aim_lease_matches(lease.binding)){
+            std::string ignored;set_native_afk_manual_aim(context,lease.binding.actor,false,ignored);
+            const auto saved=lease.binding.saved_mode;const bool restored=end_native_auto_aim_override(lease.binding);
+            if(log_)log_("[coop-afk-auto-aim-restored] slot="+std::to_string(slot)+" mode="+std::to_string(saved)+" restored="+std::to_string(restored));
             lease={};
         }
     }
@@ -512,10 +825,11 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
     }};
     for(unsigned slot=0;slot<capacity_;++slot)if(controls[slot].afk!=afk_states_[slot]){
         handed_over[slot]=true;
+        ssne::cancel_native_jump_press(slot);
         afk_states_[slot]=controls[slot].afk;
         if(log_)log_("[coop-afk-state] tick="+std::to_string(tick)+" slot="+std::to_string(slot)+" afk="+std::to_string(controls[slot].afk)+" ready="+std::to_string(controls[slot].ready)+" actor="+std::to_string(mem_read32(ssne::native_party_registry()+slot*4)));
     }
-    for(unsigned slot=0;slot<max_players;++slot)if(!controls[slot].afk || !controls[slot].ready){
+    for(unsigned slot=0;slot<max_players;++slot)if(!controls[slot].afk || !controls[slot].ready || controls[slot].spectator){
         afk_inputs_[slot]={};
         if(!controls[slot].afk)afk_respawn_wait_[slot]={};
         if(afk_native_active_[slot]){afk_native_active_[slot]=false;afk_bots_[slot]={};if(log_)log_("[coop-afk-native-control] slot="+std::to_string(slot)+" enabled=0 actor="+std::to_string(mem_read32(ssne::native_party_registry()+slot*4)));}
@@ -551,14 +865,16 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
     for(const auto& [id,entity]:sample.entities)if(entity.kind==EntityKind::Player){const auto slot=std::get<int64_t>(entity.properties.at("player_slot"));if(slot>=0 && slot<max_players)actors[slot]=&entity;}
     for(unsigned slot=0;slot<capacity_;++slot){
         const auto* actor=actors[slot];
-        const bool active=controls[slot].ready && controls[slot].afk && !afk_respawn_wait_[slot].actor && actor && mem_read32(native_.local_address(actor->id)+0x328)==0 && std::get<float>(actor->properties.at("health"))>0 && std::get<int64_t>(actor->properties.at("camera_frozen"))==0 && !ssne::native_party_spawn_waiting(native_.local_address(actor->id));
+        const bool active=controls[slot].ready && controls[slot].afk && !controls[slot].spectator && !afk_respawn_wait_[slot].actor && actor && mem_read32(native_.local_address(actor->id)+0x328)==0 && std::get<float>(actor->properties.at("health"))>0 && std::get<int64_t>(actor->properties.at("camera_frozen"))==0 && !ssne::native_party_spawn_waiting(native_.local_address(actor->id));
         if(active!=afk_native_active_[slot]){afk_native_active_[slot]=active;afk_bots_[slot]={};if(log_)log_("[coop-afk-native-control] slot="+std::to_string(slot)+" enabled="+std::to_string(active)+" actor="+std::to_string(actor?native_.local_address(actor->id):0));}
         if(!active)continue;
         if(handed_over[slot])continue; // preserve transfer boundary before the first ordinary AI action
         const auto native_actor=native_.local_address(actor->id);auto& lease=afk_aim_leases_[slot];
-        const auto aim_pointer=mem_read32(native_actor+0x37C);if(aim_pointer<0x80000000u || aim_pointer>ssne::guest_ram_end()-0x58u)continue;
-        if(!lease.actor){lease={controls[slot].id,native_actor,aim_pointer,mem_read32(aim_pointer+0x48)!=0};if(log_)log_("[coop-afk-auto-aim-owned] slot="+std::to_string(slot)+" saved="+std::to_string(lease.saved));}
-        {std::string why;if(!set_native_afk_manual_aim(context,native_actor,true,why)){report(why);continue;}}
+        const bool fresh=!lease.binding.actor;
+        {std::string why;if(!begin_native_auto_aim_override(context,native_actor,lease.binding,why)){report(why);continue;}
+            lease.player=controls[slot].id;lease.epoch=native_.current_epoch();
+            if(!set_native_afk_manual_aim(context,native_actor,true,why)){end_native_auto_aim_override(lease.binding);lease={};report(why);continue;}}
+        if(fresh && log_)log_("[coop-afk-auto-aim-owned] slot="+std::to_string(slot)+" saved_mode="+std::to_string(lease.binding.saved_mode));
         const auto p=std::get<std::array<float,3>>(actor->properties.at("position"));
         const auto movement=mem_read32(native_actor+0x344);
         const bool swimming=movement>=0x80000000u && movement<=ssne::guest_ram_end()-4 && mem_read32(movement)==ssne::game_address(0x80211030u);
@@ -578,23 +894,33 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
         afk_follow_slots_[slot]=follow;if(!leader)leader=actor; // defend self if all humans are dead/absent; never follow another AFK bot
         ssne::BotWorld world;world.host.id=native_.local_address(leader->id);world.host.position=std::get<std::array<float,3>>(leader->properties.at("position"));world.host.health=std::get<float>(leader->properties.at("health"));
         world.client.id=native_.local_address(actor->id);world.client.position=p;world.client.health=std::get<float>(actor->properties.at("health"));world.yaw=std::get<float>(actor->properties.at("yaw"));world.pitch=std::get<float>(actor->properties.at("pitch"));
+        // Ground-controller phase0 and actual native support distinguish a
+        // walkable breadcrumb from both the ascent and descent of a jump.
+        // Player+36C means falling only: it is also zero while ascending.
+        const auto leader_mode=mem_read32(world.host.id+0x344);
+        const bool leader_mode_valid=leader_mode>=0x80000000u && leader_mode<=ssne::guest_ram_end()-0x38;
+        const bool leader_swimming=leader_mode_valid && mem_read32(leader_mode)==ssne::game_address(0x80211030u);
+        const bool leader_grounded=leader_swimming || (leader_mode_valid && mem_read32(leader_mode+4)==0 && mem_read32(world.host.id+0x6D0)!=0);
         std::array<bool,12> usable{};std::array<int,12> stock{};
         for(unsigned weapon=0;weapon<12;++weapon){std::string why;auto ammo=native_owned_primary_ammo(context,native_actor,weapon,why);if(ammo){stock[weapon]=*ammo;usable[weapon]=*ammo>0;}}
-        float acquisition_range=bot_acquisition_range(usable);
+        float acquisition_range=bot_perception_range(usable);
         // Private same-binary countercheck only; ordinary sessions always use
-        // the owned weapon ranges above.
+        // the perception range above; firing retains its weapon-specific limit.
         if(env_requested("SSNE_TEST_HIDDEN") && env_present("SSNE_TEST_AFK_RANGE_LIMIT")){
             const auto limit=std::strtof(getenv("SSNE_TEST_AFK_RANGE_LIMIT"),nullptr);
-            if(std::isfinite(limit) && limit>=0.f && limit<=100.f)acquisition_range=std::min(acquisition_range,limit);
+            if(std::isfinite(limit) && limit>=0.f && limit<=bot_max_perception_range)acquisition_range=std::min(acquisition_range,limit);
         }
         // Verified native world queries exclude blocked lines and unsafe steps.
         std::array<float,3> eye;std::string origin_error;if(!native_player_fire_origin(context,world.client.id,eye,origin_error))continue;
         for(const auto& [id,enemy]:sample.entities)if(enemy.kind==EntityKind::Enemy && enemy.properties.contains("health") && std::get<float>(enemy.properties.at("health"))>0){
-            const auto address=native_.local_address(id);const auto height=u2f(mem_read32(address+0xD0));if(!std::isfinite(height) || height<.05f || height>200.f)continue;
-            auto point=std::get<std::array<float,3>>(enemy.properties.at("position"));const auto distance=std::hypot(point[0]-p[0],point[2]-p[2]);auto aim=point;aim[1]+=height*.5f;
+            const auto address=native_.local_address(id);const auto extent=u2f(mem_read32(address+0xD0));if(!std::isfinite(extent) || extent<.05f || extent>200.f)continue;
+            // Native actor positions are collision centres, also used by the
+            // original auto-aim selector. Adding half the bounding extent
+            // invents a higher target and rejects otherwise correct far shots.
+            auto point=std::get<std::array<float,3>>(enemy.properties.at("position"));const auto distance=std::hypot(point[0]-p[0],point[2]-p[2]);const auto aim=point;
             std::optional<ssne::NativeSegmentHit> obstruction;std::string why;bool query_valid=false;
             const bool visible=bot_visible_target(distance,acquisition_range,[&]{query_valid=ssne::native_world_segment(context,eye,aim,obstruction,why);return query_valid && !obstruction;});
-            if(visible)world.enemies.push_back({address,point,std::get<float>(enemy.properties.at("health")),height});
+            if(visible)world.enemies.push_back({address,point,std::get<float>(enemy.properties.at("health")),0.f});
             static unsigned detailed_far_sight_samples=0;
             const bool detailed_far_sight=distance>30.f && detailed_far_sight_samples<4096;
             if(log_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TEST_BOT_FIRE_TRACE") && (afk_decisions_[slot]%8==0 || detailed_far_sight) && distance<=acquisition_range){
@@ -608,12 +934,26 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
                 const BotPoint q{v[i*7+4],v[i*7+5],v[i*7+6]};if(bot_distance(p,q)>acquisition_range)continue;
                 std::optional<ssne::NativeSegmentHit> hit;std::string why;
                 const auto part=mem_read32(native_.local_address(id)+0x1FC+i*4);
-                if(part && ssne::native_world_segment(context,eye,q,hit,why) && !hit)world.enemies.push_back({part,q,v[i*7+3],.1f});
+                if(part && ssne::native_world_segment(context,eye,q,hit,why) && !hit)world.enemies.push_back({part,q,v[i*7+3],0.f});
             }
         }
+        // Original walking (800C04AC) applies a stored small-step correction
+        // after collision resolution. A raw straight sweep alone rejects those
+        // steps. Check both the lift's headroom and its supported landing; this
+        // only authorizes ordinary movement input, never a position write.
+        auto walk_sweep=[&](const BotPoint& from,const BotPoint& to,float radius,ssne::NativeSphereResult& result,std::string& why){
+            if(!ssne::native_world_sphere(context,from,to,radius,result,why))return false;
+            if(bot_distance(result.position,to)<.15f)return true;
+            const float rise=to[1]-from[1],limit=std::min(.6f,radius-.3f);
+            if(rise<=.03f || rise>limit+.02f)return true; // retain a native slide for the caller to assess
+            auto raised=from;raised[1]=to[1];ssne::NativeSphereResult lift,landing;
+            if(!ssne::native_world_sphere(context,from,raised,radius,lift,why) || bot_distance(lift.position,raised)>.1f)return true;
+            if(!ssne::native_world_sphere(context,raised,to,radius,landing,why) || bot_distance(landing.position,to)>.15f)return true;
+            result=std::move(landing);return true;
+        };
         auto route_clear=[&](const std::array<float,3>& goal){
             const float distance=std::hypot(goal[0]-p[0],goal[2]-p[2]);
-            if(distance<2.f || distance>((server_->bot_mask()&(1u<<slot))?65.f:12.f) || std::abs(goal[1]-p[1])>.6f)return false;
+            if(distance<.15f || distance>((server_->bot_mask()&(1u<<slot))?65.f:12.f) || std::abs(goal[1]-p[1])>.6f)return false;
             const auto radius=ssne::native_player_collision_radius(world.client.id);if(!radius)return false;
             ssne::NativeSphereResult path;std::string why;
             if(!ssne::native_world_sphere(context,p,goal,*radius,path,why) || std::hypot(path.position[0]-goal[0],path.position[2]-goal[2])>.15f || std::abs(path.position[1]-goal[1])>.3f)return false;
@@ -631,7 +971,7 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
         };
         #include "native_game_bots.inc"
         const auto previous_target=afk_bots_[slot].target();
-        const auto decision=afk_bots_[slot].update(world,8,&eye,route_clear,true,automated,acquisition_range);ControlInput input;input.pad=decision.pad;input.yaw=decision.yaw;input.pitch=decision.pitch;
+        const auto decision=afk_bots_[slot].update(world,8,&eye,route_clear,true,automated,acquisition_range,automated || leader_grounded);ControlInput input;input.pad=decision.pad;input.yaw=decision.yaw;input.pitch=decision.pitch;
         if(automated){
             const auto target=afk_bots_[slot].target();if(target!=brain.target){brain.target=target;brain.reaction=skill==1?5:skill==2?3:1;}
             if(!target && bot_distance(world.host.position,p)<.7f && bot_distance(brain.goal,p)>2){const auto yaw=std::atan2(brain.goal[0]-p[0],brain.goal[2]-p[2]);input.yaw=int32_t(std::clamp(std::remainder(yaw-world.yaw,6.283185307f),-.5f,.5f)*1000000);}
@@ -647,7 +987,7 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
             // real muzzle from ever meeting its alignment threshold.
             if(automated && distance>=4 && distance<35 && !brain.pickup && bot_firing_stance(mem_read32(native_actor+0x5DC),afk_decisions_[slot]) &&
                (sample.mode!=4 || !mem_read32(native_actor+0x6A4)) && (sample.mode!=3 || !mem_read32(native_actor+0x694)) &&
-               (!cooperative || nearest<12))input.pad.stick_x=input.pad.stick_y=128;
+               (!cooperative || nearest<8))input.pad.stick_x=input.pad.stick_y=128;
             for(const auto& enemy:world.enemies)if(std::hypot(enemy.position[0]-point[0],enemy.position[2]-point[2])<5.f)++nearby;
             bool explosive_safe=distance>=12.f,friend_blocks=false;
             const float dx=point[0]-eye[0],dy=point[1]-eye[1],dz=point[2]-eye[2],length2=dx*dx+dy*dy+dz*dz;
@@ -683,7 +1023,7 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
                 EntityId target_entity=0;for(const auto& [id,e]:sample.entities)if(native_.local_address(id)==combat_target->id){target_entity=id;break;}
                 log_("[game-bot-fire-trace] tick="+std::to_string(tick)+" slot="+std::to_string(slot)+" target="+std::to_string(combat_target->id)+" weapon="+std::to_string(selected)+" chosen="+std::to_string(chosen)+" distance="+std::to_string(distance)+" target_entity="+std::to_string(target_entity)+" acquisition_range="+std::to_string(acquisition_range)+" cosine="+std::to_string(aim_cosine)+" held="+std::to_string(same_trigger)+" fire="+std::to_string(can_fire)+" ammo="+std::to_string(selected<12?stock[selected]:0)+" state="+std::to_string(mem_read32(instance+0x1B4))+" spin="+std::to_string(selected==4?u2f(mem_read32(instance+0x290)):0.f)+" friend_blocks="+std::to_string(friend_blocks));
             }
-            if(friend_blocks){input.pad.stick_x=slot%2?224:32;input.pad.stick_y=128;}
+            if(friend_blocks && (!automated || !cooperative || nearest<8)){input.pad.stick_x=slot%2?224:32;input.pad.stick_y=128;}
         }else{input.pad.trigger_r=0;input.pad.buttons&=~ssne::PAD_R;}
         if(log_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES") && afk_decisions_[slot]%8==0){
             const auto target=std::find_if(world.enemies.begin(),world.enemies.end(),[&](const auto& enemy){return enemy.id==afk_bots_[slot].target();});
@@ -714,13 +1054,17 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
             auto ground_above=p,ground_below=p;ground_above[1]+=.5f;ground_below[1]-=2.f;std::optional<ssne::NativeSegmentHit> ground;
             const bool supported=radius && ssne::native_world_segment(context,ground_above,ground_below,ground,why) && ground && ground->normal[1]>=.7f && p[1]-ground->position[1]<=*radius+.5f;
             auto resolve=[&](const std::array<float,3>& wanted,std::array<float,3>& accepted){
-                if(!supported || !ssne::native_world_sphere(context,p,wanted,*radius,path,why))return false;
+                if(!supported)return false;
+                auto target=wanted,above=wanted,below=wanted;above[1]+=1.5f;below[1]-=2.f;
+                if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.725f || floor->position[1]<ground->position[1]-.5f || floor->position[1]>ground->position[1]+std::min(.6f,*radius-.3f))return false;
+                const float centre_y=floor->position[1]+*radius/std::max(.725f,floor->normal[1])+.02f;if(centre_y>p[1])target[1]=centre_y;
+                if(!walk_sweep(p,target,*radius,path,why))return false;
                 const float dx=path.position[0]-p[0],dz=path.position[2]-p[2],wx=wanted[0]-p[0],wz=wanted[2]-p[2];
                 const auto travel=std::hypot(dx,dz);
                 // Native collision correction may slide along a wall. Follow
                 // that resolved direction using ordinary input, never teleport.
                 if(travel<.05f || travel>std::hypot(wx,wz)+.05f || dx*wx+dz*wz<.02f || std::abs(path.position[1]-p[1])>.6f)return false;
-                auto above=path.position,below=path.position;above[1]+=1.5f;below[1]-=2.f;
+                above=below=path.position;above[1]+=1.5f;below[1]-=2.f;
                 if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.7f || floor->position[1]<ground->position[1]-.5f || floor->position[1]>ground->position[1]+.6f)return false;
                 accepted=path.position;return true;
             };
@@ -736,8 +1080,12 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
             }
             if(safe){
                 const float dx=accepted[0]-p[0],dz=accepted[2]-p[2];
-                input.pad.stick_x=uint8_t(std::clamp(128+int((dx*std::cos(world.yaw)-dz*std::sin(world.yaw))*160.f),0,255));
-                input.pad.stick_y=uint8_t(std::clamp(128+int((dx*std::sin(world.yaw)+dz*std::cos(world.yaw))*160.f),0,255));
+                // Keep an ordinary walking-speed input along the safe resolved
+                // direction. Scaling by a tiny collision correction can fall
+                // below the game's stick dead zone and prevent native stepping.
+                const float scale=102.f/std::max(.01f,std::hypot(dx,dz));
+                input.pad.stick_x=uint8_t(std::clamp(128+int((dx*std::cos(world.yaw)-dz*std::sin(world.yaw))*scale),0,255));
+                input.pad.stick_y=uint8_t(std::clamp(128+int((dx*std::sin(world.yaw)+dz*std::cos(world.yaw))*scale),0,255));
                 if(env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES") && log_ && std::hypot(accepted[0]-next[0],accepted[2]-next[2])>.05f)log_("[coop-afk-native-detour] slot="+std::to_string(slot)+" from="+std::to_string(p[0])+","+std::to_string(p[1])+","+std::to_string(p[2])+" resolved="+std::to_string(accepted[0])+","+std::to_string(accepted[1])+","+std::to_string(accepted[2])+" floor_y="+std::to_string(floor->position[1]));
                 if(input.pad.trigger_l){auto above=p;above[1]+=1.4f;ssne::NativeSphereResult clearance;
                     if(!ssne::native_world_sphere(context,p,above,*radius,clearance,why) || clearance.position[1]-p[1]<1.2f){input.pad.buttons&=~ssne::PAD_L;input.pad.trigger_l=0;}
@@ -752,7 +1100,7 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
         input.pad.buttons&=~ssne::PAD_START;afk_inputs_[slot]=input;
         ++afk_decisions_[slot];
         if(log_ && (afk_decisions_[slot]%8==0 || input.pad.stick_x!=128 || input.pad.stick_y!=128 || input.pad.trigger_r || input.pad.trigger_l))log_("[coop-afk-bot-input] slot="+std::to_string(slot)+" follow="+std::to_string(follow)+" target="+std::to_string(afk_bots_[slot].target())+" x="+std::to_string(input.pad.stick_x)+" y="+std::to_string(input.pad.stick_y)+" fire="+std::to_string(input.pad.trigger_r)+" jump="+std::to_string(input.pad.trigger_l)+" buttons="+std::to_string(input.pad.buttons));
-        if(log_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES"))log_("[coop-afk-motion] tick="+std::to_string(tick)+" slot="+std::to_string(slot)+" actor="+std::to_string(native_actor)+" x="+std::to_string(p[0])+" y="+std::to_string(p[1])+" z="+std::to_string(p[2])+" jump="+std::to_string(input.pad.trigger_l)+" follow="+std::to_string(follow)+" follow_distance="+std::to_string(nearest));
+        if(log_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES"))log_("[coop-afk-motion] tick="+std::to_string(tick)+" slot="+std::to_string(slot)+" actor="+std::to_string(native_actor)+" x="+std::to_string(p[0])+" y="+std::to_string(p[1])+" z="+std::to_string(p[2])+" jump="+std::to_string(input.pad.trigger_l)+" follow="+std::to_string(follow)+" follow_distance="+std::to_string(nearest)+" leader_y="+std::to_string(std::get<BotPoint>(leader->properties.at("position"))[1])+" leader_ground="+std::to_string(leader_grounded));
     }
 }
 bool NativeSession::drain_weapon_sounds(PPCContext& context) {
@@ -776,8 +1124,9 @@ bool NativeSession::drain_weapon_sounds(PPCContext& context) {
     std::string why;if(!cues || !ssne::reconcile_native_weapon_cues(context,*cues,why)){report(why.empty()?"Missing authoritative weapon cue lifetimes":why);return false;}
     return true;
 }
-void NativeSession::render_begin(PPCContext&) {
-    if(!client_)return;
+void NativeSession::render_begin(PPCContext& render_context) {
+    if(client_ && custom_level_rejected_)return;
+    if(!client_){begin_spectator_view(render_context);return;}
     NativeStageTimer timing("render_begin",log_);
     const auto status=client_->status();
     if(!queued_ || level_loading_ || !status.connected || !presentation_applied_ || !ssne::replica_simulation() ||
@@ -785,31 +1134,13 @@ void NativeSession::render_begin(PPCContext&) {
         presentation_.reset();presentation_revision_=0;client_->clear_predicted_look();return;
     }
     const auto now=std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    Properties vehicle_visual;
-    std::map<EntityId,EntityState> visual;
-    {ssne::perf::detail::Scope phase(ssne::perf::detail::RenderVisualSample);visual=presentation_.sample(now,&vehicle_visual);}
-    std::vector<uint32_t> first_person;
-    PredictedLook pending;ssne::RenderLookSample look_sample;
+    auto& vehicle_visual=presentation_vehicle_visual_;
+    auto& visual=presentation_visual_;
+    {ssne::perf::detail::Scope phase(ssne::perf::detail::RenderVisualSample);presentation_.sample_into(now,visual,&vehicle_visual);}
+    PredictedLook pending;
     const auto* own=ClientPresentation::own(*presentation_applied_,status.player);
     if(own && status.player.slot<max_players){
         const auto actor=replica_.local_address(own->id);
-        if(presentation_readable(actor,0x790) && u2f(mem_read32(actor+0xCC))>0){
-            const auto weapon=mem_read32(actor+0x5DC);
-            if(weapon<12)for(unsigned hand=0;hand<2;++hand){
-                const auto instance=mem_read32(actor+0x4BC+weapon*24+hand*4);
-                auto add=[&](uint32_t proxy){
-                    if(!presentation_readable(proxy,0x38))return;
-                    const auto vt=mem_read32(proxy);
-                    if(presentation_readable(vt,0x30) && mem_read32(vt+0x2C)==0x8013E954u)first_person.push_back(proxy);
-                };
-                if(presentation_readable(instance,0x228)){
-                    add(mem_read32(instance));
-                    for(unsigned effect=0;effect<3;++effect){const auto offset=native_weapon_flash_offset(weapon,effect);if(offset && presentation_readable(instance+offset,16))add(mem_read32(instance+offset+4));}
-                }
-                if(weapon==4)if(const auto barrel=native_minigun_barrel(actor,hand);barrel)add(barrel->model);
-            }
-        }
-        for(unsigned i=0;i<std::min(4u,mem_read32(0x802DCE10u));++i){const auto proxy=mem_read32(0x802D90CCu+i*4);if(presentation_readable(proxy,0x38) && ssne::replica_bullet_trail_view(proxy))first_person.push_back(proxy);}
         const auto camera_mode=own->properties.find("camera_mode");
         const auto* mode=camera_mode==own->properties.end()?nullptr:std::get_if<int64_t>(&camera_mode->second);
         const bool active=actor && u2f(mem_read32(actor+0xCC))>0 && !mem_read32(actor+0x370) && !ssne::native_party_spawn_waiting(actor) &&
@@ -822,11 +1153,7 @@ void NativeSession::render_begin(PPCContext&) {
             if(found!=visual.end() && presentation_readable(lo,0x28) && presentation_readable(hi,0x28)){
                 float low=u2f(mem_read32(lo+0x24))*.017453292f,high=u2f(mem_read32(hi+0x24))*.017453292f;if(low>high)std::swap(low,high);
                 follow_local_camera(found->second,*own,pending,low,high);
-                if(presentation_matrix(own->properties,"camera_row",look_sample.camera)){
-                    look_sample.angles=std::get<std::array<float,3>>(own->properties.at("view_angles"));look_sample.epoch=presentation_applied_->epoch;
-                    look_sample.ack=presentation_applied_->input_ack[status.player.slot];look_sample.slot=status.player.slot;look_sample.generation=status.player.generation;
-                    look_sample.pitch_low=low;look_sample.pitch_high=high;look_sample.enabled=true;
-                }
+
             }
         }else client_->clear_predicted_look();
     }
@@ -843,20 +1170,25 @@ void NativeSession::render_begin(PPCContext&) {
             std::string message="[weapon-scope-begin] proxy="+std::to_string(proxy)+" expected=";for(float v:expected)message+=std::to_string(v)+",";message+=" actual=";for(float v:actual)message+=std::to_string(v)+",";if(log_)log_(message);
         }
     }
-    if(own)if(auto item=visual.find(own->id);item!=visual.end()){
-        PresentationMatrix camera; (void)camera;
-    }
+    begin_spectator_view(render_context);
     if(++presentation_frames_%120==0 && log_)log_("[coop-client-presentation] frames="+std::to_string(presentation_frames_)+" revision="+std::to_string(presentation_applied_->revision)+" buffer_ms="+std::to_string(presentation_.delay_ms())+" visual_objects="+std::to_string(visual.size())+" pending_look="+std::to_string(pending.yaw)+","+std::to_string(pending.pitch));
 }
-void NativeSession::render_end(PPCContext&){if(client_){ssne::perf::detail::Scope phase(ssne::perf::detail::RenderVisualRestore);NativeStageTimer timing("render_end",log_);if(env_requested("SSNE_DEV_STATIONARY_LOOK") && log_)log_("[weapon-scope-end]");replica_.end_presentation();}}
+void NativeSession::render_end(PPCContext&){if(spectator_view_.active()){std::string why;if(!spectator_view_.end(why))report(why);}if(client_){ssne::perf::detail::Scope phase(ssne::perf::detail::RenderVisualRestore);NativeStageTimer timing("render_end",log_);if(env_requested("SSNE_DEV_STATIONARY_LOOK") && log_)log_("[weapon-scope-end]");replica_.end_presentation();}}
 void NativeSession::frame(PPCContext& context,uint64_t frame) {
+    if(server_){if(!custom_map_session_)custom_map_session_=std::make_unique<CustomMapSession>(server_,client_,log_);if(const auto state=server_->latest_world())custom_map_session_->host_update(*state);}
+    if(client_){const auto state=client_->latest_world();if(custom_level_rejected_ || (state && !custom_content_ok(context,*state)))return;}
+    // Frontend rendering continues while the original simulation clock is idle.
+    // Resolve explicit project startup here as well as in gameplay ticks.
+    if(server_ && setup_.contains("Session.Survival.Active") && !queued_ && frame>=30 && mem_read32(ssne::game_address(0x802DB0E0))==3){const bool menu=level_=="lobby";if(initialize(context,{menu?"Rlevel1_1":level_,setup_},menu?3:0) && menu)show_native_lobby(context);}
     if(ssne::perf::enabled.load(std::memory_order_relaxed)){
         ssne::perf::Context diagnostic;diagnostic.frame=frame;diagnostic.epoch=epoch_;diagnostic.level=level_;diagnostic.scene=mem_read32(ssne::game_address(0x802DB0E0));
+        if(server_)diagnostic.entities=host_capture_entities_;
         if(client_){const auto state=client_->latest_world();if(state){diagnostic.entities=state->entities.size();diagnostic.revision=state->revision;}const auto status=client_->status();diagnostic.ping_ms=status.ping_ms;diagnostic.bytes_received=status.bytes_received;diagnostic.interpolation_ms=presentation_.delay_ms();}
         for(const auto& binding:native_.player_bindings())if(binding.slot==unsigned(ssne::netplay_local_player()))for(unsigned i=0;i<3;++i)diagnostic.position[i]=u2f(mem_read32(binding.actor+0x20+i*4));
         ssne::perf::set_context(std::move(diagnostic));
     }
     NativeStageTimer timing("frame",log_);
+    struct FeatureHudFinish{std::function<void()> action;~FeatureHudFinish(){action();}} feature_hud{[&]{update_feature_hud(context);}};
     if(queued_ && !level_loading_ && (server_ || client_) && mem_read32(ssne::game_address(0x802DB0E0))==4 && mem_read32(context.r[13]-0x69d4)==1){
         const auto slot=ssne::netplay_local_player();
         for(const auto& player:native_.player_bindings())if(player.slot==slot){
@@ -873,8 +1205,10 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             for(const auto& [id,entity]:hud_state->entities)if(entity.kind==EntityKind::Player){const auto actor=replica_.local_address(id);if(actor)hud_actors.push_back(actor);}
         }else replica_hud_clock_={};
         std::string hud_error;if(!advance_native_player_huds(context,hud_actors,replica_hud_clock_,frame,now,hud_error)){report(hud_error);return;}
+        if(!ssne::advance_native_boss_hud(context,frame,now,hud_error)){report(hud_error);return;}
         if(!replica_.advance_combo_huds(context,std::clamp(elapsed,0.f,60.f),hud_error)){report(hud_error);return;}
         std::string why;bool effects_ok;{ssne::perf::Scope effects("effects");effects_ok=ssne::update_native_replica_effects(context,std::clamp(elapsed,0.f,.1f),why);}if(!effects_ok){report(why);return;}
+        if(!replica_.advance_particles(context,std::clamp(elapsed,0.f,.1f),why)){report(why);return;}
         if(!ssne::update_native_weapon_loops(context,why)){report(why);return;}
         if(presentation_applied_ && client_->status().connected && hud_state && presentation_applied_->epoch==hud_state->epoch && presentation_applied_->level==hud_state->level)
             if(!update_native_vehicle_audio(context,presentation_applied_->mission,why))report(why);
@@ -887,10 +1221,79 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         // A resume request must be resolved from the host's loaded native card
         // before clients receive a real asset name to initialize.
         if(!queued_ && (level_=="continue" || level_=="lobby"))return;
+        // The transport sends at most once per 16ms. Rebuilding the complete
+        // world at render FPS produces discarded snapshots. Native simulation,
+        // input, AFK decisions and rendering continue outside this capture gate;
+        // reliable effect/lifetime producers retain changes until publication.
+        static const bool paced_capture=[] {const auto* value=getenv("SSNE_HOST_CAPTURE_PACING");return !value || strcmp(value,"0");}();
+        bool pending_save=false;{std::lock_guard lock(save_mutex_);pending_save=save_request_.has_value() && !awaiting_save_identity_locked();}
+        const auto capture_epoch=native_.current_epoch();
+        if(host_capture_epoch_!=capture_epoch){host_capture_epoch_=capture_epoch;host_capture_clock_.reset();host_idle_publication_clock_.reset();}
+        static const bool idle_publication=[] {const auto* value=getenv("SSNE_HOST_IDLE_PUBLICATION");return !value || strcmp(value,"0");}();
+        std::optional<HostPublicationDemand> demand;
+        if(idle_publication){
+            demand=server_->publication_demand();
+            if(host_publication_serial_!=demand->serial){host_publication_serial_=demand->serial;host_capture_clock_.reset();host_idle_publication_clock_.reset();}
+        }
+        const bool gameplay=host_ready_ && !level_loading_ && !startup_save_ && !pending_save && !active_cutscene_object_ && !active_movie_sequence_ && mem_read32(ssne::game_address(0x802DB0E0))==4 && !ssne::native_results_presenting() && !ssne::native_cutscene_presenting() && !ssne::native_movie_presenting();
+        // A stable FMV decodes on each machine. Leave lifetimes, joins and skip
+        // decisions on the authoritative thread, but avoid capturing and encoding
+        // the entire world again at every display refresh for the same video.
+        const bool exact_publication_probe=host_exact_publication_probe();
+        const auto movie=active_movie_sequence_ ? ssne::native_movie_state() : ssne::NativeMovieState{};
+        const bool ongoing_movie=movie.active && movie.sequence==active_movie_sequence_ &&
+            capture_epoch==epoch_ && !level_loading_ && !startup_save_ && !pending_save;
+        if(paced_capture && ongoing_movie && !exact_publication_probe && !server_->skip_decision()){
+            const auto interval=std::chrono::milliseconds(demand && !demand->tcp_peers ? 100 : 32);
+            if(!host_capture_clock_.due(std::chrono::steady_clock::now(),interval))return;
+        }else if(!gameplay){
+            host_capture_clock_.reset();
+            host_idle_publication_clock_.reset();
+        }else if(paced_capture && !host_capture_clock_.due(std::chrono::steady_clock::now()))return;
         if(mem_read32(ssne::game_address(0x802DB0E0))==4){std::string why;if(!refresh_native_weapon_poses(context,why)){report(why);return;}}
         if(queued_){std::string why;if(!apply_native_lobby_skin_choices(context,why)){report(why);return;}}
         for(const auto& binding:native_.player_bindings())ssne::apply_ammo_limits(mem_read32(binding.actor+0x5E8));
-        auto sample=[&]{NativeStageTimer timing("capture",log_);return native_.capture(frame);}();
+        static const bool prepared_capture=[] {const auto* value=getenv("SSNE_HOST_PREPARED_CAPTURE");return !value || strcmp(value,"0");}();
+        static const bool connected_capture=[] {const auto* value=getenv("SSNE_ACTIVE_PLAYER_SNAPSHOTS");return !value || strcmp(value,"0");}();
+        bool idle_eligible=!survival_enabled_ && idle_publication && paced_capture && demand && gameplay && capture_epoch==epoch_ && mem_read32(ssne::game_address(0x802DB1BC))==1 && !demand->tcp_peers && demand->all_ready && !exact_publication_probe && !(!fixture_dumped_ && env_requested("SSNE_COOP_CAPTURE_RAM"));
+        if(idle_eligible)for(unsigned slot=0;slot<capacity_;++slot)if(players_[slot]!=demand->owners[slot] || join_placements_[slot].player.generation){idle_eligible=false;break;}
+        // Bone ESP/aim reads native skeleton RAM at camera frequency. Its
+        // offscreen poses previously benefited from publication preparation;
+        // preserve that cadence rather than making those local features stale.
+        if(idle_eligible){const auto local_mods=ssne::mod_current_options();if(local_mods.bone_esp || (local_mods.aimbot && local_mods.aim_point!=0))idle_eligible=false;}
+        bool idle_locals_done=false;
+        if(idle_eligible){idle_locals_done=maintain_idle_host_locals(context,*demand,capture_epoch,connected_capture);if(!idle_locals_done)idle_eligible=false;}
+        if(!host_idle_reported_ || *host_idle_reported_!=idle_eligible){host_idle_reported_=idle_eligible;if(log_)log_("[coop-host-publication-policy] idle="+std::to_string(idle_eligible)+" interval_ms="+std::to_string(idle_eligible?100:16)+" peers="+std::to_string(demand?demand->tcp_peers:0)+" serial="+std::to_string(demand?demand->serial:0));}
+        if(!idle_eligible)host_idle_publication_clock_.reset();
+        else if(!host_idle_publication_clock_.due(std::chrono::steady_clock::now(),std::chrono::milliseconds(100)))return;
+        static const bool compare_capture=env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_TEST_COMPARE_HOST_CAPTURE");
+        std::optional<NativeWorldSample> reference_capture;
+        if(compare_capture){
+            reference_capture=native_.capture(frame);
+            unsigned reserved=0,connected=0;
+            for(auto it=reference_capture->entities.begin();it!=reference_capture->entities.end();){
+                const auto& e=it->second;reserved+=e.kind==EntityKind::Player;connected+=e.kind==EntityKind::Player && e.owner.generation;
+                if(connected_capture && e.kind==EntityKind::Player && !e.owner.generation)it=reference_capture->entities.erase(it);else ++it;
+            }
+            // The full capture could still resolve an inactive reservation as
+            // a projectile source. Match publication's absent-source policy.
+            if(connected_capture)for(auto& [id,e]:reference_capture->entities)if(e.kind==EntityKind::Projectile){auto& source=std::get<EntityReference>(e.properties.at("projectile_source"));if(source.id && !reference_capture->entities.contains(source.id))source.id=0;}
+            if(frame%120==0 && log_)log_("[coop-host-player-publication] reserved="+std::to_string(reserved)+" connected="+std::to_string(connected)+" filtered="+std::to_string(connected_capture));
+        }
+        auto sample=[&]{NativeStageTimer timing("capture",log_);if(connected_capture)return native_.capture_for_publication(frame,prepared_capture);return prepared_capture?native_.capture_before_pose_preparation(frame):native_.capture(frame);}();
+        if(reference_capture){
+            auto reference=reference_capture->entities,actual=sample.entities;
+            auto omit_poses=[](auto& entities){for(auto& [id,e]:entities)if(e.kind==EntityKind::Player || e.kind==EntityKind::Enemy || (e.kind==EntityKind::Physics && e.definition==3)){for(auto it=e.properties.begin();it!=e.properties.end();){if(it->first.starts_with("enemy_bone_") || (it->first.starts_with("body") && it->first.find("_bone_")!=std::string::npos))it=e.properties.erase(it);else ++it;}}};
+            omit_poses(reference);omit_poses(actual);
+            if(reference!=actual || reference_capture->error!=sample.error || reference_capture->scene!=sample.scene || reference_capture->mode!=sample.mode || reference_capture->epoch!=sample.epoch || reference_capture->created!=sample.created || reference_capture->registered!=sample.registered || reference_capture->removed!=sample.removed || reference_capture->unmapped.size()!=sample.unmapped.size())throw std::runtime_error("Prepared host capture differs from reference");
+            for(size_t i=0;i<sample.unmapped.size();++i)if(sample.unmapped[i].address!=reference_capture->unmapped[i].address || sample.unmapped[i].vtable!=reference_capture->unmapped[i].vtable)throw std::runtime_error("Prepared host capture changed unmapped identity");
+        }
+        if(frame%120==0 && log_ && env_requested("SSNE_TEST_HIDDEN")){
+            unsigned connected=0,reserved=0;for(const auto& [id,e]:sample.entities)if(e.kind==EntityKind::Player){if(e.owner.generation)++connected;else ++reserved;}
+            log_("[coop-host-published-players] connected="+std::to_string(connected)+" reserved="+std::to_string(reserved)+" epoch="+std::to_string(sample.epoch));
+        }
+        if(update_survival_round(context,sample,frame))sample=connected_capture?native_.capture_for_publication(frame,prepared_capture):prepared_capture?native_.capture_before_pose_preparation(frame):native_.capture(frame);
+        host_capture_entities_=sample.entities.size();
         if(ssne::perf::enabled.load(std::memory_order_relaxed)){std::lock_guard lock(ssne::perf::context_mutex);ssne::perf::context.entities=sample.entities.size();}
         // Remote cameras may see an actor culled from the host's own view.
         // Evaluate its animation before publishing; never depend on host draw
@@ -903,10 +1306,19 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
                 const auto binding=e.kind==EntityKind::Player?native_body_pose_binding(object,part):e.kind==EntityKind::Physics?native_corpse_pose_binding(object):native_enemy_pose_binding(object);
                 if(!binding || !binding->model)continue;
                 const auto prefix=e.kind==EntityKind::Player?"body"+std::to_string(part)+"_bone_":std::string("enemy_bone_");
-                std::vector<float> matrices;bool valid=true;for(unsigned i=0;i<binding->count*12;++i){auto value=u2f(mem_read32(binding->matrices+i*4));valid&=std::isfinite(value) && std::abs(value)<=10000.f;matrices.push_back(value);}
+                std::vector<float> matrices;matrices.reserve(binding->count*12);bool valid=true;for(unsigned i=0;i<binding->count*12;++i){auto value=u2f(mem_read32(binding->matrices+i*4));valid&=std::isfinite(value) && std::abs(value)<=10000.f;matrices.push_back(value);}
                 if(!valid){report("Invalid prepared actor animation");return;}
                 e.properties[prefix+"count"]=int64_t(binding->count);e.properties[prefix+"layout"]=int64_t(binding->layout);e.properties[prefix+"matrices"]=std::move(matrices);
             }
+        }
+        if(reference_capture && sample.scene==4 && sample.error.empty()){
+            for(auto& [id,e]:reference_capture->entities)if(e.kind==EntityKind::Enemy || e.kind==EntityKind::Player || (e.kind==EntityKind::Physics && e.definition==3)){
+                const auto& actual=sample.entities.at(id);
+                for(const auto& [key,value]:actual.properties)if(key.starts_with("enemy_bone_") || (key.starts_with("body") && key.find("_bone_")!=std::string::npos))e.properties[key]=value;
+                if(e.kind==EntityKind::Physics){std::string why;if(!capture_native_corpse_visual(context,native_.local_address(id),e,why))throw std::runtime_error(why);}
+            }
+            if(reference_capture->entities!=sample.entities)throw std::runtime_error("Prepared host publication differs from reference");
+            if(frame%120==0 && log_)log_("[coop-host-capture-reference] frame="+std::to_string(frame)+" entities="+std::to_string(sample.entities.size())+" identical=1");
         }
         if(startup_save_){
             // Initialize native resources, then restore before publishing any
@@ -956,10 +1368,10 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             }
         }
         if(!sample.error.empty()){if(env_requested("SSNE_TEST_HIDDEN") && env_present("SSNE_COOP_CAMPAIGN_COMMAND"))campaign_probe(context,sample,native_,level_,log_);report(sample.error);return;}
-        if(sample.scene==4)for(const auto& [id,e]:sample.entities)if(e.kind==EntityKind::Player){
+        if(!idle_locals_done && sample.scene==4)for(const auto& [id,e]:sample.entities)if(e.kind==EntityKind::Player){
             std::string why;if(!refresh_native_bomb_ammo_hud(context,native_.local_address(id),why)){report(why);return;}
         }
-        capture_fixture(sample,context);
+        if(!fixture_dumped_ && env_requested("SSNE_COOP_CAPTURE_RAM"))capture_fixture(native_.capture(frame),context);
         uint32_t active_cutscene=0;
         const bool trace_camera_selection=frame%120==0 && env_requested("SSNE_COOP_PROFILE") && log_;
         for(const auto& item:sample.unmapped)if(item.vtable==0x80203078u) {
@@ -1036,13 +1448,14 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             const auto spawn_slot=env_present("SSNE_COOP_TEST_ENEMY_SLOT")?atoi(getenv("SSNE_COOP_TEST_ENEMY_SLOT")):-1;
             const auto people=server_->participants();
             const bool source_ready=spawn_slot<0 || (unsigned(spawn_slot)<capacity_ && people[spawn_slot].connected && people[spawn_slot].ready);
-            static bool requested=false,repeated=false;
+            static bool requested=false,repeated=false;static unsigned test_waves=0;
             static std::chrono::steady_clock::time_point next_wave{};
             const auto repeat_frame=env_present("SSNE_COOP_TEST_ENEMY_AGAIN_FRAME")?std::strtoul(getenv("SSNE_COOP_TEST_ENEMY_AGAIN_FRAME"),nullptr,10):0;
-            const auto repeat_ms=env_present("SSNE_COOP_TEST_ENEMY_REPEAT_MS")?std::clamp<unsigned long>(std::strtoul(getenv("SSNE_COOP_TEST_ENEMY_REPEAT_MS"),nullptr,10),10000,300000):0;
+            const auto repeat_ms=env_present("SSNE_COOP_TEST_ENEMY_REPEAT_MS")?std::clamp<unsigned long>(std::strtoul(getenv("SSNE_COOP_TEST_ENEMY_REPEAT_MS"),nullptr,10),1000,300000):0;
+            const auto max_waves=env_present("SSNE_COOP_TEST_ENEMY_MAX_WAVES")?std::clamp(atoi(getenv("SSNE_COOP_TEST_ENEMY_MAX_WAVES")),1,100):0;
             const auto now=std::chrono::steady_clock::now();
-            if(source_ready && (!requested || (repeat_frame>=900 && frame>=repeat_frame && !repeated) || (repeat_ms && now>=next_wave))){const bool repeat=requested;const auto type=unsigned(atoi(getenv("SSNE_COOP_TEST_ENEMY_TYPE")));const auto count=env_present("SSNE_COOP_TEST_ENEMY_COUNT")?atoi(getenv("SSNE_COOP_TEST_ENEMY_COUNT")):3;
-                const auto distance=env_present("SSNE_COOP_TEST_ENEMY_DISTANCE")?float(atof(getenv("SSNE_COOP_TEST_ENEMY_DISTANCE"))):15.f;if(spawn_slot>=0)ssne::mod_test_enemy_at_player(type,unsigned(spawn_slot),count,distance);else ssne::mod_spawn_type(true,type,count,distance);requested=true;repeated|=repeat;next_wave=now+std::chrono::milliseconds(repeat_ms);if(log_)log_("[coop-test-enemy-wave] type="+std::to_string(type)+" requested="+std::to_string(count)+" source_slot="+std::to_string(spawn_slot)+" repeat="+std::to_string(repeat)+" frame="+std::to_string(frame));}
+            if(source_ready && (!max_waves || test_waves<unsigned(max_waves)) && (!requested || (repeat_frame>=900 && frame>=repeat_frame && !repeated) || (repeat_ms && now>=next_wave))){const bool repeat=requested;const auto type=unsigned(atoi(getenv("SSNE_COOP_TEST_ENEMY_TYPE")));const auto count=env_present("SSNE_COOP_TEST_ENEMY_COUNT")?atoi(getenv("SSNE_COOP_TEST_ENEMY_COUNT")):3;
+                const auto base_distance=env_present("SSNE_COOP_TEST_ENEMY_DISTANCE")?float(atof(getenv("SSNE_COOP_TEST_ENEMY_DISTANCE"))):15.f;const auto spacing=env_present("SSNE_COOP_TEST_ENEMY_WAVE_SPACING")?std::clamp(float(atof(getenv("SSNE_COOP_TEST_ENEMY_WAVE_SPACING"))),0.f,5.f):0.f;const auto distance=base_distance+float(test_waves)*spacing;if(spawn_slot>=0)ssne::mod_test_enemy_at_player(type,unsigned(spawn_slot),count,distance);else ssne::mod_spawn_type(true,type,count,distance);requested=true;++test_waves;repeated|=repeat;next_wave=now+std::chrono::milliseconds(repeat_ms);if(log_)log_("[coop-test-enemy-wave] type="+std::to_string(type)+" requested="+std::to_string(count)+" source_slot="+std::to_string(spawn_slot)+" repeat="+std::to_string(repeat)+" frame="+std::to_string(frame));}
         }
         if(env_requested("SSNE_TEST_HIDDEN") && env_present("SSNE_COOP_TEST_WEAPON") && sample.scene==4 && frame>=uint64_t(env_present("SSNE_COOP_TEST_WEAPON_AT")?std::clamp(atoi(getenv("SSNE_COOP_TEST_WEAPON_AT")),900,36000):900)){
             static bool selected=false;
@@ -1062,7 +1475,7 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             static unsigned phase=0;const auto requested=frame>=1200?2u:1u;
             if(phase<requested) {
                 bool trigger=false,button=false;
-                for(const auto& [id,e]:sample.entities)if((e.kind==EntityKind::Mission && !trigger) || (e.kind==EntityKind::Switch && !button)) {
+                for(const auto& [id,e]:sample.entities)if((e.kind==EntityKind::Mission && e.definition==1 && !trigger) || (e.kind==EntityKind::Switch && !button)) {
                     std::string why;if(!set_native_script_enabled(context,native_.local_address(id),requested==2,why)){report(why);break;}
                     if(e.kind==EntityKind::Mission)trigger=true;else button=true;
                     if(log_)log_("[coop-test-script] index="+std::to_string(std::get<int64_t>(e.properties.at("script_index")))+" enabled="+std::to_string(requested==2));
@@ -1116,7 +1529,7 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         if(frame%(env_present("SSNE_COOP_TEST_OPEN_BRUSH")?10:60)==0 && log_)for(const auto& [id,e]:sample.entities)if(e.kind==EntityKind::Door && std::get<int64_t>(e.properties.at("brush_active")))log_("[coop-host-brush] resource="+std::to_string(std::get<int64_t>(e.properties.at("brush_resource")))+" segment="+std::to_string(std::get<int64_t>(e.properties.at("brush_segment")))+" progress="+std::to_string(std::get<float>(e.properties.at("brush_progress"))));
         if(frame%60==0 && log_) {
             unsigned count=0,disabled_triggers=0,disabled_switches=0;
-            for(const auto& [id,e]:sample.entities)if(e.kind==EntityKind::Mission || e.kind==EntityKind::Switch) {
+            for(const auto& [id,e]:sample.entities)if((e.kind==EntityKind::Mission && e.definition==1) || e.kind==EntityKind::Switch) {
                 ++count;if(e.kind==EntityKind::Mission)disabled_triggers+=!std::get<int64_t>(e.properties.at("trigger_enabled"));else disabled_switches+=!std::get<int64_t>(e.properties.at("switch_enabled"));
             }
             log_("[coop-host-scripts] count="+std::to_string(count)+" disabled_triggers="+std::to_string(disabled_triggers)+" disabled_switches="+std::to_string(disabled_switches));
@@ -1223,16 +1636,25 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             const auto count=std::count_if(sample.entities.begin(),sample.entities.end(),[](const auto& item){return item.second.kind==EntityKind::Player;});
             log_("[coop-native-level-observed] level="+*actual+" epoch="+std::to_string(epoch_)+" players="+std::to_string(count));
         }
-        WorldState state;state.epoch=epoch_;state.tick=frame;state.level=level_;state.mission=setup_;state.mission["Session.GameMode"]=int64_t(sample.mode);state.entities=sample.entities;
+        static const bool move_capture=[] {const auto* value=getenv("SSNE_HOST_CAPTURE_MOVE");return !value || strcmp(value,"0");}();
+        std::string content_error;if(!bind_custom_level_identity(level_,sample.mode,setup_,content_error,sample.scene==4)){report(content_error);return;}
+        WorldState state;state.epoch=epoch_;state.tick=frame;state.level=level_;state.mission=setup_;state.mission["Session.GameMode"]=int64_t(sample.mode);if(!move_capture)state.entities=sample.entities;
         state.mission["Session.Motion.Time"]=std::chrono::duration<float>(std::chrono::steady_clock::now()-motion_started_).count();
         const auto mods=ssne::mod_current_options();state.mission["Session.Mods.Flags"]=int64_t(unsigned(mods.god)|(unsigned(mods.ammo)<<1)|(unsigned(mods.weapons)<<2)|(unsigned(mods.no_enemies)<<3)|(unsigned(mods.rapid_fire)<<4));state.mission["Session.Mods.FireMultiplier"]=mods.fire_multiplier;
         state.mission["Session.EnemyMultiplier"]=int64_t(ssne::enemy_multiplier());
         const auto ammo_rules=ssne::ammo_rules();
         state.mission["Session.AmmoCapacity"]=int64_t(ammo_rules.capacity);
         state.mission["Session.AmmoPickupMultiplier"]=int64_t(ammo_rules.pickup_multiplier);
+        publish_survival(state.mission);
         publish_native_lobby_characters(state.mission);
         if(sample.scene==4 && sample.mode>=2 && sample.mode<=4)capture_versus(context,sample,state.mission);
         const bool loading=sample.scene!=4 || std::none_of(sample.entities.begin(),sample.entities.end(),[](const auto& item){return item.second.kind==EntityKind::Player;});
+        ssne::NativeBossHudState boss_hud;
+        if(!loading && sample.mode==1 && !ssne::native_results_presenting()) {
+            std::string why;
+            if(!ssne::capture_native_boss_hud(boss_hud,why)){report(why);return;}
+        }
+        publish_native_boss_hud_mission(state.mission,boss_hud);
         if(!loading){std::vector<int64_t> models;std::string why;if(!capture_native_model_states(models,why) || !capture_native_vehicles(state.mission,why)){report(why);return;}state.mission["Session.Geometry.Models"]=std::move(models);}
         if(loading){state.entities.clear();characters_={};host_ready_=false;}
         const bool presentation=sample.scene==5 || (sample.scene==3 && queued_);
@@ -1260,7 +1682,7 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             std::vector<int64_t> hit_ids,hit_shots,hit_sources,hit_targets,hit_generations,hit_codes,hit_pellets;std::vector<float> hit_values;
             const auto& hit_history=producer.hits;for(const auto& hit:hit_history){if(!source_publish)break;hit_ids.push_back(int64_t(hit.sequence));hit_shots.push_back(int64_t(hit.shot));hit_sources.push_back(int64_t(hit.source));hit_targets.push_back(int64_t(hit.target));hit_generations.push_back(int64_t(hit.generation));hit_codes.push_back(hit.slot*16+hit.weapon);hit_pellets.push_back(hit.pellet);hit_values.insert(hit_values.end(),{hit.before,hit.after,hit.amount});}
             state.mission["Session.ConfirmedHits.Ids"]=std::move(hit_ids);state.mission["Session.ConfirmedHits.Shots"]=std::move(hit_shots);state.mission["Session.ConfirmedHits.Sources"]=std::move(hit_sources);state.mission["Session.ConfirmedHits.Targets"]=std::move(hit_targets);state.mission["Session.ConfirmedHits.Generations"]=std::move(hit_generations);state.mission["Session.ConfirmedHits.Codes"]=std::move(hit_codes);state.mission["Session.ConfirmedHits.Values"]=std::move(hit_values);state.mission["Session.ConfirmedHits.Pellets"]=std::move(hit_pellets);
-            if(replica_hit_epoch_!=epoch_){replica_hit_epoch_=epoch_;replica_hit_sequence_=0;std::lock_guard lock(combat_mutex_);combat_feedback_={};}for(const auto& hit:hit_history)if(hit.sequence>replica_hit_sequence_){accept_confirmed_hit(hit,server_->status().player);replica_hit_sequence_=hit.sequence;}
+            if(!idle_locals_done){if(replica_hit_epoch_!=epoch_){replica_hit_epoch_=epoch_;replica_hit_sequence_=0;std::lock_guard lock(combat_mutex_);combat_feedback_={};}for(const auto& hit:hit_history)if(hit.sequence>replica_hit_sequence_){accept_confirmed_hit(hit,server_->status().player);replica_hit_sequence_=hit.sequence;}}
             std::vector<int64_t> ids,styles;std::vector<float> values;
             for(const auto& effect:producer.rockets){if(!source_publish)break;ids.push_back(int64_t(effect.sequence));styles.push_back(effect.style);values.insert(values.end(),effect.values.begin(),effect.values.end());}
             state.mission["Session.RocketEffects.Ids"]=std::move(ids);state.mission["Session.RocketEffects.Styles"]=std::move(styles);state.mission["Session.RocketEffects.Values"]=std::move(values);
@@ -1372,17 +1794,24 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             static bool dumped=false;const auto manager=mem_read32(0x802DAC90u);
             if(!dumped && manager<=ssne::guest_ram_end()-16 && !mem_read32(manager+0xC)){dump_native_profiles("native-profiles-saved.tsv");dumped=true;if(log_)log_("[coop-native-card-save-observed] writes="+std::to_string(ssne::exi_memcard_writes()));}
         }
-        {
+        // Later join attachment needs only id/owner. Retain full player fields
+        // only on a diagnostic log frame; never keep pointers across publication.
+        std::vector<EntityState> followup_players;followup_players.reserve(capacity_);
+        if(sample.scene==4)for(const auto& [id,e]:sample.entities)if(e.kind==EntityKind::Player){EntityState follow;follow.id=id;follow.kind=e.kind;follow.owner=e.owner;if(frame%120==0 && log_)follow=e;followup_players.push_back(std::move(follow));}
+        if(move_capture && !loading)state.entities=std::move(sample.entities);
+        if(!idle_locals_done){
             std::array<ParticipantHealth,max_players> health{};
             for(const auto& [id,entity]:state.entities)if(entity.kind==EntityKind::Player && entity.owner.slot<max_players){
-                if(auto value=entity.properties.find("health");value!=entity.properties.end())if(auto hp=std::get_if<float>(&value->second))health[entity.owner.slot]={entity.owner,*hp,!loading};
+                auto& row=health[entity.owner.slot];row.player=entity.owner;row.character=id;row.epoch=state.epoch;
+                if(auto value=entity.properties.find("health");value!=entity.properties.end())if(auto hp=std::get_if<float>(&value->second)){row.health=*hp;row.valid=!loading && std::isfinite(*hp);}
+                if(auto value=entity.properties.find("armor");value!=entity.properties.end())if(auto armor=std::get_if<float>(&value->second)){row.armor=*armor;row.armor_known=!loading && std::isfinite(*armor) && *armor>=0 && *armor<=1000000.f;}
+                if(auto value=entity.properties.find("position");value!=entity.properties.end())if(auto position=std::get_if<std::array<float,3>>(&value->second)){row.position=*position;row.position_known=!loading && std::all_of(position->begin(),position->end(),[](float v){return std::isfinite(v) && std::abs(v)<=1000000.f;});}
             }
             std::lock_guard lock(combat_mutex_);participant_health_=health;
         }
         try{native_batches=NativeEventJournal::producer_batches(state);}catch(const std::exception& e){report(e.what());return;}
-        // state owns independent copies of sample.entities/setup_. The loops
-        // above retain no mutable references; producer_batches also owns its
-        // values. No state reference is used after this ownership transfer.
+        // state exclusively owns its entity map; the follow-up players above
+        // own their few required fields. No mutable reference survives transfer.
         if(![&]{NativeStageTimer timing("publish",log_);return server_->publish_owned(std::move(state),error,loading,native_batches);}()){report(error);return;}
         if(!loading && source_publish){
             const bool acknowledged=ssne::acknowledge_native_event_publication(producer.epoch,accepted);
@@ -1465,7 +1894,8 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             why.clear();const bool party_ok=test_native_party_checkpoint(frame,rejected,why);
             if(log_)log_("[coop-native-checkpoint-party-test] frame="+std::to_string(frame)+" rejected="+std::to_string(rejected)+" passed="+std::to_string(party_ok)+" error="+why);
         }
-        if(sample.scene==4)for(const auto& [id,entity]:sample.entities)if(entity.kind==EntityKind::Player && entity.owner.slot<max_players && entity.owner.generation) {
+        if(sample.scene==4)for(const auto& entity:followup_players)if(entity.owner.slot<max_players && entity.owner.generation) {
+            const auto id=entity.id;
             if(!join_placements_[entity.owner.slot].player.generation && !ssne::native_party_spawn_waiting(native_.local_address(id)) && characters_[entity.owner.slot]!=id && server_->attach_character(entity.owner,id))characters_[entity.owner.slot]=id;
             if(characters_[entity.owner.slot]==id && entity.owner==server_->status().player && !host_ready_)host_ready_=server_->ready_host();
             if(frame%120==0 && log_) {
@@ -1507,8 +1937,12 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         if(frame%60==0 && log_)log_("[coop-host-frame] frame="+std::to_string(frame)+" scene="+std::to_string(sample.scene)+" mode="+std::to_string(sample.mode)+" revision="+std::to_string(server_->status().world_revision)+" phase="+std::string(presentation?(sample.scene==5?"credits":"menu"):loading?"loading":"gameplay")+" epoch="+std::to_string(epoch_)+" clients="+std::to_string(server_->status().joined)+" network="+server_->status().message+" unmapped="+std::to_string(sample.unmapped.size()));
         {std::string why;if(!ssne::tick_native_results_auto_continue(context,native_frontend_prepare_results_close,why)){report(why);return;}}
     } else {
+        const bool diagnostics=native_diagnostics_enabled();
+        // Only diagnostic C++ storage is released; native pose registration and
+        // render-lease ownership are maintained by their ordinary apply path.
+        if(!diagnostics && !enemy_pose_expected_.empty())enemy_pose_expected_.clear();
         if(frame%30==0 && log_ && replica_cutscene_id_ && ssne::native_cutscene_presenting())log_("[coop-client-cutscene-camera-after-render] id="+std::to_string(replica_cutscene_id_)+" host_tick="+std::to_string(replica_cutscene_tick_)+" differences="+std::to_string(ssne::native_cutscene_camera_differences(replica_cutscene_camera_)));
-        if(frame%60==0 && log_ && !enemy_pose_expected_.empty()) {
+        if(diagnostics && frame%60==0 && log_ && !enemy_pose_expected_.empty()) {
             unsigned models=0,changed=0;
             for(const auto& [id,pose]:enemy_pose_expected_) {
                 const auto binding=native_enemy_pose_binding(replica_.local_address(id));
@@ -1516,6 +1950,10 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
                 for(unsigned i=0;i<pose.size();++i)changed+=mem_read32(binding->matrices+i*4)!=f2u(pose[i]);
             }
             log_("[coop-enemy-pose-after-render] models="+std::to_string(models)+" changed_coefficients="+std::to_string(changed));
+        }
+        if(!queued_ || level_loading_ || !client_->status().connected ||
+           mem_read32(ssne::game_address(0x802DB0E0))!=4 || ssne::native_results_presenting()) {
+            std::string why;if(!ssne::clear_native_boss_hud(context,why)){report(why);return;}
         }
         auto results_state=client_->latest_world();
         if(queued_ && !level_loading_ && mem_read32(ssne::game_address(0x802DB0E0))==4){
@@ -1530,6 +1968,7 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         }
         if(frame%60==0 && log_ && results_state->mission.contains("Session.Results.Active"))log_("[coop-client-results] sequence="+std::to_string(std::get<int64_t>(results_state->mission.at("Session.Results.Sequence")))+" score="+std::to_string(std::get<int64_t>(results_state->mission.at("Session.Results.Score")))+" elapsed_seconds="+std::to_string(std::get<std::vector<float>>(results_state->mission.at("Session.Results.Values"))[1]*60.f));
         const auto received=client_->world_sample();auto state=received.world;if(!queued_ || !state->revision || state->entities.empty() || state->revision==last_revision_ || mem_read32(ssne::game_address(0x802DB0E0))!=4)return;
+        if(!custom_content_ok(context,*state))return;
         if(level_loading_) {
             const auto active=native_active_level();const auto local=native_.capture(frame);
             // A same-level rewind leaves the old level name and all its players
@@ -1741,10 +2180,18 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         }
         const auto model_field=state->mission.find("Session.Geometry.Models");const auto* models=model_field==state->mission.end()?nullptr:std::get_if<std::vector<int64_t>>(&model_field->second);
         std::string model_error;if(!models || !validate_native_model_states(*models,model_error)){report(model_error.empty()?"Missing authoritative level model states":model_error);return;}
+        // The network may deliver a newer roster between tick and frame. Bind
+        // ownership from this exact immutable sample before reconciliation.
+        for(unsigned slot=0;slot<max_players;++slot)native_.set_player_owner(slot,state->players[slot].connected?state->players[slot].id:PlayerId{});
         auto result=[&]{NativeStageTimer timing("replica_apply",log_);return replica_.apply_with_vehicles(context,state->epoch,state->entities,state->mission);}();
         if(!result.applied){report(result.error);return;}
         if(mem_read32(context.r[13]-0x69d4)>=2 && mem_read32(context.r[13]-0x69d4)<=4){std::string why;if(!apply_versus(context,native_.capture_bindings(),state->mission,why)){report(why);return;}}
         if(!apply_native_model_states(context,*models,model_error)){report(model_error);return;}
+        {std::string why;
+            const bool ok=ssne::native_results_presenting()?ssne::clear_native_boss_hud(context,why):
+                apply_native_boss_hud_mission(context,state->epoch,state->mission,why);
+            if(!ok){report(why);return;}
+        }
         if(replica_feedback_epoch_!=state->epoch){replica_feedback_epoch_=state->epoch;replica_feedback_sequence_=journaled?event_tails[5]:feedback.empty()?0:feedback.back().sequence;}
         else for(const auto& event:feedback)if(event.sequence>replica_feedback_sequence_){std::string why;if(!ssne::play_native_feedback(context,event,why)){report(why);return;}replica_feedback_sequence_=event.sequence;}
         if(replica_trail_epoch_!=state->epoch){
@@ -1777,22 +2224,35 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         for(const auto& [id,entity]:state->entities)if(entity.kind==EntityKind::Player) {
             std::string why;if(!refresh_native_player_hud(context,replica_.local_address(id),why)){report(why);return;}
         }
-        if((frame%60==0 || (env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES"))) && log_) {
+        if(diagnostics && (frame%60==0 || (env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES"))) && log_) {
             const auto reconciled=native_.capture(frame);
             std::map<uint32_t,const EntityState*> by_address;
             for(const auto& [id,e]:reconciled.entities)by_address[native_.local_address(id)]=&e;
             if(env_requested("SSNE_TEST_HIDDEN") && env_present("SSNE_COOP_CAMPAIGN_VERIFY")){
-                unsigned fields=0,differences=0,enemies=0;
-                for(const auto& [id,e]:state->entities)if(e.kind==EntityKind::Enemy || e.kind==EntityKind::Mission || e.kind==EntityKind::Switch || e.kind==EntityKind::Destructible || e.kind==EntityKind::Door){
-                    enemies+=e.kind==EntityKind::Enemy;
+                unsigned fields=0,differences=0,enemies=0,pickups=0,hidden_cached_glows=0;
+                for(const auto& [id,e]:state->entities)if(e.kind==EntityKind::Enemy || e.kind==EntityKind::Pickup || e.kind==EntityKind::Mission || e.kind==EntityKind::Switch || e.kind==EntityKind::Destructible || e.kind==EntityKind::Door){
+                    enemies+=e.kind==EntityKind::Enemy;pickups+=e.kind==EntityKind::Pickup;
                     const auto found=by_address.find(replica_.local_address(id));
                     for(const auto& [key,value]:e.properties){
                         if(key=="spawn_position")continue;++fields;
-                        const bool mismatch=found==by_address.end() || !found->second->properties.contains(key) || found->second->properties.at(key)!=value;
+                        bool mismatch=found==by_address.end() || !found->second->properties.contains(key) || found->second->properties.at(key)!=value;
+                        // A collected pickup may retain an invisible local glow
+                        // allocation for later reuse. The presentation adapter
+                        // explicitly permits that cache; verify actual native
+                        // visibility and view masks before treating its unused
+                        // matrix as equivalent to the host's absent glow.
+                        if(mismatch && e.kind==EntityKind::Pickup && key=="pickup_glow_pose" && found!=by_address.end() && found->second->kind==e.kind && found->second->definition==e.definition && found->second->properties.contains(key)){
+                            const auto* desired=std::get_if<std::vector<float>>(&value);
+                            const auto* actual=std::get_if<std::vector<float>>(&found->second->properties.at(key));
+                            const auto flags=e.properties.find("pickup_glow");
+                            const auto* state=flags==e.properties.end()?nullptr:std::get_if<std::vector<int64_t>>(&flags->second);
+                            const auto glow=native_pickup_glow_proxy(replica_.local_address(id));
+                            if(desired && desired->empty() && actual && actual->size()==12 && state && *state==std::vector<int64_t>{0,0} && glow && *glow && mem_read8(*glow+0x2D)==0 && mem_read32(*glow+0x30)==0){mismatch=false;++hidden_cached_glows;}
+                        }
                         if(mismatch){++differences;static std::set<std::pair<unsigned,std::string>> reported;if(reported.emplace(e.definition,key).second)log_("[campaign-field-difference] definition="+std::to_string(e.definition)+" key="+key);}
                     }
                 }
-                log_("[campaign-verify] level="+state->level+" epoch="+std::to_string(state->epoch)+" revision="+std::to_string(state->revision)+" enemies="+std::to_string(enemies)+" fields="+std::to_string(fields)+" differences="+std::to_string(differences));
+                log_("[campaign-verify] level="+state->level+" epoch="+std::to_string(state->epoch)+" revision="+std::to_string(state->revision)+" enemies="+std::to_string(enemies)+" pickups="+std::to_string(pickups)+" hidden_cached_glows="+std::to_string(hidden_cached_glows)+" fields="+std::to_string(fields)+" differences="+std::to_string(differences));
             }
             unsigned render_objects=0,render_differences=0,marker_objects=0,marker_differences=0;
             for(const auto& [id,e]:state->entities){
@@ -1850,7 +2310,7 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             log_("[coop-client-armor-hud] positive="+std::to_string(armor_hud_positive)+" differences="+std::to_string(armor_hud_differences));
 
             unsigned script_count=0,script_differences=0,disabled_triggers=0,disabled_switches=0;
-            for(const auto& [id,e]:state->entities)if(e.kind==EntityKind::Mission || e.kind==EntityKind::Switch) {
+            for(const auto& [id,e]:state->entities)if((e.kind==EntityKind::Mission && e.definition==1) || e.kind==EntityKind::Switch) {
                 ++script_count;
                 if(e.kind==EntityKind::Mission)disabled_triggers+=!std::get<int64_t>(e.properties.at("trigger_enabled"));else disabled_switches+=!std::get<int64_t>(e.properties.at("switch_enabled"));
                 const auto address=replica_.local_address(id);const EntityState* local=nullptr;
@@ -1872,8 +2332,10 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             }
             log_("[coop-client-brush] count="+std::to_string(brushes)+" active="+std::to_string(active)+" differences="+std::to_string(differences));
         }
-        enemy_pose_expected_.clear();
-        for(const auto& [id,e]:state->entities)if(auto pose=e.properties.find("enemy_bone_matrices");pose!=e.properties.end())enemy_pose_expected_[id]=std::get<std::vector<float>>(pose->second);
+        if(diagnostics){
+            enemy_pose_expected_.clear();
+            for(const auto& [id,e]:state->entities)if(auto pose=e.properties.find("enemy_bone_matrices");pose!=e.properties.end())enemy_pose_expected_[id]=std::get<std::vector<float>>(pose->second);
+        }
         if(!last_revision_ && log_)log_("[coop-client-first-apply] revision="+std::to_string(state->revision)+" objects="+std::to_string(result.objects));
         last_revision_=state->revision;
         presentation_applied_=state;
@@ -1926,4 +2388,6 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         if((frame%30==0 || (env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES"))) && log_){auto skipped=ssne::replica_simulation_stats();log_("[coop-client-frame] frame="+std::to_string(frame)+" host_frame="+std::to_string(state->tick)+" revision="+std::to_string(last_revision_)+" objects="+std::to_string(result.objects)+" mode="+std::to_string(mem_read32(ssne::game_address(0x802DB1BC)))+" replica="+std::to_string(ssne::replica_simulation())+" skipped_game="+std::to_string(skipped.game_updates)+" skipped_world="+std::to_string(skipped.world_updates));}
     }
 }
+#include "native_features.inc"
+
 }

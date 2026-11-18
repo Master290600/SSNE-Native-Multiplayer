@@ -1,4 +1,8 @@
 #include "ssne/native_party.h"
+#include "ssne/connected_camera_updates.h"
+#include "ssne/native_results.h"
+#include "ssne/native_cutscene.h"
+#include <cstring>
 #include "ssne/weapon_groups.h"
 #include "ssne/runtime.h"
 #include "ssne/recomp_hooks.h"
@@ -21,6 +25,8 @@ bool occupancy_enabled=false;
 bool leaving_network=false;
 uint8_t occupied_slots=255;
 uint8_t connected_slots=255;
+const void* camera_update_gate_owner=nullptr;
+std::function<bool()> camera_update_gate;
 struct ReservedBodyMask {uint32_t proxy,mask;};
 std::map<uint32_t,ReservedBodyMask> reserved_body_masks;
 std::array<uint32_t,8> profiles{~0u,~0u,~0u,~0u,~0u,~0u,~0u,~0u};
@@ -34,7 +40,7 @@ std::map<uint32_t,uint32_t> pickup_flags;
 std::map<uint32_t,unsigned> view_owners;
 std::array<PadState,8> pads;
 std::array<uint32_t,8> known_player_actors{};
-struct PendingSpawn {unsigned request=0,flags=0,attempts=0;bool local=true,force_safe=false;std::chrono::steady_clock::time_point next{};};
+struct PendingSpawn {unsigned request=0,flags=0,attempts=0;bool local=true,force_safe=false,full_respawn=false;std::chrono::steady_clock::time_point next{};};
 std::map<uint32_t,PendingSpawn> pending_spawns;
 std::map<uint32_t,std::array<float,3>> prepared_spawns;
 std::map<uint32_t,uint64_t> completed_spawns;
@@ -288,6 +294,10 @@ bool native_party_prepare_spawn(PPCContext& context,uint32_t actor,unsigned requ
     return false;
 }
 void native_party_spawn_completed(uint32_t actor) {
+    // Original PlayerStart may destroy/recreate the body at the same proxy
+    // address. Its original self-hidden mask supersedes any inactive/death
+    // mask saved before the completed spawn, even when that address is reused.
+    reserved_body_masks.erase(actor);
     if(native_player_collision_radius(actor)){
         ensure_pending_observer();completed_spawns[actor]=++next_spawn_revision;
         const auto slot=mem_read32(actor+0x17C);if(slot<roster)known_player_actors[slot]=actor;
@@ -309,6 +319,53 @@ bool native_party_request_join_spawn(PPCContext& context,uint32_t actor,std::str
     if(native_party_spawn_revision(actor)>before)return true;
     error=native_party_spawn_waiting(actor)?"Native join is waiting for a free spawn point":"Native join spawn did not complete";return false;
 }
+namespace {
+bool full_respawn_code(){
+    if(mem_read32(0x80000000u)!=0x47334250u)return false;
+    uint64_t hash=14695981039346656037ull;
+    for(uint32_t i=0;i<0x4C4u;++i){hash^=mem_read8(0x800B2950u+i);hash*=1099511628211ull;}
+    return hash==0x408BC930E2A95916ull;
+}
+}
+bool native_party_request_respawn(PPCContext& context,uint32_t actor,std::string& error){
+    error.clear();const auto* reset=ssne_find_func(0x800B2950u);
+    const auto slot=actor_slot(actor);
+    if(replica_simulation() || !native_player_collision_radius(actor) || slot<0 ||
+       mem_read32(native_party_registry()+unsigned(slot)*4)!=actor ||
+       (occupancy_enabled && !(connected_slots&(1u<<unsigned(slot)))) ||
+       mem_read32(0x802DB8CCu)!=1 || mem_read32(0x802DB7E8u)!=4 || !reset || !full_respawn_code() ||
+       context.r[2]!=0x802F22A0u || context.r[13]!=0x802E22A0u ||
+       context.r[1]<0x80004000u || context.r[1]>guest_ram_end()-4){
+        error="Native full respawn context, owner or PAL revision unavailable";return false;
+    }
+    const auto camera=mem_read32(actor+0x368);
+    if(!valid(camera,0xD8) || mem_read32(camera)!=0x80210880u || mem_read32(camera+4)!=actor){
+        error="Native full respawn camera binding unavailable";return false;
+    }
+    const auto before=native_party_spawn_revision(actor);
+    std::vector<uint8_t> stack(0x4000);std::memcpy(stack.data(),host_ptr(context.r[1]-0x4000),stack.size());
+    const auto previous_force=force_safe_spawn;force_safe_spawn=true;
+    auto restore=[&]{force_safe_spawn=previous_force;std::memcpy(host_ptr(context.r[1]-0x4000),stack.data(),stack.size());};
+    try{
+        // Validate placement before resetting health, model/camera or inventory.
+        // A blocked attempt keeps its original dead/inactive state until the
+        // pending retry can run this full lifecycle at a safe native point.
+        if(!native_party_prepare_spawn(context,actor,1)){
+            if(auto pending=pending_spawns.find(actor);pending!=pending_spawns.end())pending->second.full_respawn=true;
+            restore();error="Native full respawn is waiting for a free spawn point";return false;
+        }
+        PPCContext call=context;call.msr&=~0x8000u;call.r[1]-=0x100;mem_write32(call.r[1],context.r[1]);call.r[3]=actor;call.r[4]=0;
+        ssne_call(call,reset->address);
+    }catch(...){prepared_spawns.erase(actor);restore();throw;}
+    restore();
+    const auto health=u2f(mem_read32(actor+0xCC));
+    if(native_party_spawn_revision(actor)>before && !native_party_spawn_waiting(actor) &&
+       std::isfinite(health) && health>0.f && !mem_read32(actor+0x328) && !mem_read32(actor+0x370) &&
+       mem_read32(actor+0x368)==camera && !mem_read32(camera+0xAC)){
+        log_message("[coop-native-full-respawn-completed] slot="+std::to_string(slot)+" actor="+std::to_string(actor)+" revision="+std::to_string(native_party_spawn_revision(actor)));return true;
+    }
+    error="Native full respawn did not restore a living player and first-person camera";return false;
+}
 void native_party_cancel_join_spawn(uint32_t actor){
     const auto found=pending_spawns.find(actor);if(found!=pending_spawns.end() && found->second.force_safe){pending_spawns.erase(found);prepared_spawns.erase(actor);log_message("[coop-join-spawn-cancelled] actor="+std::to_string(actor));}
 }
@@ -319,6 +376,11 @@ bool native_party_retry_spawn(PPCContext& context,uint32_t actor) {
     // Preserve constructor/unknown-registry behavior and pending state for later joins.
     static const bool defer=[] {const auto value=std::getenv("SSNE_DEFER_DISCONNECTED_SPAWNS");return !value || std::strcmp(value,"0");}();
     if(defer && occupancy_enabled){const auto slot=actor_slot(actor);if(slot>=0 && mem_read32(native_party_registry()+unsigned(slot)*4)==actor && !(connected_slots&(1u<<slot)))return true;}
+    if(pending->second.full_respawn){
+        std::string error;
+        if(!native_party_request_respawn(context,actor,error) && !native_party_spawn_waiting(actor))log_message("[coop-native-full-respawn-error] "+error);
+        return native_party_spawn_waiting(actor);
+    }
     const auto request=pending->second.request;
     std::vector<uint8_t> stack(0x3000);for(unsigned i=0;i<stack.size();++i)stack[i]=mem_read8(context.r[1]-0x3000+i);
     PPCContext call=context;call.msr&=~0x8000u;call.r[1]-=0x100;mem_write32(call.r[1],context.r[1]);call.r[3]=actor;call.r[4]=request;
@@ -344,7 +406,7 @@ bool native_party_replica_spawn_state(PPCContext& context,uint32_t actor,bool wa
     for(unsigned i=0;i<stack.size();++i)mem_write8(context.r[1]-0x3000+i,stack[i]);return !native_party_spawn_waiting(actor);
 }
 void native_party_configure(unsigned count){roster=std::clamp(count,1u,8u);configured=true;leaving_network=false;}
-void native_party_leave_network(){configured=false;occupancy_enabled=false;profiles_prepared=false;leaving_network=true;pads={};owner=-1;if(!arena){roster=2;leaving_network=false;}}
+void native_party_leave_network(){camera_update_gate={};camera_update_gate_owner=nullptr;configured=false;occupancy_enabled=false;profiles_prepared=false;leaving_network=true;pads={};owner=-1;if(!arena){roster=2;leaving_network=false;}}
 uint32_t native_party_profile(unsigned slot){return slot<8?profiles[slot]:~0u;}
 bool native_party_joined(unsigned slot){return !configured || slot<roster;}
 void native_party_set_occupancy(uint8_t mask,uint8_t connected_mask){
@@ -420,8 +482,109 @@ void occupied_bomb(PPCContext& ctx){if(ctx.r[4] && !native_party_actor_occupied(
 void occupied_active(PPCContext& ctx){if(!native_party_actor_occupied(ctx.r[3])){ctx.r[3]=0;return;}ssne_call_original(ctx,0x800B7618,occupied_active_original);}
 void occupied_health(PPCContext& ctx){if(!native_party_actor_occupied(ctx.r[3])){ctx.ps0[1]=ctx.ps1[1]=0;return;}ssne_call_original(ctx,0x8009DBCC,occupied_health_original);}
 void occupied_render(PPCContext& ctx){if(!native_party_actor_occupied(ctx.r[3]))return;ssne_call_original(ctx,0x800B2568,occupied_render_original);}
+
+constexpr uint32_t secondary_player_query=0x800B6630u;
+constexpr std::array<uint32_t,12> secondary_player_signature{
+    0x80030340u,0x2C000000u,0x41820018u,0x2C000003u,
+    0x41820010u,0x80030370u,0x2C000000u,0x4182000Cu,
+    0x38600000u,0x4E800020u,0x38600001u,0x4E800020u};
+PPCFunc secondary_player_previous=nullptr;
+bool secondary_player_filter_enabled(){
+    static const bool enabled=[] {const auto* value=std::getenv("SSNE_SECONDARY_PLAYER_FILTER");return !value || std::strcmp(value,"0");}();
+    return enabled;
+}
+bool secondary_player_client_filter_enabled(){
+    static const bool enabled=[] {const auto* value=std::getenv("SSNE_SECONDARY_PLAYER_CLIENT_FILTER");return !value || std::strcmp(value,"0");}();
+    return enabled;
+}
+// Only the scene manager's extra weapon/aim update is filtered. In particular,
+// leave the original predicate intact for scripts, transitions and replicas.
+bool secondary_player_reserved(uint32_t actor){
+    if(!configured || !occupancy_enabled || replica_simulation() || netplay_local_player()!=0 ||
+       mem_read32(0x80000000u)!=0x47334250u ||
+       mem_read32(game_address(0x802DB0E0u))!=4 || mem_read32(0x802DB8CCu)!=1)return false;
+    const auto slot=actor_slot(actor);const auto reg=native_party_registry();
+    if(slot<0 || !valid(reg,roster*4u) || mem_read32(reg+unsigned(slot)*4u)!=actor)return false;
+    // Other native actor states retain their exact predicate behavior.
+    if(mem_read32(actor+0x340u)!=1 || mem_read32(actor+0x370u)!=0)return false;
+    return !native_party_actor_occupied(actor);
+}
+// Replica reservations receive no authoritative weapon state. Filter only a
+// fully ready local world, keeping every transition and uncertain actor native.
+bool secondary_player_client_reserved(uint32_t actor){
+    if(!secondary_player_client_filter_enabled() || !configured || !occupancy_enabled || !replica_simulation())return false;
+    const auto local=netplay_local_player();
+    if(local<=0 || unsigned(local)>=roster || !netplay_world_ready() ||
+       mem_read32(0x80000000u)!=0x47334250u ||
+       mem_read32(game_address(0x802DB0E0u))!=4 || mem_read32(game_address(0x802DB0E4u))!=0 ||
+       mem_read32(game_address(0x802DB1BCu))!=1 || !prepared_spawns.empty() || pending_spawns.size()>roster ||
+       native_results_presenting() || native_cutscene_presenting() || native_movie_presenting() ||
+       local_information_open() || local_pause_menu_open())return false;
+    const auto players=(1u<<roster)-1u;
+    if((occupied_slots&~players) || (connected_slots&~players) || occupied_slots!=connected_slots ||
+       !(connected_slots&1u) || !(connected_slots&(1u<<unsigned(local))))return false;
+    const auto reg=native_party_registry();
+    if(!valid(reg,roster*4u))return false;
+    const auto self=mem_read32(reg+unsigned(local)*4u);
+    if(actor_slot(self)!=local || mem_read32(self+0x340u)!=1 || mem_read32(self+0x370u)!=0)return false;
+    // Disconnected reservations can remain pending indefinitely. Keep their
+    // pending state; only a fresh canonical unconnected reservation is safe.
+    for(const auto& entry:pending_spawns){
+        const auto pending=entry.first;const auto slot=actor_slot(pending);
+        if(slot<0 || mem_read32(reg+unsigned(slot)*4u)!=pending ||
+           ((connected_slots|occupied_slots)&(1u<<unsigned(slot))))return false;
+    }
+    const auto slot=actor_slot(actor);
+    if(slot<0 || mem_read32(reg+unsigned(slot)*4u)!=actor ||
+       mem_read32(actor+0x340u)!=1 || mem_read32(actor+0x370u)!=0)return false;
+    const auto bit=1u<<unsigned(slot);
+    return !(occupied_slots&bit) && !(connected_slots&bit);
+}
+void secondary_player_trace(const PPCContext& ctx,uint32_t actor,bool skipped){
+    if(ctx.lr!=0x801511B8u || !configured || !occupancy_enabled ||
+       mem_read32(game_address(0x802DB0E0u))!=4 || ctx.r[13]!=0x802E22A0u)return;
+    // Cold replica Info/pause transitions must not exhaust the bounded trace
+    // before the original local view is ready. This never changes the filter.
+    if(replica_simulation() && (!netplay_world_ready() || local_information_open() || local_pause_menu_open() ||
+       native_cutscene_presenting() || native_movie_presenting() || native_results_presenting()))return;
+    struct Frame {uint32_t id=0;unsigned forwarded=0,skipped=0,forwarded_mask=0,skipped_mask=0,lines=0;bool started=false;};
+    static Frame frame;
+    if(frame.lines>=32)return;
+    const auto id=mem_read32(ctx.r[13]-0x6D80u);
+    if(frame.started && id!=frame.id){
+        char line[240];std::snprintf(line,sizeof(line),"[secondary-player-filter] frame=%u forwarded=%u skipped=%u forwarded_mask=%02X skipped_mask=%02X occupied=%02X connected=%02X enabled=%u",frame.id,frame.forwarded,frame.skipped,frame.forwarded_mask,frame.skipped_mask,unsigned(occupied_slots),unsigned(connected_slots),unsigned(secondary_player_filter_enabled()));
+        log_message(line);const auto lines=frame.lines+1;frame={};frame.lines=lines;
+        if(frame.lines>=32)return;
+    }
+    frame.started=true;frame.id=id;
+    const auto slot=actor_slot(actor);const auto reg=native_party_registry();
+    const auto mask=slot>=0 && valid(reg,roster*4u) && mem_read32(reg+unsigned(slot)*4u)==actor ? 1u<<slot:0u;
+    if(skipped){++frame.skipped;frame.skipped_mask|=mask;}
+    else{++frame.forwarded;frame.forwarded_mask|=mask;}
+}
+void secondary_player_predicate(PPCContext& ctx){
+    const auto actor=ctx.r[3];
+    const bool skip=ctx.lr==0x801511B8u && secondary_player_filter_enabled() &&
+        (secondary_player_reserved(actor) || secondary_player_client_reserved(actor));
+    static const bool trace=[] {const auto* hidden=std::getenv("SSNE_TEST_HIDDEN");const auto* value=std::getenv("SSNE_TEST_SECONDARY_PLAYER_TRACE");return hidden && std::strcmp(hidden,"0") && value && !std::strcmp(value,"1");}();
+    if(trace)secondary_player_trace(ctx,actor,skip);
+    if(skip){ctx.r[3]=0;return;}
+    ssne_call_original(ctx,secondary_player_query,secondary_player_previous);
+}
+void install_secondary_player_filter(){
+    if(secondary_player_previous)return;
+    const auto* query=ssne_find_func(secondary_player_query);
+    if(!query || !query->func || mem_read32(0x80000000u)!=0x47334250u)return;
+    for(unsigned i=0;i<secondary_player_signature.size();++i)
+        if(mem_read32(secondary_player_query+i*4u)!=secondary_player_signature[i])return;
+    auto* hook=ssne_hook_slot(secondary_player_query);
+    if(!hook || *hook==secondary_player_predicate)return;
+    secondary_player_previous=*hook?*hook:query->func;
+    ssne_install_hook(secondary_player_query,secondary_player_predicate);
+}
 }
 void native_party_install_occupancy_hooks(){
+    install_secondary_player_filter();
     if(occupied_spheres_original)return;
     const auto* spheres=ssne_find_func(0x8009C410);const auto* health=ssne_find_func(0x8009DBCC);const auto* render=ssne_find_func(0x800B2568);
     if(!spheres || !health || !render || mem_read32(spheres->address)!=0x38600001u || mem_read32(health->address)!=0xC02300CCu || mem_read32(render->address)!=0x9421FFF8u)fatal("Native player participation hooks unavailable for this revision.");
@@ -517,6 +680,11 @@ void native_party_controller_channel(PPCContext& ctx) {
     if(ctx.r[3]!=original_bank)fatal("Unexpected native party rumble-bank receiver.");
     ctx.r[3]=second_bank;ctx.r[4]-=4;
 }
+bool native_party_render_layout_safe(uint32_t engine){
+    return configured && occupancy_enabled && native_party_extended() && arena && valid(arena,0x10000u) &&
+        views==arena+0x2200u && engine==engine_base && valid(engine,0x708u) &&
+        mem_read32(engine)==0x8021C600u && valid(views,32u*76u);
+}
 uint32_t native_party_view_engine(uint32_t engine) {
     if(native_party_extended() && views && engine!=engine_base && getenv("SSNE_NATIVE_PARTY_TRACE")) {
         static std::set<uint32_t> seen;
@@ -527,12 +695,75 @@ uint32_t native_party_view_engine(uint32_t engine) {
 int native_party_owner(){return owner;}
 void native_party_owner_set(int value){owner=value;}
 void native_party_bind_view(uint32_t view,unsigned slot){if(native_party_extended() && slot<roster)view_owners[view]=slot;}
+void native_party_set_camera_update_gate(const void* owner,std::function<bool()> gate){
+    camera_update_gate_owner=owner;camera_update_gate=owner?std::move(gate):std::function<bool()>{};
+}
+void native_party_clear_camera_update_gate(const void* owner){
+    if(owner==camera_update_gate_owner){camera_update_gate={};camera_update_gate_owner=nullptr;}
+}
 uint32_t native_party_frame_view_mask(uint32_t mask) {
-    if(!native_party_extended())return mask;
+    int gate_status=-1,inspected_slot=-1;
+    auto finish=[&](uint32_t selected,const char* reason){
+        static const bool trace=[] {const auto* hidden=std::getenv("SSNE_TEST_HIDDEN");const auto* value=std::getenv("SSNE_TEST_CONNECTED_CAMERA_TRACE");return hidden && std::strcmp(hidden,"0") && value && std::strcmp(value,"0");}();
+        if(trace && mask==0xFu){
+            struct Last {uint32_t selected=0;uint8_t connected=0,occupied=0;int gate=-1,slot=-1;const char* reason=nullptr;unsigned count=0;};
+            static Last last;
+            if(last.count<32 && (last.reason!=reason || last.selected!=selected || last.connected!=connected_slots || last.occupied!=occupied_slots || last.gate!=gate_status || last.slot!=inspected_slot)){
+                char line[256];std::snprintf(line,sizeof(line),"[connected-camera-updates] selected=%08X connected=%02X occupied=%02X gate=%d slot=%d reason=%s pending=%zu prepared=%zu",selected,unsigned(connected_slots),unsigned(occupied_slots),gate_status,inspected_slot,reason,pending_spawns.size(),prepared_spawns.size());log_message(line);
+                last={selected,connected_slots,occupied_slots,gate_status,inspected_slot,reason,last.count+1};
+            }
+        }
+        return selected;
+    };
+    if(!native_party_extended())return finish(mask,"not_extended");
     const auto players=(1u<<roster)-1;
     auto group=[&](unsigned shift){const auto bits=(mask>>shift)&15u;return bits==15u?players:bits;};
-    return group(0)|(group(6)<<8)|(group(10)<<16)|((mask&0x30u)<<20)|((mask&0xC000u)<<12);
+    const uint32_t legacy=group(0)|(group(6)<<8)|(group(10)<<16)|((mask&0x30u)<<20)|((mask&0xC000u)<<12);
+    static const bool enabled=[] {const auto* value=std::getenv("SSNE_CONNECTED_CAMERA_UPDATES");return !value || std::strcmp(value,"0");}();
+    if(!enabled)return finish(legacy,"reference_disabled");
+    if(mask!=0xFu)return legacy;
+    if(!configured || !occupancy_enabled)return finish(legacy,"party_or_occupancy_unknown");
+    if(replica_simulation())return finish(legacy,"replica");
+    if(!(occupied_slots&connected_slots&1u))return finish(legacy,"host_not_connected_ready");
+    if((connected_slots&players)==players)return finish(legacy,"all_connected");
+    if(!camera_update_gate)return finish(legacy,"session_gate_missing");
+    if(!pending_spawns.empty())return finish(legacy,"native_spawn_pending");
+    if(!prepared_spawns.empty())return finish(legacy,"native_spawn_prepared");
+    try {gate_status=camera_update_gate()?1:0;if(!gate_status)return finish(legacy,"session_transition");}
+    catch(...){gate_status=2;return finish(legacy,"session_gate_exception");}
+    // This helper is called only by the original guest Frame camera loop.
+    // Preserve every transition, unknown class and shared/aliased camera path.
+    if(mem_read32(0x80000000u)!=0x47334250u || mem_read16(0x80000004u)!=0x3947u)return finish(legacy,"not_supported_pal");
+    if(!netplay_world_ready() || netplay_local_player()!=0)return finish(legacy,"runtime_not_host_ready");
+    if(mem_read32(game_address(0x802DB0E0u))!=4 || mem_read32(game_address(0x802DB0E4u))!=0 ||
+       mem_read32(game_address(0x802DB1BCu))!=1)return finish(legacy,"native_scene_or_mode_transition");
+    if(native_results_presenting() || native_cutscene_presenting() || native_movie_presenting() ||
+       local_information_open() || local_pause_menu_open())return finish(legacy,"native_presentation");
+    if(!valid(registry,roster*4) || !valid(views,32*76) || !valid(engine_base,0x768) ||
+       mem_read32(0x802ABAA0u)!=engine_base || mem_read32(engine_base)!=0x8021C600u)return finish(legacy,"party_storage_or_engine_identity");
+    if(mem_read32(0x80210880u+0x14)!=0x800A5EDCu || mem_read16(0x80210880u+0x10)!=0 ||
+       mem_read32(0x800A5EDCu)!=0x9421FE30u)return finish(legacy,"camera_callback_identity");
+    std::array<camera_updates::Binding,8> bindings{};
+    for(unsigned slot=0;slot<roster;++slot){
+        inspected_slot=int(slot);
+        auto& b=bindings[slot];b.actor=mem_read32(registry+slot*4);b.camera=mem_read32(views+slot*76);
+        if(!valid(b.actor,0x790) || !valid(b.camera,0xE0) || mem_read32(views+slot*76+0x30)!=1)return finish(legacy,"actor_camera_range_or_inactive_view");
+        b.actor_class=mem_read32(b.actor+0x48);b.slot=mem_read32(b.actor+0x17C);b.actor_camera=mem_read32(b.actor+0x368);
+        b.camera_class=mem_read32(b.camera);b.camera_owner=mem_read32(b.camera+4);
+        if(!(connected_slots&(1u<<slot))){
+            b.mode=mem_read32(b.camera+0xAC);b.shake=mem_read32(b.camera+0x9C);
+            b.movement=mem_read32(b.actor+0x340);b.vehicle=mem_read32(b.actor+0x6C4);
+            b.frozen=mem_read32(b.actor+0x370);b.dead=mem_read32(b.actor+0x328);b.health=u2f(mem_read32(b.actor+0xCC));
+            b.fov=mem_read32(b.actor+0x344);if(!valid(b.fov,0x28))return finish(legacy,"reserved_fov_range");
+            b.fov_class=mem_read32(b.fov);if(b.fov_class!=0x80210E80u)return finish(legacy,"reserved_fov_class");
+            b.fov_adjust=int16_t(mem_read16(b.fov_class+0x48));b.fov_method=mem_read32(b.fov_class+0x4C);
+        }
+    }
+    inspected_slot=-1;
+    const auto selected=camera_updates::select(mask,legacy,roster,true,occupied_slots,connected_slots,guest_ram_end(),bindings);
+    return finish(selected,selected==legacy?"binding_or_alias_fallback":"connected_world_cameras");
 }
+
 void native_party_initialize_player_masks(PPCContext& context,uint32_t engine) {
     if(!native_party_extended())return;
     const auto* setter=ssne_find_func(0x8011A2BC);

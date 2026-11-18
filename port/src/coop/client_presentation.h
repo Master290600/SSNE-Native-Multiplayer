@@ -2,8 +2,11 @@
 #include "world_state.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
+#include <stdexcept>
 
 namespace port::coop {
 // Presentation only. None of these values are sent back as gameplay state.
@@ -93,12 +96,39 @@ inline EntityState presentation_fields(const EntityState& e){
     for(const auto& item:e.properties)if(presentation_field(item.first))out.properties.emplace_hint(out.properties.end(),item);
     return out;
 }
+// Reproducible developer A/B only; no saved preference or network state.
+inline bool presentation_vector_reuse_enabled(){
+    static const bool enabled=[] {
+        const auto* mode=std::getenv("SSNE_PRESENTATION_VECTOR_REUSE");
+        return !mode || std::strcmp(mode,"0")!=0;
+    }();
+    return enabled;
+}
 inline void interpolate_property(Property& out,const Property& a,const Property& b,float alpha,const std::string& key){
     if(a.index()!=b.index())return;
     auto blend=[&](float x,float y){return x+(y-x)*alpha;};
     if(const auto* x=std::get_if<std::array<float,3>>(&a)){const auto& y=std::get<std::array<float,3>>(b);auto v=*x;for(unsigned i=0;i<3;++i){const auto delta=key=="enemy_rotation"?std::remainder(y[i]-v[i],6.283185307f):y[i]-v[i];v[i]+=delta*alpha;}out=v;}
     else if(const auto* x=std::get_if<std::array<float,4>>(&a)){const auto& y=std::get<std::array<float,4>>(b);auto v=*x;for(unsigned i=0;i<4;++i)v[i]=blend(v[i],y[i]);out=v;}
-    else if(const auto* x=std::get_if<std::vector<float>>(&a)){const auto& y=std::get<std::vector<float>>(b);if(x->size()!=y.size())return;auto v=*x;for(unsigned i=0;i<v.size();++i)v[i]=blend(v[i],y[i]);out=std::move(v);}
+    else if(const auto* x=std::get_if<std::vector<float>>(&a)){
+        const auto& y=std::get<std::vector<float>>(b);if(x->size()!=y.size())return;
+        // presentation_fields already owns a vector for this render frame.
+        // Reuse that storage; when out aliases a/b their equal sizes also mean
+        // resize cannot invalidate either input, and each coefficient is independent.
+        if(presentation_vector_reuse_enabled())if(auto* v=std::get_if<std::vector<float>>(&out)){
+            v->resize(x->size());
+            for(unsigned i=0;i<v->size();++i)(*v)[i]=blend((*x)[i],y[i]);
+            return;
+        }
+        // Exact old path for A/B and a target with another property type.
+        auto v=*x;for(unsigned i=0;i<v.size();++i)v[i]=blend(v[i],y[i]);out=std::move(v);
+    }
+}
+inline bool presentation_cache_enabled(){
+    static const bool enabled=[] {
+        const auto* mode=std::getenv("SSNE_PRESENTATION_CACHE");
+        return !mode || std::strcmp(mode,"0")!=0;
+    }();
+    return enabled;
 }
 class ClientPresentation {
     struct Sample {std::shared_ptr<const WorldState> world;double host,received;};
@@ -106,8 +136,88 @@ class ClientPresentation {
     double cursor_=0,last_render_=0,interval_=1./60,jitter_=0;
     uint64_t epoch_=0;
     PlayerId owner_{};
+    struct CachedField {
+        const std::string* key=nullptr;
+        const Property* latest=nullptr;
+        const Property* before=nullptr;
+        const Property* after=nullptr;
+        bool blend=false;
+    };
+    struct CachedEntity {
+        EntityId id=0;
+        const EntityState* current=nullptr;
+        const EntityState* before=nullptr;
+        const EntityState* after=nullptr;
+        bool continuous=false;
+        std::vector<CachedField> fields;
+    };
+    // The cached descriptions refer only to immutable owned snapshots. There
+    // are no guest-RAM pointers or borrowed output-node pointers in this cache.
+    std::vector<CachedEntity> cached_entities_;
+    std::shared_ptr<const WorldState> cached_before_,cached_after_,cached_latest_;
+    uint64_t history_generation_=0,cached_generation_=0;
+    PlayerId cached_owner_{};
+    bool cache_valid_=false;
+    void clear_cache(){
+        cache_valid_=false;cached_entities_.clear();
+        cached_before_.reset();cached_after_.reset();cached_latest_.reset();
+    }
+    static bool render_entity(const EntityState& e){
+        return e.kind==EntityKind::Player || e.kind==EntityKind::Enemy || e.kind==EntityKind::Pickup || e.kind==EntityKind::Projectile ||
+            (e.kind==EntityKind::Physics && (e.definition==3 || e.definition==4));
+    }
+    static bool blends_value(const Property& a,const Property& b){
+        if(a.index()!=b.index())return false;
+        if(std::holds_alternative<std::array<float,3>>(a) || std::holds_alternative<std::array<float,4>>(a))return true;
+        const auto* x=std::get_if<std::vector<float>>(&a);
+        return x && x->size()==std::get<std::vector<float>>(b).size();
+    }
+    void prepare_cached_entities(const Sample& before,const Sample& after,const Sample& latest,double span){
+        cache_valid_=false;
+        cached_before_=before.world;cached_after_=after.world;cached_latest_=latest.world;
+        size_t used=0;
+        for(const auto& [id,current]:latest.world->entities){
+            if(!render_entity(current))continue;
+            if(used==cached_entities_.size())cached_entities_.emplace_back();
+            auto& plan=cached_entities_[used++];plan.id=id;plan.current=&current;plan.fields.clear();
+            auto a=before.world->entities.find(id),b=after.world->entities.find(id);
+            plan.before=a==before.world->entities.end()?nullptr:&a->second;
+            plan.after=b==after.world->entities.end()?nullptr:&b->second;
+            plan.continuous=plan.before && plan.after && span>0 && presentation_continuous(*plan.before,*plan.after,span) &&
+                presentation_continuous(*plan.after,current,std::max(.001,latest.host-after.host));
+            for(const auto& [key,value]:current.properties){
+                if(!presentation_field(key))continue;
+                CachedField field{&key,&value};
+                if(plan.continuous){
+                    bool eligible=true;
+                    if(current.owner==owner_ && !presentation_driving(current) && key.starts_with("camera_row"))eligible=false;
+                    if(current.owner==owner_ && key.starts_with("weapon_model") && key.find("_row")!=std::string::npos)eligible=false;
+                    if(eligible && key.starts_with("weapon_model")){
+                        const auto slot=current.properties.find("weapon_model_slot");
+                        if(slot==current.properties.end() || !a->second.properties.contains("weapon_model_slot") || !b->second.properties.contains("weapon_model_slot") || a->second.properties.at("weapon_model_slot")!=slot->second || b->second.properties.at("weapon_model_slot")!=slot->second || a->second.properties.at("weapon_model_visibility")!=current.properties.at("weapon_model_visibility") || b->second.properties.at("weapon_model_visibility")!=current.properties.at("weapon_model_visibility"))eligible=false;
+                    }
+                    if(eligible){
+                        const auto x=a->second.properties.find(key),y=b->second.properties.find(key);
+                        if(x!=a->second.properties.end() && y!=b->second.properties.end()){
+                            if(key=="pickup_glow_pose"){
+                                const auto size=std::get<std::vector<float>>(value).size();
+                                const bool lifetime_edge=std::any_of(samples_.begin(),samples_.end(),[&](const Sample& sample){if(sample.host<before.host)return false;auto found=sample.world->entities.find(id);if(found==sample.world->entities.end())return true;auto pose=found->second.properties.find(key);const auto* v=pose==found->second.properties.end()?nullptr:std::get_if<std::vector<float>>(&pose->second);return !v || v->size()!=size;});
+                                if(lifetime_edge)eligible=false;
+                            }
+                            if(eligible && key.find("_bone_matrices")!=std::string::npos){auto count=key.substr(0,key.size()-8)+"count",layout=key.substr(0,key.size()-8)+"layout";if(!a->second.properties.contains(count) || !b->second.properties.contains(count) || !a->second.properties.contains(layout) || !b->second.properties.contains(layout) || a->second.properties.at(count)!=current.properties.at(count) || b->second.properties.at(count)!=current.properties.at(count) || a->second.properties.at(layout)!=current.properties.at(layout) || b->second.properties.at(layout)!=current.properties.at(layout))eligible=false;}
+                            if(eligible && blends_value(x->second,y->second)){
+                                field.before=&x->second;field.after=&y->second;field.blend=true;
+                            }
+                        }
+                    }
+                }
+                plan.fields.push_back(field);
+            }
+        }
+        cached_entities_.resize(used);cached_generation_=history_generation_;cached_owner_=owner_;cache_valid_=true;
+    }
 public:
-    void reset(){samples_.clear();epoch_=0;cursor_=last_render_=0;interval_=1./60;jitter_=0;}
+    void reset(){samples_.clear();clear_cache();++history_generation_;epoch_=0;cursor_=last_render_=0;interval_=1./60;jitter_=0;}
     bool push(std::shared_ptr<const WorldState> world,double received,PlayerId owner){
         auto it=world->mission.find("Session.Motion.Time");const auto* t=it==world->mission.end()?nullptr:std::get_if<float>(&it->second);
         if(!t || !std::isfinite(*t))return false;
@@ -131,7 +241,8 @@ public:
             const auto variation=std::abs((received-samples_.back().received)-span);
             jitter_=std::max(jitter_*std::exp(-span/3.),std::clamp(variation,0.,.12));
         }
-        samples_.push_back({std::move(world),*t,received});while(samples_.size()>32)samples_.pop_front();return cut;
+        samples_.push_back({std::move(world),*t,received});while(samples_.size()>32)samples_.pop_front();
+        ++history_generation_;cache_valid_=false;return cut;
     }
     static const EntityState* own(const WorldState& world,PlayerId player){for(const auto& [id,e]:world.entities)if(e.kind==EntityKind::Player && e.owner==player)return &e;return nullptr;}
     std::map<EntityId,EntityState> sample(double now,Properties* vehicles=nullptr){
@@ -226,6 +337,113 @@ public:
             }
             out.emplace(id,std::move(e));
         }return out;
+    }
+    // Caller-owned scratch stays mutable only for its current render lease.
+    // Every call restores all discrete/latest values before local camera work;
+    // interpolation overwrites its complete result, never accumulating deltas.
+    void sample_into(double now,std::map<EntityId,EntityState>& out,Properties* vehicles=nullptr){
+        // Guard the public scratch API against accidental aliasing of a retained
+        // snapshot. Normal NativeSession output is a separate private member.
+        for(const auto& sample:samples_)
+            if(&out==&sample.world->entities || (vehicles && vehicles==&sample.world->mission))
+                throw std::invalid_argument("Presentation output aliases an immutable snapshot");
+        if(!presentation_cache_enabled()){out=sample(now,vehicles);return;}
+        if(samples_.empty()){out.clear();return;}
+        const auto& latest=samples_.back();
+        const auto delay=delay_ms()/1000.;
+        const double target=latest.host+std::clamp(now-latest.received,0.,.25)-delay;
+        const double dt=std::clamp(now-last_render_,0.,.1);last_render_=now;
+        if(std::abs(target-cursor_)>.25)cursor_=target;
+        else cursor_+=dt*std::clamp(1.+(target-cursor_)*4.,.9,1.1);
+        cursor_=std::clamp(cursor_,samples_.front().host,latest.host);
+        while(samples_.size()>2 && samples_[1].host<cursor_)samples_.pop_front();
+        const Sample* before=&samples_.front(),*after=before;
+        for(const auto& s:samples_){if(s.host<=cursor_)before=&s;if(s.host>=cursor_){after=&s;break;}after=&s;}
+        const double span=after->host-before->host;const float alpha=span>0?float(std::clamp((cursor_-before->host)/span,0.,1.)):1;
+        if(vehicles){
+            const auto& current=latest.world->mission;
+            // Retain output nodes/vector capacity while restoring all latest values.
+            for(auto it=vehicles->begin();it!=vehicles->end();){
+                if((it->first=="Session.Vehicles.Tags" || it->first=="Session.Vehicles.Values") && current.contains(it->first))++it;
+                else it=vehicles->erase(it);
+            }
+            for(const char* key:{"Session.Vehicles.Tags","Session.Vehicles.Values"})if(auto it=current.find(key);it!=current.end())(*vehicles)[key]=it->second;
+            auto tags=[](const Properties& p){auto i=p.find("Session.Vehicles.Tags");return i==p.end()?nullptr:std::get_if<std::vector<int64_t>>(&i->second);};
+            auto values=[](const Properties& p){auto i=p.find("Session.Vehicles.Values");return i==p.end()?nullptr:std::get_if<std::vector<float>>(&i->second);};
+            const auto* tc=tags(current),*ta=tags(before->world->mission),*tb=tags(after->world->mission);
+            const auto* va=values(before->world->mission),*vb=values(after->world->mission);
+            if(tc && ta && tb && va && vb && tc->size()%20==0 && ta->size()==tc->size() && tb->size()==tc->size() && span>0){
+                auto out=vehicles->find("Session.Vehicles.Values");auto* vc=out==vehicles->end()?nullptr:std::get_if<std::vector<float>>(&out->second);size_t offset=0;
+                for(size_t n=0;vc && n<tc->size();n+=20){
+                    const auto count=(*tc)[n+6];if(count<0 || count>128)break;
+                    const size_t length=(*tc)[n+1]?104+size_t(count)*12:0;
+                    // Match complete records, not array positions from a different
+                    // vehicle lifetime. Entry/exit and teleports snap immediately.
+                    if(!std::equal(tc->begin()+n,tc->begin()+n+8,ta->begin()+n) || !std::equal(tc->begin()+n,tc->begin()+n+8,tb->begin()+n))break;
+                    if(offset+length>vc->size() || offset+length>va->size() || offset+length>vb->size())break;
+                    double distance=0,tail=0;for(unsigned i=0;length && i<3;++i){distance+=std::pow((*vb)[offset+i]-(*va)[offset+i],2);tail+=std::pow((*vc)[offset+i]-(*vb)[offset+i],2);}
+                    const auto limit=std::max(3.,160.*span),tail_limit=std::max(3.,160.*std::max(.001,latest.host-after->host));
+                    if(length && distance<limit*limit && tail<tail_limit*tail_limit)for(size_t i=0;i<length;++i){
+                        if(i==6 || i==7)continue; // Health is authoritative, never a render field.
+                        const auto delta=i>=3 && i<6?std::remainder((*vb)[offset+i]-(*va)[offset+i],6.283185307f):(*vb)[offset+i]-(*va)[offset+i];
+                        (*vc)[offset+i]=(*va)[offset+i]+delta*alpha;
+                    }
+                    offset+=length;
+                }
+            }
+        }
+        if(!cache_valid_ || cached_generation_!=history_generation_ || cached_owner_!=owner_ ||
+           cached_before_.get()!=before->world.get() || cached_after_.get()!=after->world.get() || cached_latest_.get()!=latest.world.get())
+            prepare_cached_entities(*before,*after,latest,span);
+        auto output=out.begin();
+        for(const auto& plan:cached_entities_){
+            const auto& current=*plan.current;
+            while(output!=out.end() && output->first<plan.id)output=out.erase(output);
+            if(output==out.end() || output->first!=plan.id)
+                output=out.emplace_hint(output,plan.id,EntityState{current.id,current.kind,current.definition,current.resource,current.owner,{}});
+            auto& e=output->second;
+            e.id=current.id;e.kind=current.kind;e.definition=current.definition;e.resource=current.resource;e.owner=current.owner;
+            auto field_output=e.properties.begin();
+            for(const auto& field:plan.fields){
+                const auto& key=*field.key;
+                if(field_output==e.properties.end() || field_output->first!=key){
+                    while(field_output!=e.properties.end() && field_output->first<key)field_output=e.properties.erase(field_output);
+                    if(field_output==e.properties.end() || field_output->first!=key)
+                        field_output=e.properties.emplace_hint(field_output,key,*field.latest);
+                }
+                auto& value=field_output->second;
+                if(field.blend)interpolate_property(value,*field.before,*field.after,alpha,key);
+                else value=*field.latest;
+                ++field_output;
+            }
+            e.properties.erase(field_output,e.properties.end());
+            if(plan.continuous){
+                const auto* a=plan.before;const auto* b=plan.after;
+                if(current.owner==owner_ && !presentation_driving(current)){
+                    PresentationMatrix camera,ca,cb;
+                    if(presentation_matrix(current.properties,"camera_row",camera) && presentation_matrix(a->properties,"camera_row",ca) && presentation_matrix(b->properties,"camera_row",cb)){
+                        const auto slot=current.properties.find("weapon_model_slot");
+                        if(slot!=current.properties.end() && a->properties.contains("weapon_model_slot") && b->properties.contains("weapon_model_slot") && a->properties.at("weapon_model_slot")==slot->second && b->properties.at("weapon_model_slot")==slot->second){
+                            for(unsigned hand=0;hand<2;++hand){
+                                const auto prefix="weapon_model"+std::to_string(hand)+"_row";PresentationMatrix ga,gb,gc;
+                                if(presentation_matrix(a->properties,prefix,ga) && presentation_matrix(b->properties,prefix,gb) && presentation_matrix(current.properties,prefix,gc) && a->properties.at("weapon_model_visibility")==current.properties.at("weapon_model_visibility") && b->properties.at("weapon_model_visibility")==current.properties.at("weapon_model_visibility")){
+                                    auto ra=matrix_product(matrix_rigid_inverse(ca),ga),rb=matrix_product(matrix_rigid_inverse(cb),gb);
+                                    for(unsigned i=0;i<12;++i)ra[i]+=(rb[i]-ra[i])*alpha;
+                                    put_presentation_matrix(e.properties,prefix,matrix_product(camera,ra));
+                                }
+                            }
+                        }
+                        const auto previous_camera=camera;
+                        for(unsigned r=0;r<3;++r)camera[r*4+3]=ca[r*4+3]+(cb[r*4+3]-ca[r*4+3])*alpha;
+                        const auto translation=matrix_product(camera,matrix_rigid_inverse(previous_camera));
+                        for(unsigned hand=0;hand<2;++hand){const auto prefix="weapon_model"+std::to_string(hand)+"_row";PresentationMatrix gun;if(presentation_matrix(e.properties,prefix,gun))put_presentation_matrix(e.properties,prefix,matrix_product(translation,gun));}
+                        put_presentation_matrix(e.properties,"camera_row",camera);
+                    }
+                }
+            }
+            ++output;
+        }
+        out.erase(output,out.end());
     }
     double delay_ms()const{return std::clamp(interval_+.008+jitter_,.025,.15)*1000;}
 };

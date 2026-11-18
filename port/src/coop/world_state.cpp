@@ -1,4 +1,5 @@
 #include "world_state.h"
+#include "native_boss_hud_mission.h"
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -113,8 +114,15 @@ struct Reader {
 };
 }
 bool validate_world(const WorldState& w,std::string& error) {
+    return validate_world(WorldReadView(w),error);
+}
+bool validate_world(WorldReadView w,std::string& error) {
     auto fail=[&](const char* message){error=message;return false;};
     if(!w.epoch || !text_ok(w.level,256) || !properties_ok(w.mission,max_mission_properties))return fail("Invalid world metadata");
+    if(has_native_boss_hud_mission(w.mission)) {
+        ssne::NativeBossHudState boss_hud;
+        if(!read_native_boss_hud_mission(w.mission,boss_hud,error))return false;
+    }
     for(const char* key:{"Session.Lobby.Open","Session.Lobby.ReadyMask"})if(auto field=w.mission.find(key);field!=w.mission.end()) {
         const auto value=std::get_if<int64_t>(&field->second);const auto limit=std::string_view(key)=="Session.Lobby.Open"?1:255;
         if(!value || *value<0 || *value>limit)return fail("Invalid lobby metadata");
@@ -172,7 +180,7 @@ bool validate_world(const WorldState& w,std::string& error) {
     }
     for(unsigned slot=0;slot<max_players;++slot) {
         const auto& p=w.players[slot];
-        if(!p.connected){if(p.ready || p.afk || p.character)return fail("Disconnected participant has active state");continue;}
+        if(!p.connected){if(p.ready || p.afk || p.character || p.spectator)return fail("Disconnected participant has active state");continue;}
         if(p.id.slot!=slot || !p.id.generation || !text_ok(p.name,64,false) || (p.ready && !p.character))return fail("Invalid participant");
         if(p.ready && (!w.entities.contains(p.character) || w.entities.at(p.character).kind!=EntityKind::Player || w.entities.at(p.character).owner!=p.id))return fail("Ready participant has no matching character");
     }
@@ -180,6 +188,10 @@ bool validate_world(const WorldState& w,std::string& error) {
     return true;
 }
 WorldDelta difference(const WorldState* base,const WorldState& current) {
+    std::optional<WorldReadView> before;if(base)before.emplace(*base);
+    return difference(before?&*before:nullptr,WorldReadView(current));
+}
+WorldDelta difference(const WorldReadView* base,WorldReadView current) {
     std::string error;if(!validate_world(current,error))throw std::invalid_argument(error);
     WorldDelta d;d.epoch=current.epoch;d.revision=current.revision;d.tick=current.tick;
     d.full=!base || base->epoch!=current.epoch;
@@ -224,23 +236,32 @@ bool apply_delta(WorldState& w,const WorldDelta& d,std::string& error) {
     w=std::move(*next);return true;
 }
 std::vector<uint8_t> encode_delta(const WorldDelta& d) {
-    Writer w;w.u64(d.epoch);w.u64(d.base_revision);w.u64(d.revision);w.u64(d.tick);w.u8(d.full);w.text(d.level,256);w.patch(d.mission,max_mission_properties);
+    Writer w;w.u64(d.epoch);w.u64(d.base_revision);w.u64(d.revision);w.u64(d.tick);w.u8(d.full?3:2);w.text(d.level,256);w.patch(d.mission,max_mission_properties);
     if(d.entities.size()>max_entities || d.remove.size()>max_entities)throw std::invalid_argument("Too many entity patches");
     w.u32(uint32_t(d.entities.size()));
     for(const auto& e:d.entities){w.u64(e.id);w.u8(e.create);w.u8(uint8_t(e.kind));w.u32(e.definition);w.text(e.resource,256);w.id(e.owner);w.patch(e.properties,max_properties);}
     w.u32(uint32_t(d.remove.size()));for(auto id:d.remove)w.u64(id);
     for(const auto& p:d.players){w.id(p.id);w.u8(p.connected);w.u8(p.ready);w.u8(p.afk);w.u64(p.character);w.text(p.name,64);}
     for(auto ack:d.input_ack)w.u64(ack);
-    w.u64(d.vote.cutscene);w.u32(d.vote.received);w.u32(d.vote.required);w.u8(d.vote.skip_requested);return std::move(w.bytes);
+    w.u64(d.vote.cutscene);w.u32(d.vote.received);w.u32(d.vote.required);w.u8(d.vote.skip_requested);
+    // One trailing mask extends the209 payload; full-byte2/3 marks this format.
+    // New protocol66 peers send it; old local checkpoint frames decode as all
+    // active, and no ambiguous per-participant variable layout is introduced.
+    uint8_t spectators=0;for(unsigned slot=0;slot<max_players;++slot)if(d.players[slot].spectator)spectators|=uint8_t(1u<<slot);w.u8(spectators);
+    return std::move(w.bytes);
 }
 bool decode_delta(const std::vector<uint8_t>& bytes,WorldDelta& output,std::string& error) {
     if(bytes.size()>max_frame_bytes){error="Coop frame too large";return false;}
-    Reader r{bytes};WorldDelta d;d.epoch=r.u64();d.base_revision=r.u64();d.revision=r.u64();d.tick=r.u64();d.full=r.boolean();d.level=r.text(256);d.mission=r.patch(max_mission_properties);
+    Reader r{bytes};WorldDelta d;d.epoch=r.u64();d.base_revision=r.u64();d.revision=r.u64();d.tick=r.u64();const auto full=r.u8();const bool modern=(full&2)!=0;if(full>3)r.ok=false;d.full=(full&1)!=0;d.level=r.text(256);d.mission=r.patch(max_mission_properties);
     auto n=r.count(max_entities);for(unsigned i=0;i<n && r.ok;++i){EntityPatch p;p.id=r.u64();p.create=r.boolean();p.kind=EntityKind(r.u8());p.definition=r.u32();p.resource=r.text(256);p.owner=r.id();p.properties=r.patch(max_properties);d.entities.push_back(std::move(p));}
     n=r.count(max_entities);for(unsigned i=0;i<n && r.ok;++i)d.remove.push_back(r.u64());
     for(auto& p:d.players){p.id=r.id();p.connected=r.boolean();p.ready=r.boolean();p.afk=r.boolean();p.character=r.u64();p.name=r.text(64);}
     for(auto& ack:d.input_ack)ack=r.u64();
     d.vote.cutscene=r.u64();d.vote.received=r.u32();d.vote.required=r.u32();d.vote.skip_requested=r.boolean();
+    if(r.ok && modern){
+        if(r.position>bytes.size() || bytes.size()-r.position!=1){error="Malformed spectator world extension";return false;}
+        const auto spectators=r.u8();for(unsigned slot=0;slot<max_players;++slot)d.players[slot].spectator=(spectators&(1u<<slot))!=0;
+    }
     if(!r.ok || r.position!=bytes.size()){error="Malformed coop world frame";return false;}
     output=std::move(d);return true;
 }

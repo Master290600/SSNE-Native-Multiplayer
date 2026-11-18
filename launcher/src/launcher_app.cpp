@@ -1,6 +1,7 @@
 #include "launcher_app.h"
 
 #include <imgui.h>
+#include <SDL.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -9,6 +10,8 @@
 #include <fstream>
 
 #include "launcher_json.h"
+#include "gc/custom_levels.h"
+#include "gc/sha256.h"
 
 #include "gc/disc.h"
 #include "platform.h"
@@ -74,7 +77,7 @@ LauncherApp::LauncherApp(bool updated) {
     refresh_target();
     trace("startup complete");
     if (updated) {
-        message_ = std::string("Updated to SSNE-Native ") + updater::current_version() + ".";
+        message_ = std::string("Updated to SSNE-RECOOP-Native ") + updater::current_version() + ".";
         // A new build kit (engine update): rebuild the game right away, as Update Game would.
         if (cfg_.installed && kit_present_ && game_outdated()) start_install();
     }
@@ -99,7 +102,7 @@ void LauncherApp::start_update() {
     {
         std::lock_guard<std::mutex> lk(mu_);
         message_.clear();
-        update_step_ = "Downloading SSNE-Native " + update_.version;
+        update_step_ = "Downloading SSNE-RECOOP-Native " + update_.version;
     }
     phase_ = Phase::Updating;
     worker_ = std::thread([this] {
@@ -169,12 +172,13 @@ void LauncherApp::refresh_target(bool force_verify) {
     target_valid_ = select_build_target(base_kit_, base_dir_, data_dir_, kit_, target_error_);
     target_present_ = target_ready_ = false;
     if (target_valid_) {
-        target_present_ = platform::file_exists(kit_.output_exe(base_dir_));
+        const auto play_exe=kit_.play_exe(base_dir_);
+        target_present_ = platform::file_exists(play_exe);
         if (kit_.target == BuildTarget::Standard)
             for (auto& old : platform::legacy_port_exe_names())
                 target_present_ |= platform::file_exists(base_dir_ + "/" + old);
         std::string err;
-        target_ready_ = game_build_ready(kit_, kit_.output_exe(base_dir_), err, force_verify);
+        target_ready_ = game_build_ready(kit_, play_exe, err, force_verify);
         if (!kit_present_) target_ready_ = target_present_;
         if (!err.empty() && !target_ready_) target_error_ = err;
     }
@@ -241,6 +245,7 @@ void LauncherApp::start_install(bool auto_launch) {
 }
 
 void LauncherApp::launch_game() {
+    if (phase_ != Phase::Idle) return;
     refresh_target(true);
     if (!target_valid_ || !game_ready()) {
         if (target_valid_ && kit_present_) { start_install(true); return; }
@@ -249,12 +254,40 @@ void LauncherApp::launch_game() {
         message_is_error_ = true;
         return;
     }
-    std::string exe = kit_.output_exe(base_dir_);
+    std::string exe = kit_.play_exe(base_dir_);
     if (kit_.target == BuildTarget::Standard)
         for (auto& old : platform::legacy_port_exe_names())
             if (!platform::file_exists(exe)) exe = base_dir_ + "/" + old;
     std::vector<std::string> args{"--data", data_dir_};
     if (cfg_.fullscreen) args.push_back("--fullscreen");
+    if (kit_.target == BuildTarget::NativeMultiplayer) {
+        join_worker();
+        const auto data=data_dir_,base=base_dir_,cwd=kit_.working_directory(base_dir_);
+        const bool close=cfg_.close_on_launch;
+        cancel_=false;phase_=Phase::Preparing;prog_done_=0;prog_total_=1;
+        {std::lock_guard<std::mutex> lock(mu_);build_step_="Preparing custom levels";message_.clear();}
+        worker_=std::thread([this,exe,args=std::move(args),data,base,cwd,close]() mutable {
+            try {
+                args.insert(args.end(),{"--custom-downloads",base+"/DownloadedCustomLevels"});
+                const auto catalog=gc::custom::scan(fs::u8path(base)/"CustomLevels");
+                if (!catalog.levels.empty()) {
+                    const auto target=gc::custom::prepared_cache_path(fs::u8path(base),fs::u8path(data),catalog);
+                    const auto prepared=gc::custom::prepare_data(fs::u8path(data),catalog,target);
+                    const auto u8=prepared.data_dir.u8string(),manifest=prepared.catalog_file.u8string();
+                    args[1]=std::string(u8.begin(),u8.end());args.insert(args.end(),{"--custom-levels",std::string(manifest.begin(),manifest.end())});
+                }
+                std::string error;
+                if (cancel_) throw std::runtime_error("Game start cancelled.");
+                if (!platform::launch(exe,args,cwd,error)) throw std::runtime_error(error);
+                cfg_.save(config_path_);if(close)quit_=true;
+                {std::lock_guard<std::mutex> lock(mu_);message_=catalog.warnings.empty()?"Game started.":"Game started; some invalid custom level packages were skipped.";message_is_error_=false;}
+            } catch(const std::exception& error) {
+                std::lock_guard<std::mutex> lock(mu_);message_=std::string("Launch failed: ")+error.what();message_is_error_=true;
+            }
+            phase_=Phase::Idle;
+        });
+        return;
+    }
     std::string err;
     if (!platform::launch(exe, args, kit_.working_directory(base_dir_), err)) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -273,6 +306,7 @@ void LauncherApp::launch_game() {
 bool LauncherApp::item_enabled(int item) const {
     bool idle = phase_ == Phase::Idle;
     switch (item) {
+    case ITEM_EDITOR: return idle && cfg_.installed && platform::file_exists(data_dir_ + "/files/Levels/Rlevel1_1.ssw");
     case ITEM_PLAY: return idle && cfg_.installed && (kit_present_ || game_built());
     case ITEM_DISC: return idle;
     case ITEM_INSTALL: {
@@ -291,6 +325,7 @@ void LauncherApp::browse() {
 void LauncherApp::activate(int item) {
     if (!item_enabled(item)) return;
     switch (item) {
+    case ITEM_EDITOR: editor_.configure(base_dir_,data_dir_,kit_.play_exe(base_dir_)); editor_open_=true; break;
     case ITEM_PLAY: launch_game(); break;
     case ITEM_DISC: browse(); break;
     case ITEM_INSTALL: start_install(); break;
@@ -317,6 +352,7 @@ void LauncherApp::frame() {
         if (launch_pending_.exchange(false)) launch_game();
     }
     test_rows_.clear();
+    if(editor_open_){ editor_open_=editor_.draw(); return; }
     ImGuiIO& io = ImGui::GetIO();
     time_ += io.DeltaTime;
     const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -392,7 +428,7 @@ void LauncherApp::draw_update(ImVec2 p0, ImVec2 p1) {
     ImVec2 sz = theme::chunky_text(ImGui::GetWindowDrawList(), pos + ImVec2(3, 0), 34,
                                    phase_ == Phase::Updating ? "Updating" : "Update Available", theme::Look::Normal, time_);
     ImGui::Dummy(ImVec2(sz.x, sz.y + 6));
-    ImGui::TextWrapped("SSNE-Native %s is available (this is %s).", update_.version.c_str(), updater::current_version());
+    ImGui::TextWrapped("SSNE-RECOOP-Native %s is available (this is %s).", update_.version.c_str(), updater::current_version());
     ImGui::PushStyleColor(ImGuiCol_Text, kDim);
     ImGui::TextWrapped("Update downloads it from GitHub, installs it in this folder and restarts the launcher. Your game "
                        "files, saves and settings are kept; if the new version brings an engine update, the game is "
@@ -432,13 +468,14 @@ void LauncherApp::draw_update(ImVec2 p0, ImVec2 p1) {
 void LauncherApp::draw_title(ImVec2 p0, ImVec2 p1) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float w = p1.x - p0.x, h = p1.y - p0.y;
-    float size = std::min(h * 0.56f, w * 0.082f);
-    const char* title = "Serious Sam";
+    const char* title = "SSNE-RECOOP-Native";
+    const float title_width = theme::chunky_text(nullptr, {}, 100.0f, title, theme::Look::Normal, time_).x;
+    const float size = std::min(h * 0.56f, w * 0.90f * 100.0f / title_width);
     ImVec2 ts = theme::chunky_text(nullptr, ImVec2(0, 0), size, title, theme::Look::Normal, time_);
     ImVec2 tp(p0.x + (w - ts.x) * 0.5f, p0.y + h * 0.14f);
     theme::chunky_text(dl, tp, size, title, theme::Look::Normal, time_);
 
-    const char* sub = "NEXT ENCOUNTER NATIVE";
+    const char* sub = "SERIOUS SAM: NEXT ENCOUNTER";
     float ss = std::max(13.0f, size * 0.26f), sp = ss * 0.55f;
     float sw = theme::spaced_text(nullptr, theme::fonts.bold, ss, ImVec2(0, 0), 0, sub, sp);
     ImVec2 sub_pos(p0.x + (w - sw) * 0.5f, tp.y + ts.y + h * 0.06f);
@@ -456,13 +493,14 @@ void LauncherApp::draw_title(ImVec2 p0, ImVec2 p1) {
 void LauncherApp::draw_menu(ImVec2 p0, ImVec2 p1) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float w = p1.x - p0.x, h = p1.y - p0.y;
-    float big = std::clamp(h * 0.105f, 26.0f, 50.0f), small = big * 0.72f;
+    float big = std::clamp(h * 0.090f, 26.0f, 50.0f), small = big * 0.72f;
     bool installed = cfg_.installed;
     struct Row { int item; const char* label; float size; const char* value; };
     Row rows[ITEM_COUNT] = {
         {ITEM_PLAY, "Play", big * 1.12f, nullptr},
         {ITEM_DISC, "Select Disc", big, nullptr},
         {ITEM_INSTALL, !installed ? "Install Game" : game_outdated() ? "Update Game" : (kit_present_ && !game_ready()) ? "Build Game" : kit_.target == BuildTarget::NativeMultiplayer ? "Rebuild Game" : "Reinstall", big, nullptr},
+        {ITEM_EDITOR, "Map Editor", big, nullptr},
         {ITEM_FULLSCREEN, "Fullscreen", small, cfg_.fullscreen ? "ON" : "OFF"},
         {ITEM_CLOSE, "Close On Launch", small, cfg_.close_on_launch ? "ON" : "OFF"},
         {ITEM_QUIT, "Quit", big, nullptr},
@@ -509,7 +547,7 @@ void LauncherApp::draw_menu(ImVec2 p0, ImVec2 p1) {
 void LauncherApp::draw_progress() {
     float f = float(double(prog_done_.load()) / double(prog_total_.load()));
     std::string what = phase_ == Phase::Verifying ? "Checking disc" : "Copying the game files";
-    if (phase_ == Phase::Building) {
+    if (phase_ == Phase::Building || phase_ == Phase::Preparing) {
         std::lock_guard<std::mutex> lk(mu_);
         what = build_step_.empty() ? "Building the game" : build_step_;
     }
@@ -585,6 +623,9 @@ void LauncherApp::draw_panel(ImVec2 p0, ImVec2 p1) {
     bool ready = game_ready();
     if (phase_ == Phase::Extracting) {
         ImGui::TextColored(kDim, "Step 1: copying the game's files out of your disc image...");
+        draw_progress();
+    } else if (phase_ == Phase::Preparing) {
+        ImGui::TextColored(kDim, "Preparing the Custom Level category...");
         draw_progress();
     } else if (phase_ == Phase::Building) {
         ImGui::PushStyleColor(ImGuiCol_Text, kDim);
@@ -674,7 +715,7 @@ void LauncherApp::draw_prompt_bar(ImVec2 p0, ImVec2 p1) {
 // Hidden, opt-in input tests report the same hit rectangles used by the real UI.
 void LauncherApp::save_test_state(const std::string& path, uint64_t sequence, uint64_t frame_number) {
     using launcher::JSONValue;
-    const char* phases[] = {"Idle", "Verifying", "Extracting", "Building", "Updating"};
+    const char* phases[] = {"Idle", "Verifying", "Extracting", "Building", "Updating", "Preparing"};
     JSONValue::Array rows;
     for (const auto& r : test_rows_)
         rows.emplace_back(JSONValue::Object{{"id",r.id},{"label",r.label},{"enabled",r.enabled},
@@ -686,7 +727,24 @@ void LauncherApp::save_test_state(const std::string& path, uint64_t sequence, ui
         {"is_error",message_is_error_},{"build_step",build_step_},
         {"progress",double(prog_done_.load()) / double(prog_total_.load())},{"rows",std::move(rows)},
         {"target",kit_.target == BuildTarget::NativeMultiplayer ? "multiplayer" : "standard"},
-        {"output_exe",kit_.output_exe(base_dir_)},{"working_directory",kit_.working_directory(base_dir_)}});
+        {"output_exe",kit_.play_exe(base_dir_)},{"build_output_exe",kit_.output_exe(base_dir_)},{"working_directory",kit_.working_directory(base_dir_)}});
+    (*state.object())["editor_open"]=editor_open_;
+    if (auto* window = SDL_GL_GetCurrentWindow()) {
+        int width = 0, height = 0, x = 0, y = 0;
+        SDL_GetWindowSize(window, &width, &height);
+        SDL_GetWindowPosition(window, &x, &y);
+        (*state.object())["window_size"] = JSONValue::Array{width, height};
+        (*state.object())["window_position"] = JSONValue::Array{x, y};
+        (*state.object())["window_flags"] = int64_t(SDL_GetWindowFlags(window));
+        int top = 0, left = 0, bottom = 0, right = 0;
+        if (SDL_GetWindowBordersSize(window, &top, &left, &bottom, &right) == 0)
+            (*state.object())["window_borders"] = JSONValue::Array{top, left, bottom, right};
+        SDL_Rect work{};
+        const int display = SDL_GetWindowDisplayIndex(window);
+        if (display >= 0 && SDL_GetDisplayUsableBounds(display, &work) == 0)
+            (*state.object())["window_work_area"] = JSONValue::Array{work.x, work.y, work.w, work.h};
+    }
+    if(editor_open_)(*state.object())["editor"]=editor_.test_state();
     fs::path out = fs::u8path(path), tmp = out; tmp += ".tmp";
     { std::ofstream f(tmp, std::ios::binary | std::ios::trunc); f << launcher::write_json(state); }
     std::error_code ec;

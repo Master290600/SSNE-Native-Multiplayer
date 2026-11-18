@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,7 @@
 #endif
 
 #include "gx_gpu_frame.h"
+#include "gx_decode_timeline.h"
 #include "gx_crosshair.h"
 #include "gx_internal.h"
 #include "../state_io.h"
@@ -35,6 +37,64 @@ using namespace gx;
 std::mutex G;   // command processing state (g_pending, register state, the renderers' recording)
 std::mutex PM;  // g_pe: written by the command processing (draw done, tokens), read / acknowledged by the game
 std::vector<uint8_t> g_pending;
+// Context metadata is separate from FIFO bytes. The producer never takes G
+// while publishing a scope marker, so it cannot wait on a whole decoder job.
+constexpr size_t kContextMarkerLimit=4096;
+std::mutex g_context_mutex;
+std::condition_variable g_context_space;
+detail::GxDecodeMarkerQueue<kContextMarkerLimit> g_context_marks;
+detail::GxDecodeTimeline g_decode_timeline; // G protects parser-owned history
+// Context clock is protected by g_context_mutex; raw ring counters never rewind.
+detail::GxDecodeOffsetClock g_context_clock;
+detail::GxDecodeChoice g_producer_choice;
+GxDecodeMarkerDebug g_producer_debug;
+uint64_t g_producer_context_offset=0,g_pending_begin_abs=0;
+bool decode_debug_enabled(){
+#ifdef SSNE_GX_FIFO_CONTEXT_TEST
+    return true; // Exercise snapshots in the direct-TU parser regression.
+#else
+    static const bool enabled=[] {const auto* v=std::getenv("SSNE_GX_CONTEXT_VERIFY");return v&&!std::strcmp(v,"1");}();return enabled;
+#endif
+}
+thread_local const detail::GxDecodeChange* g_decode_source=nullptr;
+thread_local uint64_t g_decode_opcode_start=0;
+thread_local uint32_t g_decode_opcode=0,g_decode_depth=0;
+uint64_t g_last_fence_head=0,g_last_fence_begin=0,g_last_fence_bytes=0,g_last_fence_need=0; // G
+
+thread_local const GxDecodeContext* g_decode_override=nullptr;
+struct DecodeContextScope {
+    bool installed=false,debug=false;const GxDecodeContext* previous=nullptr;
+    const detail::GxDecodeChange* previous_source=nullptr;
+    uint64_t previous_start=0;uint32_t previous_opcode=0,previous_depth=0;
+    DecodeContextScope(bool enabled,const detail::GxDecodeChoice& choice,const detail::GxDecodeChange* source,uint64_t start,uint8_t opcode,int depth):installed(enabled),debug(decode_debug_enabled()){
+        if(installed){previous=g_decode_override;g_decode_override=choice.marked?&choice.context:nullptr;}
+        if(debug){previous_source=g_decode_source;previous_start=g_decode_opcode_start;previous_opcode=g_decode_opcode;previous_depth=g_decode_depth;
+            if(installed)g_decode_source=source;
+            g_decode_opcode_start=start;g_decode_opcode=opcode;g_decode_depth=uint32_t(depth);}
+    }
+    ~DecodeContextScope(){if(installed)g_decode_override=previous;if(debug){g_decode_source=previous_source;g_decode_opcode_start=previous_start;g_decode_opcode=previous_opcode;g_decode_depth=previous_depth;}}
+};
+#ifdef SSNE_GX_FIFO_CONTEXT_TEST
+using DecodeTestObserver=bool(*)(uint8_t,uint64_t,int);
+DecodeTestObserver g_decode_test_observer=nullptr;
+bool observe_decode(uint8_t opcode,uint64_t offset,int depth){return g_decode_test_observer&&g_decode_test_observer(opcode,offset,depth);}
+#endif
+void ingest_context_marks(uint64_t raw_head){
+    // At most one partial command remains after process_pending. Its compacted
+    // timeline has<=2 entries, so one full marker batch always fits this reserve.
+    g_decode_timeline.reserve(kContextMarkerLimit+4);
+    bool consumed=false;
+    {
+        std::lock_guard lock(g_context_mutex);const auto logical_head=g_context_clock.logical(raw_head);
+        while(g_context_marks.size()&&g_context_marks.front().offset<=logical_head){
+            if(!g_decode_timeline.append(g_context_marks.front())){std::fprintf(stderr,"GX context marker order invalid\n");std::abort();}
+            g_context_marks.pop();consumed=true;
+        }
+    }
+    if(consumed)g_context_space.notify_all();
+}
+void compact_context_pending(){g_decode_timeline.compact_pending(g_pending_begin_abs,g_pending_begin_abs+g_pending.size());}
+
 // Bytes g_pending must hold before parse() can make progress (0 = unknown, parse on the next write). The game writes
 // a draw command 4 bytes at a time; without this, every write re-parsed the incomplete command just to find it still
 // incomplete. Only the head of g_pending is ever unparsed, and the CP registers that size it (VCD/VAT) only change
@@ -107,7 +167,14 @@ void call_display_list(uint32_t addr, uint32_t size, int depth) {
 size_t parse(const uint8_t* p, size_t n, int depth) {
     size_t i = 0;
     while (i < n) {
+        const bool scoped=depth==0&&gx_scoped_context_enabled();
+        detail::GxDecodeChoice choice;
+        const detail::GxDecodeChange* source=nullptr;
+        if(scoped){if(decode_debug_enabled()){source=g_decode_timeline.find(g_pending_begin_abs+i);if(source)choice=source->choice;}else choice=g_decode_timeline.at(g_pending_begin_abs+i);}
         uint8_t op = p[i];
+        // Nested display lists inherit the parent marker. Their bytes have no
+        // top-level FIFO offset, so diagnostics report UINT64_MAX and depth.
+        DecodeContextScope decode_scope(scoped,choice,source,depth==0?g_pending_begin_abs+i:UINT64_MAX,op,depth);
         size_t need;
         switch (op) {
         case 0x00: need = 1; break;
@@ -132,6 +199,9 @@ size_t parse(const uint8_t* p, size_t n, int depth) {
                 int vat = op & 7;
                 need = 3 + size_t(count) * vertex_size(vat);
                 if (n - i < need) return i;
+#ifdef SSNE_GX_FIFO_CONTEXT_TEST
+                if(observe_decode(op,depth==0?g_pending_begin_abs+i:UINT64_MAX,depth)){i+=need;s_cmds++;continue;}
+#endif
                 s_prims++;
                 s_verts += count;
                 static const bool gpu_tl = gpu_vertex_shading();
@@ -156,6 +226,9 @@ size_t parse(const uint8_t* p, size_t n, int depth) {
             need = 1;
         }
         if (n - i < need) return i;
+#ifdef SSNE_GX_FIFO_CONTEXT_TEST
+        if(observe_decode(op,depth==0?g_pending_begin_abs+i:UINT64_MAX,depth)){i+=need;s_cmds++;continue;}
+#endif
         switch (op) {
         case 0x08: g.cp[p[i + 1]] = rd32(p + i + 2); g_vsetup_dirty = true; break;
         case 0x10: load_xf(p + i + 1); break;
@@ -189,10 +262,12 @@ size_t head_need(const uint8_t* p, size_t n) {
 
 // Parses what g_pending holds (caller holds G).
 void process_pending() {
-    if (g_pending.size() < g_need) return;  // the head command is still incomplete
+    const bool scoped=gx_scoped_context_enabled();
+    if (g_pending.size() < g_need) {if(scoped)compact_context_pending();return;}
     size_t used = parse(g_pending.data(), g_pending.size(), 0);
-    if (used) g_pending.erase(g_pending.begin(), g_pending.begin() + long(used));
+    if (used) {g_pending.erase(g_pending.begin(), g_pending.begin() + long(used));if(scoped)g_pending_begin_abs+=used;}
     g_need = head_need(g_pending.data(), g_pending.size());
+    if(scoped)compact_context_pending();
 }
 
 // ---- GX thread. The game's writes to the pipe go into a ring buffer (single producer: the game's thread, which
@@ -214,6 +289,25 @@ std::atomic<bool> g_gx_sleeping{false}, g_sync_waiting{false}, g_stop{false};
 std::mutex WM;                           // wake-ups (with the two condition variables)
 std::condition_variable g_wake_cv, g_done_cv;
 std::thread* g_gx_thread = nullptr;
+void enqueue_context_choice(const detail::GxDecodeChoice& choice,const GxDecodeMarkerDebug& debug={}){
+    std::unique_lock lock(g_context_mutex);
+    if(choice==g_producer_choice&&debug.serial==g_producer_debug.serial)return;
+    const auto offset=g_context_clock.logical(g_head.load(std::memory_order_relaxed));
+    if(offset<g_producer_context_offset){std::fprintf(stderr,"GX producer context clock moved backwards\n");std::abort();}
+    const detail::GxDecodeChange change{offset,choice,debug,offset};
+    while(!g_context_marks.push(change)){
+        if(g_stop.load(std::memory_order_relaxed))return;
+        // Distinct marker offsets imply intervening published bytes. The worker
+        // consumes metadata even when those bytes end in a partial command.
+        // Same-offset marks coalesce and cannot exhaust the bounded ring.
+        g_wake_cv.notify_one();g_context_space.wait_for(lock,std::chrono::milliseconds(10));
+    }
+    g_producer_choice=choice;g_producer_debug=debug;g_producer_context_offset=offset;
+}
+void record_context_fence(uint64_t head){
+    if(!decode_debug_enabled())return;
+    std::lock_guard lock(G);g_last_fence_head=head;g_last_fence_begin=g_pending_begin_abs;g_last_fence_bytes=g_pending.size();g_last_fence_need=g_need;
+}
 
 inline void cpu_relax() {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
@@ -246,6 +340,7 @@ void gx_thread_main() {
             memcpy(g_pending.data() + old, g_ring + at, first);
             if (n > first) memcpy(g_pending.data() + old + first, g_ring, n - first);
             g_taken.store(h, std::memory_order_release);
+            if(gx_scoped_context_enabled())ingest_context_marks(h);
             process_pending();
         }
         taken = h;
@@ -263,7 +358,7 @@ void stop_gx_thread() {
         std::lock_guard<std::mutex> lk(WM);
         g_stop.store(true);
     }
-    g_wake_cv.notify_all();
+    g_wake_cv.notify_all();g_context_space.notify_all();
     g_gx_thread->join();
 }
 
@@ -277,13 +372,32 @@ void start_gx_thread() {
 
 } // namespace
 
+bool gx_scoped_context_enabled(){
+    static const bool enabled=[] {const auto* value=std::getenv("SSNE_GX_SCOPED_CONTEXT");return !value || std::strcmp(value,"1")==0;}();
+    return enabled;
+}
+void gx_mark_decode_context(const GxDecodeContext& context){if(gx_scoped_context_enabled())enqueue_context_choice({true,context});}
+void gx_mark_decode_context_debug(const GxDecodeContext& context,const GxDecodeMarkerDebug& debug){if(gx_scoped_context_enabled())enqueue_context_choice({true,context},debug);}
+GxDecodeDebugState gx_decode_debug_state(){
+    // Decoder-only: G is already held, including for recursive display lists.
+    GxDecodeDebugState state;if(g_decode_source){state.marker=g_decode_source->debug;state.marker_offset=g_decode_source->marker_offset;}
+    state.opcode_start=g_decode_opcode_start;state.opcode=g_decode_opcode;state.depth=g_decode_depth;
+    state.raw_head=g_head.load();state.raw_taken=g_taken.load();state.raw_done=g_done.load();
+    state.pending_begin=g_pending_begin_abs;state.pending_bytes=g_pending.size();state.pending_need=g_need;
+    state.last_fence_head=g_last_fence_head;state.last_fence_pending_begin=g_last_fence_begin;state.last_fence_pending_bytes=g_last_fence_bytes;state.last_fence_need=g_last_fence_need;return state;
+}
+void gx_clear_decode_context(){if(gx_scoped_context_enabled())enqueue_context_choice({});}
+const GxDecodeContext* gx_decode_context_override(){return g_decode_override;}
+
 void gx_set_threaded(bool on) {
     if (!g_started) g_threaded = on && getenv("SSNE_GX_SYNC") == nullptr;
 }
 
 void gx_sync() {
+    // Capture even the early-complete path: g_done includes partial headers.
+    struct FenceSnapshot {uint64_t head;~FenceSnapshot(){record_context_fence(head);}} snapshot{g_head.load()};
     if (!g_gx_thread) return;
-    uint64_t h = g_head.load();
+    uint64_t h = snapshot.head;
     if (g_done.load() >= h) return;
     for (int i = 0; i < 4000; i++) {
         if (g_done.load(std::memory_order_acquire) >= h) return;
@@ -303,7 +417,11 @@ void gx_fifo_write(uint32_t value, int size) {
         size_t old = g_pending.size();
         g_pending.resize(old + size_t(size));
         for (int k = 0; k < size; k++) g_pending[old + size_t(k)] = uint8_t(value >> (8 * (size - 1 - k)));
-        process_pending();
+        if(gx_scoped_context_enabled()){
+            const auto h=g_head.load(std::memory_order_relaxed)+uint64_t(size);
+            g_head.store(h,std::memory_order_release);g_taken.store(h,std::memory_order_release);
+            ingest_context_marks(h);process_pending();g_done.store(h,std::memory_order_release);
+        }else process_pending();
         return;
     }
     uint64_t h = g_head.load(std::memory_order_relaxed);
@@ -355,7 +473,14 @@ void gx_state_save(StateWriter& w) {
     gx_sync();
     std::lock_guard<std::mutex> lk(G);
     std::lock_guard<std::mutex> lp(PM);
-    w.tag("GX01");
+    const bool scoped=gx_scoped_context_enabled();
+    std::vector<detail::GxDecodeChange> changes;
+    if(scoped){ingest_context_marks(g_head.load());compact_context_pending();changes=g_decode_timeline.pending_state(g_pending_begin_abs,g_pending_begin_abs+g_pending.size());}
+    // Unmarked/live-only decoding needs no extension. Preserve byte-compatible
+    // GX01 for SP and other modes, including when support is enabled by default.
+    // A known pending prefix OR a known next-opcode choice still needs GX02.
+    const bool known_context=std::any_of(changes.begin(),changes.end(),[](const auto& change){return change.choice.marked;});
+    w.tag(known_context?"GX02":"GX01");
     w.bytes(g.cp, sizeof(g.cp)); w.bytes(g.xf_mem, sizeof(g.xf_mem)); w.bytes(g.xf_reg, sizeof(g.xf_reg));
     w.bytes(g.bp, sizeof(g.bp)); w.u32(g.bp_mask);
     w.block(g.tmem, sizeof(g.tmem));
@@ -364,22 +489,49 @@ void gx_state_save(StateWriter& w) {
     int16_t regs[4][4], konst[4][4];
     tev_regs_access(regs, konst, false);
     w.bytes(regs, sizeof(regs)); w.bytes(konst, sizeof(konst));
+    if(known_context){
+        w.u32(1);w.u32(uint32_t(changes.size()));
+        for(const auto& change:changes){w.u64(change.offset);w.u32(detail::gx_decode_choice_bits(change.choice));}
+    }
 }
 
 bool gx_state_load(StateReader& r, bool apply) {
     gx_sync();
     std::lock_guard<std::mutex> lk(G);
     std::lock_guard<std::mutex> lp(PM);
-    if (!r.tag("GX01")) return false;
+    const bool scoped_state=r.ok&&r.pos<=r.n&&r.n-r.pos>=4&&std::memcmp(r.p+r.pos,"GX02",4)==0;
+    if(scoped_state){
+        if(!gx_scoped_context_enabled()){std::fprintf(stderr,"GX02 context state requires SSNE_GX_SCOPED_CONTEXT=1\n");return false;}
+        if(!r.tag("GX02"))return false;
+    }else if (!r.tag("GX01")) return false;
     r.bytes(apply ? g.cp : nullptr, sizeof(g.cp)); r.bytes(apply ? g.xf_mem : nullptr, sizeof(g.xf_mem)); r.bytes(apply ? g.xf_reg : nullptr, sizeof(g.xf_reg));
     r.bytes(apply ? g.bp : nullptr, sizeof(g.bp)); const auto mask = r.u32(); if (apply) g.bp_mask = mask;
     if (!r.block(apply ? g.tmem : nullptr, sizeof(g.tmem))) return false;
-    if (apply) r.vec(g_pending); else r.skip_vec();
+    const auto pending_bytes=r.u64();
+    if(!r.ok||pending_bytes>r.n-r.pos)return false;
+    std::vector<uint8_t> loaded_pending;
+    if(apply){loaded_pending.resize(size_t(pending_bytes));if(!r.bytes(loaded_pending.data(),loaded_pending.size()))return false;}
+    else if(!r.bytes(nullptr,size_t(pending_bytes)))return false;
     r.bytes(apply ? g_pe : nullptr, sizeof(g_pe));
     int16_t regs[4][4], konst[4][4];
     r.bytes(regs, sizeof(regs)); r.bytes(konst, sizeof(konst));
+    std::vector<detail::GxDecodeChange> loaded_context{{0,{}}};
+    if(scoped_state){
+        if(r.u32()!=1)return false;const auto count=r.u32();if(!r.ok||count<1||count>2)return false;
+        loaded_context.clear();loaded_context.reserve(count);
+        for(unsigned i=0;i<count;++i){detail::GxDecodeChange change;change.offset=r.u64();if(!detail::gx_decode_choice_from_bits(r.u32(),change.choice))return false;loaded_context.push_back(change);}
+        if(!detail::valid_gx_decode_pending_state(loaded_context,pending_bytes))return false;
+    }
     if (!r.ok) return false;
     if (!apply) return true;
+    g_pending=std::move(loaded_pending);
+    if(gx_scoped_context_enabled()){
+        std::lock_guard context_lock(g_context_mutex);g_context_marks.clear();
+        g_context_clock.restore(g_head.load(),g_pending.size());g_pending_begin_abs=0;
+        g_decode_timeline.restore_pending(loaded_context);g_producer_choice=g_decode_timeline.at(g_pending.size());g_producer_debug={};
+        g_producer_context_offset=g_pending.size();
+        if(!scoped_state&&!g_pending.empty())std::fprintf(stderr,"GX01 pending prefix uses explicit legacy/live decode fallback\n");
+    }
     custom_crosshair_reset_stream(); // Private tickets/config are not guest state; stale queued tags fall back safely.
     g_need=0; // state files preserve pending bytes, not derived parser thresholds
     tev_regs_access(regs, konst, true);

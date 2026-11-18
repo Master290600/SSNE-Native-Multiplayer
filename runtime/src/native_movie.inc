@@ -5,6 +5,7 @@ NativeMovieState movie_state;
 std::atomic<bool> movie_vote_gate{false};
 uint64_t movie_skip_pending=0;
 uint64_t applied_movie_sequence=0;
+std::chrono::steady_clock::time_point movie_catchup_due{};
 PPCFunc movie_start_original=nullptr,movie_stop_original=nullptr,movie_update_original=nullptr,movie_playing_original=nullptr;
 bool movie_asset_valid(const std::string& name){return !name.empty() && name.size()<=96 && name.find("..") == std::string::npos && std::all_of(name.begin(),name.end(),[](unsigned char c){return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='-'||c=='.';});}
 struct MovieScratch {uint32_t address;std::array<uint8_t,2048> bytes;MovieScratch(PPCContext& c):address(c.r[1]-2048){for(unsigned i=0;i<bytes.size();++i)bytes[i]=mem_read8(address+i);}~MovieScratch(){for(unsigned i=0;i<bytes.size();++i)mem_write8(address+i,bytes[i]);}};
@@ -41,10 +42,35 @@ void movie_playing_hook(PPCContext& ctx){
 void movie_update_hook(PPCContext& ctx){
     if(replica && native_movie_presenting() && ctx.r[3]==mem_read32(movie_scene+0x80)){
         const auto resource=ctx.r[3],bink=mem_read32(resource+0x10);
-        // Decode locally up to the host's next frame, at most four per tick.
-        // Holding here also prevents a shorter local clock from ending early.
-        for(unsigned i=0;i<4 && readable(bink,0x20) && mem_read32(bink+0xC)<movie_target_frame && mem_read32(bink+0xC)<mem_read32(bink+8);++i){auto call=ctx;call.r[3]=resource;ssne_call(call,0x80132EF8u);}
-        ctx.r[3]=0;return;
+        if(!readable(bink,0x20)){ctx.r[3]=0;return;}
+        const uint32_t total=mem_read32(bink+8);
+        const uint32_t frame=mem_read32(bink+0xC);
+        const uint32_t target=std::min(total,movie_target_frame);
+        const uint32_t rate=mem_read32(bink+0x14), divisor=mem_read32(bink+0x18);
+        const double fps=rate && divisor ? std::clamp(double(rate)/divisor,1.,240.) : 30.;
+        const auto lead=uint32_t(std::ceil(.1*fps));
+        // Let the original BinkWait service audio and pace each decoded frame.
+        // The host owns the last frame and bounds local playback to 100 ms
+        // beyond its last clock sample if the transport or host stalls.
+        if(!target || !total || frame>=total || (frame+1==total && target<total) ||
+           (frame>target && frame-target>=lead)){ctx.r[3]=0;return;}
+        ssne_call_original(ctx,0x80133160u,movie_update_original);
+        if(mem_read32(resource+0x10)!=bink)return;
+        const uint32_t after=mem_read32(bink+0xC);
+        if(target<=after || target-after<=lead)return;
+
+        // A client joining mid-film needs the intermediate prediction frames.
+        // Bound the burst on a real tick; small differences use native pacing.
+        const auto now=std::chrono::steady_clock::now();
+        if(now<movie_catchup_due)return;
+        movie_catchup_due=now+std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(.5/fps));
+        const unsigned extra=target-after>uint32_t(std::ceil(fps)) ? 3u : 1u;
+        const uint32_t limit=target==total ? total : target-lead;
+        for(unsigned i=0;i<extra && mem_read32(bink+0xC)<limit;++i){
+            auto call=ctx;call.r[3]=resource;ssne_call(call,0x80132EF8u);
+            if(std::chrono::steady_clock::now()-now>=std::chrono::milliseconds(4))break;
+        }
+        return;
     }
     ssne_call_original(ctx,0x80133160u,movie_update_original);
 }
@@ -58,11 +84,13 @@ void install_movie_hooks(){
 bool apply_movie(PPCContext& ctx,const NativeMovieState& desired,std::string& error){
     if(!desired.active && !native_movie_presenting()){movie_state=desired;movie_target_frame=0;return true;}
     if(!replica || ctx.r[13]!=0x802E22A0u || !readable(ctx.r[1]-2048,2048) || !readable(movie_scene,0x94) || (desired.active && (!desired.sequence || !movie_asset_valid(desired.asset) || desired.frame>1000000))){error="Invalid native movie presentation";return false;}
-    MovieScratch scratch(ctx);auto call=ctx;call.r[1]-=0x200;mem_write32(call.r[1],ctx.r[1]);
     if(native_movie_presenting() && (!desired.active || applied_movie_sequence!=desired.sequence)){
+        MovieScratch scratch(ctx);auto call=ctx;call.r[1]-=0x200;mem_write32(call.r[1],ctx.r[1]);
         call.r[3]=movie_scene;ssne_call(call,0x80167A2Cu);
     }
     if(desired.active && (!native_movie_presenting() || applied_movie_sequence!=desired.sequence)){
+        MovieScratch scratch(ctx);auto call=ctx;call.r[1]-=0x200;mem_write32(call.r[1],ctx.r[1]);
+        movie_catchup_due={};
         // A client never runs level scripts; its movie queue must be empty.
         if(mem_read32(ctx.r[13]-0x54CC)){error="Unexpected pending replica movie";return false;}
         for(unsigned i=0;i<=desired.asset.size();++i)mem_write8(call.r[1]+0x80+i,i<desired.asset.size()?desired.asset[i]:0);

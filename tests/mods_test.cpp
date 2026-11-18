@@ -17,6 +17,7 @@ namespace ssne {
 void install_ammo_rule_hooks() {}
 void native_entity_hooks_installed(bool) {}
 void notify_native_entity(NativeEntityNotice) {}
+void notify_native_entity(PPCContext&, NativeEntityNotice notice) { notify_native_entity(notice); }
 uint32_t guest_ram_size() { return kRamSize; }
 uint32_t guest_ram_end() { return 0x80000000u + kRamSize; }
 bool replica_simulation() { return test_replica; }

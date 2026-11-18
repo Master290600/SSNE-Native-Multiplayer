@@ -1,4 +1,5 @@
 #include "native_menu_carousel.h"
+#include "coop/custom_level_menu.h"
 #include "ssne/recomp_hooks.h"
 #include <algorithm>
 #include <array>
@@ -157,6 +158,7 @@ std::string native_carousel_mouse_diagnostics(){
             out<<"{\"gui\":"<<s.gui<<",\"node\":"<<s.node<<",\"selected\":"<<s.selected
                <<",\"count\":"<<s.count<<",\"category\":"<<word(s.owner+0x48)
                <<",\"category_enabled\":"<<(s.category?"true":"false")
+               <<",\"custom_active\":"<<(coop::custom_level_menu_active() && coop::custom_level_menu_gui()==s.gui?"true":"false")
                <<",\"selected_level\":\""<<authored_level(s,s.selected)<<"\",\"entries\":[";
             for(unsigned i=0;i<s.count;++i){if(i)out<<',';out<<"{\"index\":"<<i<<",\"level\":\""<<authored_level(s,i)<<"\"}";}
             out<<"]}";

@@ -267,7 +267,7 @@ bool GameBuilder::build(const BuildKit& kit, const std::string& data_dir, const 
     fs::create_directories(logs, ec);
     fs::create_directories(obj, ec);
     log_path = S(logs / "build.log");
-    log("SSNE-Native game build");
+    log("SSNE-RECOOP-Native game build");
 
     // 1. Compiler
     report("Preparing the compiler", 0);
@@ -440,23 +440,30 @@ bool native_source_cache(const fs::path& root,const std::string& generation,std:
         for(const auto& f:*files){if(cancel)return false;const auto name=native_required_string(f,"name");if(fs::path(name).filename()!=fs::path(name)||!expected.insert(name).second)return false;if(native_hash(root/P(name))!=native_required_string(f,"sha256"))return false;}return true;
     }catch(...){return false;}
 }
-const std::vector<std::string> native_publish_names={"SSNE-Native-Multiplayer-Game.exe","SSNE-Native-Multiplayer.exe","release-manifest.json","native-build.json"};
+const std::vector<std::string> native_publish_names={launcher::native_legacy_exe,launcher::native_legacy_alias,"release-manifest.json","native-build.json",launcher::native_project_exe};
 bool native_publish_name(const std::string& name){return std::find(native_publish_names.begin(),native_publish_names.end(),name)!=native_publish_names.end();}
+fs::path native_target_path(const fs::path& dir,const std::string& name){
+    const auto parent = name == launcher::native_project_exe ? dir.parent_path() : dir;
+    const auto target = parent / P(name);
+    native_need(native_contained(parent,target),"native target is outside the installation: "+S(target));
+    return target;
+}
 void native_recover_publish(const fs::path& dir){
     const auto stage=dir/".native-build-transaction";if(!fs::exists(stage))return;
     // All old/new filenames are a fixed allowlist; never follow journal paths.
     const auto journal=stage/"journal.json";
     if(!fs::exists(journal)){native_need(!fs::exists(stage/"old")||fs::is_empty(stage/"old"),"unfinished native publication has rollback files without a journal; keep them for repair review: "+S(stage));native_remove_tree(dir,stage);return;}
-    auto record=native_read_json(journal);const auto items_value=record.find("items");auto items=items_value?items_value->array():nullptr;native_need(items&&items->size()==native_publish_names.size(),"invalid native rollback journal");
+    auto record=native_read_json(journal);const auto items_value=record.find("items");auto items=items_value?items_value->array():nullptr;
+    native_need(items&&(items->size()==4||items->size()==native_publish_names.size()),"invalid native rollback journal");
     const auto state=native_required_string(record,"state");native_need(state=="prepared"||state=="committed","invalid native publication state");std::set<std::string> names;
-    for(const auto& item:*items){const auto name=native_required_string(item,"name");native_need(native_publish_name(name)&&names.insert(name).second,"unsafe/duplicate native rollback filename");const auto target=dir/P(name),backup=stage/"old"/P(name);const auto old=native_required_string(item,"old_sha256"),fresh=native_required_string(item,"new_sha256");
+    for(const auto& item:*items){const auto name=native_required_string(item,"name");native_need(native_publish_name(name)&&(items->size()!=4||name!=launcher::native_project_exe)&&names.insert(name).second,"unsafe/duplicate native rollback filename");const auto target=native_target_path(dir,name),backup=stage/"old"/P(name);const auto old=native_required_string(item,"old_sha256"),fresh=native_required_string(item,"new_sha256");
         if(state=="committed"){native_need(fs::is_regular_file(target)&&native_hash(target)==fresh,"committed native target changed; preserve rollback files for review");continue;}
         if(native_true(item,"old_existed")){
             if(fs::exists(backup))native_need(native_hash(backup)==old&&(!fs::exists(target)||native_hash(target)==fresh||native_hash(target)==old),"native rollback files changed; stop for review");
             else native_need(fs::exists(target)&&native_hash(target)==old,"native rollback copy is missing; stop for review");
         }else native_need(!fs::exists(target)||native_hash(target)==fresh,"new native target changed; stop for review");
     }
-    if(state!="committed")for(auto it=items->rbegin();it!=items->rend();++it){const auto name=native_required_string(*it,"name");const auto target=dir/P(name),backup=stage/"old"/P(name);
+    if(state!="committed")for(auto it=items->rbegin();it!=items->rend();++it){const auto name=native_required_string(*it,"name");const auto target=native_target_path(dir,name),backup=stage/"old"/P(name);
         if(native_true(*it,"old_existed")){if(fs::exists(backup))native_replace(backup,target);}else if(fs::exists(target)){std::error_code ec;fs::remove(target,ec);native_need(!ec,"cannot remove rolled-back target "+S(target));}}
     native_remove_tree(dir,stage);
 }
@@ -466,15 +473,17 @@ void native_publish(const launcher::RuntimeKit& kit,const fs::path& candidate,co
     if(fs::exists(dir/"release-manifest.json")){try{auto old=native_read_json(dir/"release-manifest.json");if(old.object())manifest=std::move(old);}catch(...){}}
     auto& m=*manifest.object();m["build"]=kit.build;m["protocol"]=kit.protocol;m["entrypoint"]="native";m["destination"]="SSNE-Native-Multiplayer-Game.exe";m["renderer"]="gpu";m["product_sha256"]=hash;m["entrypoint_sha256"]=hash;m["kit_descriptor_sha256"]=kit.descriptor_sha256;
     m["acceptance"]="Locally rebuilt from the owned PAL disc; native gameplay verification is separate from build success.";
-    NativeJSON receipt=NativeJSON::Object{{"schema",1},{"fingerprint",kit.fingerprint},{"exe_sha256",hash},{"descriptor_sha256",kit.descriptor_sha256},{"build",kit.build},{"protocol",kit.protocol}};
+    m["project_executable"]=launcher::native_project_exe;
+    NativeJSON receipt=NativeJSON::Object{{"schema",1},{"project_executable",launcher::native_project_exe},{"fingerprint",kit.fingerprint},{"exe_sha256",hash},{"descriptor_sha256",kit.descriptor_sha256},{"build",kit.build},{"protocol",kit.protocol}};
+    if (!kit.ps2_content_sha256.empty()) (*receipt.object())["ps2_content_sha256"]=kit.ps2_content_sha256;
     bool journal_written=false;
     try{
-        for(unsigned i=0;i<2;++i){native_need(!cancel,"cancelled");fs::copy_file(candidate,stage/"new"/P(native_publish_names[i]));}
+        for(const auto* name:{launcher::native_project_exe,launcher::native_legacy_exe,launcher::native_legacy_alias}){native_need(!cancel,"cancelled");fs::copy_file(candidate,stage/"new"/name);}
         native_write_json(stage/"new/release-manifest.json",manifest);native_write_json(stage/"new/native-build.json",receipt);
-        NativeJSON::Array entries;for(const auto& name:native_publish_names){const auto target=dir/P(name);const bool existed=fs::exists(target);entries.emplace_back(NativeJSON::Object{{"name",name},{"old_existed",existed},{"old_sha256",existed?native_hash(target):std::string{}},{"new_sha256",native_hash(stage/"new"/P(name))}});}
+        NativeJSON::Array entries;for(const auto& name:native_publish_names){const auto target=native_target_path(dir,name);const bool existed=fs::exists(target);entries.emplace_back(NativeJSON::Object{{"name",name},{"old_existed",existed},{"old_sha256",existed?native_hash(target):std::string{}},{"new_sha256",native_hash(stage/"new"/P(name))}});}
         NativeJSON journal=NativeJSON::Object{{"state","prepared"},{"items",entries}};native_write_json(stage/"journal.json",journal);journal_written=true;
-        for(const auto& name:native_publish_names){native_need(!cancel,"cancelled");const auto target=dir/P(name);if(fs::exists(target))fs::rename(target,stage/"old"/P(name));native_need(!cancel,"cancelled");fs::rename(stage/"new"/P(name),target);}
-        native_need(!cancel,"cancelled");for(const auto& entry:entries)native_need(native_hash(dir/P(native_required_string(entry,"name")))==native_required_string(entry,"new_sha256"),"published native file differs");
+        for(const auto& name:native_publish_names){native_need(!cancel,"cancelled");const auto target=native_target_path(dir,name);if(fs::exists(target))fs::rename(target,stage/"old"/P(name));native_need(!cancel,"cancelled");fs::rename(stage/"new"/P(name),target);}
+        native_need(!cancel,"cancelled");for(const auto& entry:entries)native_need(native_hash(native_target_path(dir,native_required_string(entry,"name")))==native_required_string(entry,"new_sha256"),"published native file differs");
         (*journal.object())["state"]="committed";native_write_json(stage/"journal.json",journal);
     }catch(...){if(journal_written)native_recover_publish(dir);else native_remove_tree(dir,stage);throw;}
     // Committed targets are verified. A cleanup failure may leave only a
@@ -484,7 +493,22 @@ void native_publish(const launcher::RuntimeKit& kit,const fs::path& candidate,co
 std::string native_rsp(std::string arg){native_need(arg.find_first_of("\r\n\0",0,3)==std::string::npos,"invalid newline/NUL in linker argument");std::replace(arg.begin(),arg.end(),'\\','/');std::string out="\"";for(char c:arg){if(c=='"')out+='\\';out+=c;}return out+"\"\n";}
 }
 
-std::string BuildKit::output_exe(const std::string& project) const{return target==BuildTarget::NativeMultiplayer?S(P(runtime.project_dir)/"Multiplayer/SSNE-Native-Multiplayer-Game.exe"):S(P(project)/platform::port_exe_name());}
+std::string BuildKit::output_exe(const std::string& project) const{
+    return target==BuildTarget::NativeMultiplayer ? S(P(runtime.project_dir)/launcher::native_project_exe) : S(P(project)/platform::port_exe_name());
+}
+std::string BuildKit::play_exe(const std::string& project) const{
+    const auto output = output_exe(project);
+    if(target!=BuildTarget::NativeMultiplayer) return output;
+    const auto dir = P(runtime.project_dir)/"Multiplayer";
+    const auto legacy = dir/launcher::native_legacy_exe;
+    if(!exists(S(legacy))) return output;
+    // Older installations can also have an unrelated standalone game in the root.
+    // The publisher records ownership of the root executable in the release manifest.
+    try {
+        if(!native_read_json(dir/"release-manifest.json").find("project_executable")) return S(legacy);
+    } catch(const std::exception&) { /* Readiness validation reports broken metadata. */ }
+    return output;
+}
 std::string BuildKit::working_directory(const std::string& project) const{return target==BuildTarget::NativeMultiplayer?S(P(runtime.project_dir)/"Multiplayer"):project;}
 std::string BuildKit::target_fingerprint() const{return target==BuildTarget::NativeMultiplayer?runtime.fingerprint:"standard:"+version;}
 bool select_build_target(const BuildKit& base,const std::string& project,const std::string& data,BuildKit& selected,std::string& error){
@@ -510,7 +534,7 @@ bool GameBuilder::build_native(const BuildKit& kit,const std::string& data,const
         native_need(fs::weakly_canonical(P(kit.compiler))==fs::weakly_canonical(P(native.compiler))&&fs::weakly_canonical(P(kit.toolchain_dir))==fs::weakly_canonical(P(native.project_dir)/"build-kit/toolchain"),"base compiler/toolchain path differs from the pinned native toolchain");
         const auto work=P(kit.dir)/"native-multiplayer-work";fs::create_directories(work/"logs");NativeBuildLock lock(work/"build.lock");log_path=S(work/"logs/build.log");log("Native multiplayer build "+native.fingerprint);
         native_need(!cancel,"cancelled");report("Verifying the native runtime",0);native_need(launcher::verify_runtime_kit(native,false,error),error);
-        const auto destination=P(output).parent_path();fs::create_directories(destination);native_recover_publish(destination);
+        const auto destination=P(native.project_dir)/"Multiplayer";native_need(native_contained(P(native.project_dir),destination),"Multiplayer directory is outside the installation");fs::create_directories(destination);native_recover_publish(destination);
         report("Preparing the compiler",0);native_need(get_toolchain(kit,report,cancel,error),error);native_need(launcher::verify_runtime_kit(native,true,error),error);
         const auto generation=launcher::runtime_text_sha256("native-source-v1\n"+native.dol_sha256+"\n"+native.recompiler_sha256+"\n"+native.recipe_sha256+"\n"+native.symbols_sha256);
         // Full SHA256 remains in source/object receipts; short folder names keep Windows paths below MAX_PATH.
@@ -557,6 +581,30 @@ bool GameBuilder::build_native(const BuildKit& kit,const std::string& data,const
         std::string response;for(const auto& arg:link)response+=native_rsp(arg);native_write(work/"link.rsp",response);const auto candidate=work/"game.pending.exe";std::error_code ec;fs::remove(candidate,ec);
         if(!run({native.compiler,"@"+S(work/"link.rsp"),"-o",S(candidate)},S(work),S(work/"logs/link.log"),cancel,error))throw std::runtime_error("linking the native game failed: "+error);
         std::ifstream pe(candidate,std::ios::binary);char mz[2]{};native_need(bool(pe.read(mz,2))&&mz[0]=='M'&&mz[1]=='Z',"compiler did not produce a native executable");pe.close();native_need(!cancel,"cancelled");
-        report("Verifying and publishing the native game",.9);native_need(launcher::verify_runtime_kit(native,true,error),error);native_publish(native,candidate,destination,cancel);log("Native game published: "+output);report("Done",1);error.clear();return true;
+        report("Verifying the native game",.9);
+        native_need(launcher::verify_runtime_kit(native,true,error),error);
+        const auto content_pending=destination/".ps2-content-pending";
+        if (!native.ps2_content_sha256.empty()) {
+            native_need(!cancel,"cancelled");
+            report("Installing PS2 maps and characters",.95);
+            const auto ps2=P(native.project_dir)/"Extras/PS2";
+            const auto import_log=work/"logs/ps2-import.log";
+            // A stopped or failed repair must not leave an old game receipt
+            // claiming its partially restored files are ready to play.
+            native_write(content_pending,native.ps2_content_sha256+"\n");
+            native_write(import_log,"");
+            if (!run({S(ps2/"runtime/python.exe"),"-I","-B","-u",S(ps2/"import_ps2.py"),"--game",native.project_dir},
+                     native.project_dir,S(import_log),cancel,error)) {
+                if (cancel) throw std::runtime_error("cancelled");
+                std::ifstream messages(import_log);
+                std::string line;
+                while (std::getline(messages,line)) if (!line.empty()) error=line;
+                throw std::runtime_error("PS2 content installation failed: "+error);
+            }
+        }
+        report("Publishing the native game",.99);
+        native_publish(native,candidate,destination,cancel);
+        if (!native.ps2_content_sha256.empty()) fs::remove(content_pending);
+        log("Native game published: "+output);report("Done",1);error.clear();return true;
     }catch(const std::exception& e){error=e.what();if(!log_path.empty())log("error: "+error);return false;}
 }

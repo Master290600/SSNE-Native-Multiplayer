@@ -17,6 +17,24 @@ struct PlayerInput {
     float lx = 0, ly = 0, cx = 0, cy = 0;
 };
 
+// Chat consumes a press until every button and trigger has been released.
+class ControllerReleaseGate {
+    bool blocked_=false;
+public:
+    void suppress(){blocked_=true;}
+    void clear(){blocked_=false;}
+    bool ready(SDL_GameController* controller){
+        if(!blocked_)return true;
+        if(controller){
+            for(int button=0;button<SDL_CONTROLLER_BUTTON_MAX;++button)
+                if(SDL_GameControllerGetButton(controller,SDL_GameControllerButton(button)))return false;
+            if(SDL_GameControllerGetAxis(controller,SDL_CONTROLLER_AXIS_TRIGGERLEFT)>4000 ||
+               SDL_GameControllerGetAxis(controller,SDL_CONTROLLER_AXIS_TRIGGERRIGHT)>4000)return false;
+        }
+        blocked_=false;return true;
+    }
+};
+
 // A controller's part of its player's input.
 inline void sample_controller(const Settings& settings, SDL_GameController* c, PlayerInput& in, bool control, bool held_jump) {
     for (int a = port::kFirstButtonAction; a < port::ACT_COUNT; a++) {

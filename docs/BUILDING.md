@@ -23,7 +23,7 @@ The output is statically linked and needs only standard Windows DLLs (msvcrt, Op
 player's PC, so everything runs on Windows 7 SP1 / 8.1 / 10 / 11 without the UCRT update; check a build with
 `llvm-readobj --coff-imports` (no `api-ms-win-crt-*` DLLs).
 
-### Windows release (launcher + build kit)
+### Base Windows package (launcher + standard build kit)
 ```sh
 tools/make_public_release.sh <out_dir> /opt/llvm-mingw
 ```
@@ -68,7 +68,7 @@ manual builds: `-DSSNE_PGO_GENERATE=ON` (instrument) and `-DSSNE_PGO_PROFILE=<fi
 1. Install your disc with the launcher, or run `gctool extract game.iso game_data`.
 2. Translate the executable:
    ```sh
-   ssne-recomp game_data/sys/main.dol recompiled --map data/symbols/G3BE9G_r1.sym
+   build/bin/build-kit/SSNE-RECOOP-Native game_data/sys/main.dol recompiled --map data/symbols/G3BE9G_r1.sym
    ```
    Expected output for USA Rev 1: `functions: 7919, jump tables: 23`, `translated 489232 instructions, 23 unimplemented`.
    The 23 "unimplemented" entries are zero words in padding and are never executed.
@@ -88,26 +88,12 @@ results (bl/blr, bdnz, rlwinm incl. wrap masks, CR logic, floats, bctrl, switch 
 
 ## Integrated Windows native-multiplayer package
 
-Build `ssne-launcher` with CMake as above. Its native patch engine uses
-`launcher/src/translation_patch.cpp`; player installs do not invoke Python.
-The reviewed runtime descriptor/payload and `launcher-kit.json` bind the sparse
-`translation-recipe.json`, PAL symbol map, tools and original disc hashes.
-`tools/make_multiplayer_launcher_recipe.py` is a developer-only recipe generator
-from private recompiler/reference outputs; keep those generated bodies private.
+Build `ssne-launcher` with CMake as above. The Windows 1.2.8 package pairs the launcher with the multiplayer runtime for build 242 / protocol 70, the sparse PAL translation recipe, the C++ toolchain and the PS2 content pack. The content installer uses the Python runtime included in the Windows ZIP.
 
-After producing/reviewing the runtime kit and recipe, assemble a separate clean
-launcher package with `tools/package_native_launcher.py --base <existing-clean-kit>
---launcher <build/bin/SSNE-Native.exe> --recipe <translation-recipe.json>
---sidecar <launcher-kit.json> --output <new-folder>`. The package includes source
-and runtime-only objects, never extracted data, translated game objects, built
-game executables, settings, memory cards or compiler caches. The standard
-`make_public_release.sh` builds the original standard package; it does not
-assemble the additional reviewed multiplayer kit.
+For a complete distribution base, use the Windows x64 asset from the [1.2.8 release](https://github.com/Master290600/SSNE-Native-Multiplayer/releases/tag/v1.2.8). Its `Extras/PS2/` directory contains the content payload. The matching installer source and checksums are in `data/release/ps2/` in this checkout. The game is compiled from the player's European GameCube disc. Build Game also restores the shared GameCube resources used by the additional maps from that disc.
+
+`tools/package_native_launcher.py` assembles historical multiplayer kits up to build 229. `tools/make_public_release.sh` assembles the standard build kit. The Windows 1.2.8 release asset includes the multiplayer kit and content pack needed for a fresh install.
 
 ## Public fork release identity
 
-The public Windows launcher uses version 1.2.7.201 and the release feed for
-Master290600/SSNE-Native-Multiplayer. A developer fork can set
-`-DSSNE_UPDATE_REPOSITORY=owner/repository` at configuration time. The value must
-be an owner/repository pair. Public CI builds synthetic/component tests without
-a disc; complete local game builds still require the player-owned PAL image.
+The Windows launcher uses version 1.2.8 and the update feed for Master290600/SSNE-Native-Multiplayer. A developer fork can set `-DSSNE_UPDATE_REPOSITORY=owner/repository` at configuration time. The public CI exercises synthetic discs and component tests. A full local game build uses the supported PAL disc image.

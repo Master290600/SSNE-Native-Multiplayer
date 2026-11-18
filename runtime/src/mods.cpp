@@ -213,6 +213,7 @@ void update_targets(unsigned player, float dt);
 bool aim_held = false, aim_enabled = false;
 unsigned target = 0;
 auto camera_time = std::chrono::steady_clock::time_point{};
+std::optional<ModViewCamera> local_view_camera;
 PPCFunc create_fn, register_fn, remove_fn, camera_fn;
 PPCFunc bounds_fn;
 void original(unsigned addr, PPCFunc fn, PPCFunc hook, PPCContext &c) {
@@ -249,7 +250,7 @@ void register_hook(PPCContext &c) {
   }
 }
 void remove_hook(PPCContext &c) {
-  notify_native_entity({NativeEntityNotice::Event::Removing,c.r[4]});
+  notify_native_entity(c,{NativeEntityNotice::Event::Removing,c.r[4]});
   {
     std::lock_guard<std::recursive_mutex> guard(lock);
     enemies.erase(c.r[4]);
@@ -307,6 +308,20 @@ void camera_hook(PPCContext &c) {
   }
   std::lock_guard<std::recursive_mutex> guard(lock);
   if (local_netplay_port>=0 && (!netplay_world_ready() || camera_port!=local_netplay_port)) return;
+  // The tactical HUD needs only the final local view, not enemy/ESP scans.
+  // Publish a small immutable value before the optional cheat-work early exit.
+  if(local_netplay_port>=0 && netplay_render_local() && !netplay_render_discard()) {
+    ModViewCamera snapshot;snapshot.local_player=local_netplay_port;
+    bool finite=true;
+    for(unsigned i=0;i<12;++i){snapshot.view[i]=u2f(mem_read32(game_address(0x80291A54)+i*4));finite&=std::isfinite(snapshot.view[i]);}
+    snapshot.projection_x=u2f(mem_read32(game_address(0x80291BE0)));
+    snapshot.projection_y=u2f(mem_read32(game_address(0x80291BE0)+20));
+    const float scale=fov()>0?std::tan(63.f*.008726646f)/std::tan(fov()*.008726646f):1.f;
+    snapshot.projection_x*=scale/widescreen();snapshot.projection_y*=scale;
+    snapshot.sampled_ms=uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if(finite && std::isfinite(snapshot.projection_x) && std::isfinite(snapshot.projection_y) && snapshot.projection_x>0 && snapshot.projection_y>0)local_view_camera=snapshot;
+    else local_view_camera.reset();
+  }
   if (!state.options.aimbot && !state.options.esp && !state.options.item_esp &&
       !state.options.bone_esp) {
     markers.clear();
@@ -831,7 +846,7 @@ void enemy_hook(PPCContext &c) {
   }
 }
 void exit_hook(PPCContext &c) {
-  notify_native_entity({NativeEntityNotice::Event::LevelExit});
+  notify_native_entity(c,{NativeEntityNotice::Event::LevelExit});
   netplay_reset_world();
   {
     std::lock_guard<std::recursive_mutex> guard(lock);
@@ -843,6 +858,7 @@ void exit_hook(PPCContext &c) {
     bone_markers.clear();
     target = 0;
     camera_time = {};
+    local_view_camera.reset();
     pending_aim_yaw=pending_aim_pitch=0;
     state.tracked_enemies = 0;
     recipes.clear();
@@ -1106,6 +1122,14 @@ void mod_options(ModOptions o) {
 void mod_netplay_player(int port) {
   std::lock_guard<std::recursive_mutex> guard(lock);
   local_netplay_port=port; pending_aim_yaw=pending_aim_pitch=0;
+  local_view_camera.reset();
+}
+std::optional<ModViewCamera> mod_view_camera() {
+  std::lock_guard<std::recursive_mutex> guard(lock);
+  const auto now=uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+  if(!local_view_camera || local_netplay_port<0 || local_view_camera->local_player!=local_netplay_port ||
+     now<local_view_camera->sampled_ms || now-local_view_camera->sampled_ms>250)return {};
+  return local_view_camera;
 }
 void mod_take_netplay_aim(double& yaw,double& pitch) {
   std::lock_guard<std::recursive_mutex> guard(lock);

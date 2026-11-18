@@ -37,7 +37,9 @@ int main(int argc,char** argv)try{
     context.msr&=~0x8000u;context.r[1]=ssne::guest_ram_end()-0x40000;
     mem_write32(context.r[1],0);
     require(mem_read32(0x80000000u)==0x47334250u,"This regression requires the owned PAL revision");
+    ssne::select_version();
     ssne::install_cheats();require(ssne::cheats_available(),"PAL cheat signatures unavailable");
+    ssne::install_mouse_aim();require(ssne::mouse_aim_available(),"Verified PAL look/flight adapter unavailable");
     const auto* player_update=ssne_find_func(0x800beec8u);
     require(player_update && player_update->func,"Native player update unavailable");
     const auto registry=ssne::native_party_registry();const auto actor=mem_read32(registry);
@@ -67,20 +69,48 @@ int main(int argc,char** argv)try{
         // The original hidden D-pad toggle must not compete with F12 selection.
         for(uint32_t offset:{0x578u,0x594u,0x5ccu,0x5b0u})mem_write32(bank+0x10+offset,0);
     };
-    auto step=[&](float ascend,float descend,unsigned frames){
+    const auto status=mem_read32(0x802abad8u);
+    require(status>=0x80000000u && status<=ssne::guest_ram_end()-48,"Native PAL pad status unavailable");
+    const auto* clamp=ssne_find_func(ssne::g_ver->pad_clamp);
+    const auto* process=ssne_find_func(ssne::g_ver->pad_process);
+    require(clamp && process,"Original PAL pad processor unavailable");
+    unsigned sampled_frames=0;
+    auto step=[&](float jump,float fire,unsigned frames){
         for(unsigned i=0;i<frames;++i){
-            clear_actions();mem_write32(bank+0xc+0x604,f2u(ascend));mem_write32(bank+0xc+0x63c,f2u(descend));
+            // Drive real PADRead -> original PADClamp -> original action
+            // processing, rather than manufacturing flight-only action floats.
+            ssne::PadState pad;
+            if(jump){pad.buttons|=ssne::PAD_L;pad.trigger_l=255;}
+            if(fire){pad.buttons|=ssne::PAD_R;pad.trigger_r=255;}
+            ssne::set_pad(0,pad);clear_actions();
+            auto call=context;call.r[3]=status;
+            ssne::g_netplay_pad_refresh=true;ssne::hle_netplay_pad_read(call);ssne::g_netplay_pad_refresh=false;
+            call=context;call.r[3]=status;ssne_call_original(call,ssne::g_ver->pad_clamp,clamp->func);
+            call=context;call.r[3]=bank;call.ps0[1]=call.ps1[1]=1.f/60.f;
+            ssne_call_original(call,ssne::g_ver->pad_process,process->func);
+            require((mem_read8(status+6)!=0)==bool(jump) && (mem_read8(status+7)!=0)==bool(fire),"Flight changed the native L/R pad meanings");
+            require((u2f(mem_read32(bank+12))>.5f)==bool(jump),"Raw Space did not retain the original jump action");
+            require((u2f(mem_read32(bank+12+28*10))>.5f)==bool(fire),"Raw Space became native primary fire, or real R/fire was blocked");
+            ++sampled_frames;
             ssne::cheats_frame(false);
-            auto call=context;call.r[3]=actor;
+            call=context;call.r[3]=actor;
             ssne_call_original(call,0x800beec8u,player_update->func);
         }
     };
+    // The movement adapter must neither change another caller's nonvolatile
+    // register nor another player's flight direction.
+    auto probe=context;probe.r[3]=actor;probe.lr=0x800A8660u;probe.ps0[29]=probe.ps1[29]=.75;
+    ssne::hle_look_update(probe);require(probe.ps0[29]==.75,"Normal look caller changed flight movement register");
+    if(has_other){probe=context;probe.r[3]=other;probe.lr=0x800BF410u;probe.ps0[29]=probe.ps1[29]=.75;
+        ssne::hle_look_update(probe);require(probe.ps0[29]==.75,"Host cheat reversed another player's flight scalar");}
     const auto before=position(actor);step(1,0,8);const auto above=position(actor);
-    require(above[1]>before[1]+.01f,"Held native ascent did not move the host upwards");
+    require(above[1]>before[1]+.01f,"Held raw L/Space did not move the host upwards");
     step(0,0,8);const auto stationary=position(actor);
     require(distance(stationary,above)<.0001f,"Neutral flight drifted or fell");
     step(0,1,8);const auto below=position(actor);
-    require(below[1]<stationary[1]-.01f,"Held native descent did not move the host downwards");
+    require(below[1]<stationary[1]-.01f,"Held raw R/fire did not move the host downwards");
+    const auto both_before=position(actor);step(1,1,8);
+    require(distance(position(actor),both_before)<.0001f,"Simultaneous raw jump/fire did not cancel vertical flight movement");
     if(has_other)require(mem_read32(other+0x1c)==other_flags && mem_read32(other+0x35c)==other_fly,"Host flight changed another player's physics flags");
     clear_actions();ssne::set_cheats({});ssne::cheats_frame(false);
     require(!ssne::cheat_flying() && mem_read32(actor+0x35c)==0 && mem_read32(actor+0x1c)==retained_flags && mem_read32(allow+0x1c)==original_allow,"Host flight did not restore the game's original flags and setting");
@@ -100,6 +130,7 @@ int main(int argc,char** argv)try{
     const auto single=position(actor);step(1,0,8);require(position(actor)[1]>single[1]+.01f,"Single-player native ascent regressed");
     ssne::set_cheats({});ssne::cheats_frame(false);
     require(mem_read32(actor+0x1c)==retained_flags && mem_read32(allow+0x1c)==original_allow,"Single-player flight failed to restore original settings");
-    std::cout<<"PAL flight: real held ascent/descent/neutral, host-only physics, original flag restoration, client/replica/missing-player gates and single-player regression passed.\n"<<std::flush;
+    require(sampled_frames==40,"Expected all original pad/action flight frames");
+    std::cout<<"PAL flight: original PADRead/clamp/actions keep Space out of fire and R/fire intact; raw L ascent, raw R descent, neutral/both, scoped caller/actor, host-only physics, original flag restoration, client/replica/missing-player gates and single-player regression passed.\n"<<std::flush;
     std::_Exit(0);
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

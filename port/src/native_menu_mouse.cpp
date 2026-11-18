@@ -1,3 +1,4 @@
+#include "ssne/performance.h"
 #include "native_menu_mouse.h"
 #include "ssne/recomp_hooks.h"
 #include "ssne/native_party.h"
@@ -409,7 +410,7 @@ void describe(){
         out<<"{\"node\":"<<w.node<<",\"id\":"<<w.id<<",\"type\":"<<w.type<<",\"option\":"<<w.option<<",\"selectable\":"<<(w.selectable?"true":"false")<<",\"allowed\":"<<(w.allowed?"true":"false")<<",\"value\":"<<w.value<<",\"min\":"<<w.minimum<<",\"max\":"<<w.maximum<<",\"event\":"<<w.event<<",\"control\":\""<<w.control<<"\",\"axis\":\""<<(w.type==5?(word(w.definition+0xc)&0x2000u?"vertical":"horizontal"):"")<<"\",\"track_bounds\":["<<normx(w.track.l)<<','<<.5f+w.track.t/480.f<<','<<normx(w.track.r)<<','<<.5f+w.track.b/480.f<<"],\"bounds\":["<<normx(w.box.l)<<','<<.5f+w.box.t/480.f<<','<<normx(w.box.r)<<','<<.5f+w.box.b/480.f<<"]}";
     }
     if(!first)out<<"]}";out<<"]}";const auto state=out.str();{std::lock_guard lock(mutex);diagnostics=state;}
-    if(std::getenv("SSNE_TEST_HIDDEN")&&(std::getenv("SSNE_DEV_NATIVE_MENU")||std::getenv("SSNE_NATIVE_MOUSE_COMMAND"))){
+    if(!ssne::perf::fixture_quiet.load(std::memory_order_relaxed) && std::getenv("SSNE_TEST_HIDDEN")&&(std::getenv("SSNE_DEV_NATIVE_MENU")||std::getenv("SSNE_NATIVE_MOUSE_COMMAND"))){
         std::ofstream file("native-menu-mouse-state.json.pending",std::ios::binary);file<<state;file.close();
         if(file){std::remove("native-menu-mouse-state.json");std::rename("native-menu-mouse-state.json.pending","native-menu-mouse-state.json");}
     }
@@ -432,6 +433,7 @@ void install_native_menu_mouse(){
 }
 void set_native_menu_mouse_display(float wide){if(std::isfinite(wide)&&wide>=1&&wide<=8)display_wide.store(wide,std::memory_order_relaxed);}
 NativeMenuMouseSnapshot native_menu_mouse_snapshot(){std::lock_guard lock(mutex);return published;}
+bool native_menu_pointer_pending(){std::lock_guard lock(mutex);return !events.empty();}
 bool menu_mouse_wants_pointer(){return native_menu_mouse_snapshot().active;}
 uint64_t menu_mouse_surface_generation(){return native_menu_mouse_snapshot().surface_generation;}
 std::string native_menu_mouse_diagnostics(){std::lock_guard lock(mutex);return diagnostics;}
@@ -477,6 +479,12 @@ void consume_native_menu_pointer(PPCContext& c){
             focus(c,*target);if(scroll(c,*target,e))break;
         }
     }
-    describe();
+    // Keep serialization out of ordinary gameplay; collecting live widgets and
+    // handling every queued pointer event above retain their original cadence.
+    static const bool eager_diagnostics=[] {
+        const auto* value=std::getenv("SSNE_MOUSE_DIAGNOSTICS_EAGER");
+        return value && value[0]=='1' && value[1]=='\0';
+    }();
+    if(eager_diagnostics || (services.diagnostics && !ssne::perf::fixture_quiet.load(std::memory_order_relaxed)))describe();
 }
 }

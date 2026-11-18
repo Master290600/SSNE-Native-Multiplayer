@@ -46,6 +46,8 @@ std::vector<std::string> strings(const JSONValue& v,const char* key){
 void verify(const RuntimeKit& k,bool compiler,bool disc=true){
     const auto project=P(k.project_dir),kit=P(k.kit_dir);
     matches(kit/"launcher-kit.json",k.sidecar_sha256);matches(kit/"runtime-kit.json",k.descriptor_sha256);
+    if (!k.ps2_content_sha256.empty())
+        matches(contained(project,"Extras/PS2/checksums.json"),k.ps2_content_sha256);
     matches(P(k.recipe),k.recipe_sha256);matches(P(k.symbols),k.symbols_sha256);matches(P(k.recompiler),k.recompiler_sha256);
     if(compiler)matches(P(k.compiler),k.compiler_sha256);
     if(disc){const auto data=P(k.data_dir);std::ifstream boot(data/"sys/boot.bin",std::ios::binary);char id[6]{};need(bool(boot.read(id,6))&&std::string(id,6)=="G3BP9G","Native multiplayer requires the supported original European G3BP9G disc");
@@ -67,11 +69,12 @@ bool load_runtime_kit(const std::string& project_dir,const std::string& data_dir
         RuntimeKit k;k.project_dir=S(fs::weakly_canonical(P(project_dir)));k.kit_dir=S(P(k.project_dir)/"build-kit/multiplayer");k.data_dir=S(fs::weakly_canonical(P(data_dir)));
         const auto project=P(k.project_dir),kit=P(k.kit_dir);auto side=json(kit/"launcher-kit.json");need(number(side,"schema")==1,"Unsupported native launcher kit schema");
         k.sidecar_sha256=runtime_text_sha256(bytes(kit/"launcher-kit.json"));k.descriptor_sha256=hash_field(side,"runtime_kit_sha256");matches(kit/"runtime-kit.json",k.descriptor_sha256);
-        auto d=json(kit/"runtime-kit.json");k.build=number(d,"build");k.protocol=number(d,"protocol");need(k.build>=202&&k.protocol==63,"Unsupported native multiplayer runtime build/protocol");
+        auto d=json(kit/"runtime-kit.json");k.build=number(d,"build");k.protocol=number(d,"protocol");need(k.build>=202&&(k.protocol==63||k.protocol==64||k.protocol==65||k.protocol==66||k.protocol==67||k.protocol==68||k.protocol==69||k.protocol==70),"Unsupported native multiplayer runtime build/protocol");
+        if (side.find("ps2_content_sha256")) k.ps2_content_sha256=hash_field(side,"ps2_content_sha256");
         k.recipe=S(contained(project,relative(str(side,"patch_recipe"))));k.recipe_sha256=hash_field(side,"patch_recipe_sha256");
         k.symbols=S(contained(project,relative(str(side,"symbols"))));k.symbols_sha256=hash_field(side,"symbols_sha256");
         k.compiler=S(project/"build-kit/toolchain/bin/clang++.exe");k.compiler_sha256=hash_field(d,"compiler_sha256");
-        k.recompiler=S(project/"build-kit/ssne-recomp.exe");k.recompiler_sha256=hash_field(d,"recompiler_sha256");k.dol_sha256=hash_field(d,"dol_sha256");
+        k.recompiler=S(project/"build-kit/SSNE-RECOOP-Native.exe");k.recompiler_sha256=hash_field(d,"recompiler_sha256");k.dol_sha256=hash_field(d,"dol_sha256");
         matches(P(k.recipe),k.recipe_sha256);auto recipe=json(P(k.recipe));
         need(number(recipe,"schema")==1&&str(recipe,"kind")=="ssne-pal-translation-edits"&&hash_field(recipe,"runtime_kit_sha256")==k.descriptor_sha256
              &&hash_field(recipe,"symbols_sha256")==k.symbols_sha256&&hash_field(recipe,"patcher_sha256")==hash_field(d,"patcher_sha256"),"Native translation recipe is bound to another runtime/symbols/patcher");
@@ -94,17 +97,42 @@ bool runtime_build_ready(const RuntimeKit& k,const std::string& output,std::stri
         // A verified existing game does not execute a compiler. Missing or
         // retired toolchains are repaired only when a new build is required.
         if(force)verify(k,false);
-        const auto project=P(k.project_dir),exe=P(output),dir=exe.parent_path(),alias=dir/"SSNE-Native-Multiplayer.exe";
-        need(fs::weakly_canonical(exe)==contained(project,relative("Multiplayer/SSNE-Native-Multiplayer-Game.exe")),"native game output path differs from selected project");
-        contained(project,relative("Multiplayer/SSNE-Native-Multiplayer.exe"));
+        const auto project=P(k.project_dir),exe=fs::weakly_canonical(P(output)),dir=contained(project,"Multiplayer");
+        const auto legacy=contained(project,fs::path("Multiplayer")/native_legacy_exe);
+        const auto alias=contained(project,fs::path("Multiplayer")/native_legacy_alias);
         need(!fs::exists(dir/".native-build-transaction"),"An interrupted native build needs recovery; choose Build Game");
+        if (!k.ps2_content_sha256.empty())
+            need(!fs::exists(dir/".ps2-content-pending"),"PS2 content installation is incomplete; choose Build Game");
+        const auto release=json(dir/"release-manifest.json");
+        const bool has_root=release.find("project_executable")!=nullptr;
+        if(has_root)need(str(release,"project_executable")==native_project_exe,"Unrecognized native project executable");
+        need(exe==(has_root?contained(project,native_project_exe):legacy),"native game output path differs from selected project");
         std::string failure;const auto hash=runtime_file_sha256(exe,failure);need(!hash.empty(),"Native multiplayer game has not been built");matches(alias,hash);
-        auto release=json(dir/"release-manifest.json");need(number(release,"build")==k.build&&number(release,"protocol")==k.protocol&&str(release,"entrypoint")=="native"&&hash_field(release,"kit_descriptor_sha256")==k.descriptor_sha256&&hash_field(release,"product_sha256")==hash&&hash_field(release,"entrypoint_sha256")==hash,"Native release manifest does not match its verified runtime kit/executable");
+        if(has_root)matches(legacy,hash);
+        need(number(release,"build")==k.build&&number(release,"protocol")==k.protocol&&str(release,"entrypoint")=="native"&&hash_field(release,"kit_descriptor_sha256")==k.descriptor_sha256&&hash_field(release,"product_sha256")==hash&&hash_field(release,"entrypoint_sha256")==hash,"Native release manifest does not match its verified runtime kit/executable");
         const auto receipt=dir/"native-build.json";
+        if (!k.ps2_content_sha256.empty()) need(fs::is_regular_file(receipt),"Build Game to install the included PS2 content");
         if(fs::exists(receipt)){
-            auto v=json(receipt);need(number(v,"schema")==1&&str(v,"fingerprint")==k.fingerprint&&hash_field(v,"exe_sha256")==hash&&hash_field(v,"descriptor_sha256")==k.descriptor_sha256,"Native game was built with another kit or changed; choose Build Game");
-        }else{
-            auto v=json(dir/"release-manifest.json");need(number(v,"build")==k.build&&number(v,"protocol")==k.protocol&&str(v,"entrypoint")=="native"&&hash_field(v,"kit_descriptor_sha256")==k.descriptor_sha256&&hash_field(v,"product_sha256")==hash&&hash_field(v,"entrypoint_sha256")==hash,"Existing native release does not match its verified runtime kit");
+            auto v=json(receipt);need(number(v,"schema")==1&&str(v,"fingerprint")==k.fingerprint&&hash_field(v,"exe_sha256")==hash&&hash_field(v,"descriptor_sha256")==k.descriptor_sha256&&(v.find("project_executable")!=nullptr)==has_root,"Native game was built with another kit or changed; choose Build Game");
+            if(has_root)need(str(v,"project_executable")==native_project_exe,"Native build receipt refers to another executable");
+            if (!k.ps2_content_sha256.empty()) {
+                need(v.find("ps2_content_sha256") && hash_field(v,"ps2_content_sha256")==k.ps2_content_sha256,
+                     "Build Game to install the included PS2 content");
+                // Readiness is refreshed on startup, after a build and before Play.
+                // The installer verifies every SHA-256. Checking output lengths here
+                // detects missing or truncated data without hashing 425 MiB on Play.
+                const auto recipe=json(contained(project,"Extras/PS2/checksums.json"));
+                const auto* rows=field(recipe,"rows").object();
+                need(rows && !rows->empty(),"Missing PS2 content inventory");
+                for (const auto& [name,row] : *rows) {
+                    const auto path=contained(project,relative(name));
+                    int64_t expected=0;
+                    std::error_code ec;
+                    need(field(row,"bytes").integer(expected) && expected>=0 &&
+                         fs::file_size(path,ec)==uintmax_t(expected) && !ec,
+                         "PS2 content is missing or incomplete: "+name+"; choose Build Game");
+                }
+            }
         }
         error.clear();return true;
     }catch(const std::exception& e){error=e.what();return false;}

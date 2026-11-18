@@ -7,12 +7,13 @@ import re
 import zipfile
 from audit_source import inspect
 
-ROOT_FILES={"SSNE-Native.exe","gctool.exe","known_dumps.txt","LICENSE.txt",
+ROOT_FILES={"SSNE-RECOOP-Native.exe","gctool.exe","known_dumps.txt","LICENSE.txt",
             "THIRD-PARTY-NOTICES.txt","README.txt","launcher-integration.json","package-files.json"}
 FORBIDDEN_PARTS={"game_data","generated","generated-multiplayer","recompiled","saves","states",
                  "work","native-multiplayer-work","toolchain","downloads",".git","__pycache__"}
 FORBIDDEN_EXT={".iso",".gcm",".rvz",".wia",".gcz",".ciso",".dol",".raw",".ram",".state",".coop",".bik"}
-TOOLS={"SSNE-Native.exe","gctool.exe","build-kit/ssne-recomp.exe"}
+OPTIONAL_ROOT_FILES={"NATIVE-INVITATIONS.txt","SSNE-INTERNET.example"}
+TOOLS={"SSNE-RECOOP-Native.exe","gctool.exe","build-kit/SSNE-RECOOP-Native.exe"}
 
 def need(value,message):
     if not value:raise ValueError(message)
@@ -22,7 +23,7 @@ def safe_path(name):
     need(name and not p.is_absolute() and ".." not in p.parts and ":" not in name and "\\" not in name,"Unsafe ZIP path: "+name)
     need(not any(part.lower() in FORBIDDEN_PARTS for part in p.parts),"Private/game directory: "+name)
     need(p.suffix.lower() not in FORBIDDEN_EXT,"Disc/save/generated artifact: "+name)
-    need(name in ROOT_FILES or p.parts[0] in {"source","licenses","build-kit"},"Unexpected release root: "+name)
+    need(name in ROOT_FILES or name in OPTIONAL_ROOT_FILES or p.parts[0] in {"source","licenses","build-kit"},"Unexpected release root: "+name)
     if p.suffix.lower()==".exe":need(name in TOOLS,"Built game or unknown executable: "+name)
     if p.suffix.lower() in {".a",".obj",".o",".lib"}:need(p.parts[0]=="build-kit","Object outside runtime kit: "+name)
     return p
@@ -61,12 +62,20 @@ def audit(path):
     need(side["runtime_kit_sha256"]==recipe["runtime_kit_sha256"]==digest(base+"runtime-kit.json"),"Runtime/recipe binding differs")
     need(side["patch_recipe"]==base+"translation-recipe.json" and side["patch_recipe_sha256"]==digest(base+"translation-recipe.json"),"Recipe checksum differs")
     need(side["symbols_sha256"]==digest(side["symbols"]),"PAL symbol checksum differs")
-    need(descriptor["recompiler_sha256"]==digest("build-kit/ssne-recomp.exe"),"Recompiler checksum differs")
-    need(58<=len(descriptor["files"])<=128 and descriptor["protocol"]==63,"Unexpected native kit scope")
+    need(descriptor["recompiler_sha256"]==digest("build-kit/SSNE-RECOOP-Native.exe"),"Recompiler checksum differs")
+    need(58<=len(descriptor["files"])<=128 and descriptor["protocol"] in (63,64,65,66,67,68,69,70),"Unexpected native kit scope")
     for item in descriptor["files"]:need(digest(base+item["path"])==item["sha256"],"Native runtime checksum differs: "+item["path"])
-    need(marker["launcher_sha256"]==digest("SSNE-Native.exe") and marker["launcher_kit_sha256"]==digest(base+"launcher-kit.json"),"Launcher binding differs")
+    if descriptor["protocol"]>=70:
+        need(OPTIONAL_ROOT_FILES<=contents.keys(),"Invitation instructions/settings example are missing")
+        need(contents["THIRD-PARTY-NOTICES.txt"]==contents.get("source/data/release/THIRD-PARTY-NOTICES.txt"),"Shipped notices differ from current source")
+        for license_name,source_name in (("libjuice-MPL-2.0.txt","vendor/libjuice/LICENSE"),("KCP-MIT.txt","vendor/kcp/LICENSE")):
+            target="licenses/"+license_name
+            need(target in contents and contents[target]==contents.get("source/"+source_name),"Invitation license or corresponding source is missing: "+license_name)
+        for name in ("vendor/libjuice/include/juice/juice.h","vendor/libjuice/src/juice.c","vendor/kcp/ikcp.c","vendor/kcp/ikcp.h"):
+            need("source/"+name in contents,"Invitation build source is missing: "+name)
+    need(marker["launcher_sha256"]==digest("SSNE-RECOOP-Native.exe") and marker["launcher_kit_sha256"]==digest(base+"launcher-kit.json"),"Launcher binding differs")
     return {"passed":True,"files":len(contents),"source_files":source_count,"runtime_build":descriptor["build"],
-            "protocol":descriptor["protocol"],"launcher_sha256":digest("SSNE-Native.exe"),
+            "protocol":descriptor["protocol"],"launcher_sha256":digest("SSNE-RECOOP-Native.exe"),
             "contains_disc_data":False,"contains_built_game":False}
 
 if __name__=="__main__":

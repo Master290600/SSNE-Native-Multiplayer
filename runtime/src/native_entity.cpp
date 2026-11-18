@@ -57,4 +57,8 @@ void notify_native_entity(NativeEntityNotice notice) {
     {std::lock_guard lock(mutex);for(const auto& [id,callback]:observers)callbacks.push_back(callback);}
     for(auto& callback:callbacks)callback(notice);
 }
+void notify_native_entity(PPCContext& context,NativeEntityNotice notice) {
+    notice.context=&context;
+    notify_native_entity(notice);
+}
 }

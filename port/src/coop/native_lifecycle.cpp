@@ -4,6 +4,7 @@
 #include <cctype>
 #include "native_configuration.h"
 #include "native_world.h"
+#include "native_particles.h"
 #include "native_presentation.h"
 #include "ssne/runtime.h"
 #include "ssne/game_addresses.h"
@@ -12,6 +13,7 @@
 #include "ssne/native_pickup.h"
 #include "ssne/native_party.h"
 #include "ssne/native_effect.h"
+#include "ssne/native_survival.h"
 #include "ssne/replica_simulation.h"
 #include <cmath>
 #include <set>
@@ -22,6 +24,23 @@
 namespace port::coop {
 namespace {
 bool readable(uint32_t p,unsigned n){return p>=0x80000000u && n<=ssne::guest_ram_size() && p<=ssne::guest_ram_end()-n;}
+PPCFunc survival_weapon_set_previous=nullptr,survival_powerups_previous=nullptr;
+bool survival_rules_enabled=false,survival_allow_powerups=true;
+unsigned survival_weapon_set=0;
+bool survival_rules_active(){return survival_rules_enabled && ssne::native_survival_enabled() && mem_read32(ssne::game_address(0x802DB8CCu))==1;}
+void survival_weapon_set_getter(PPCContext& c){
+    if(survival_rules_active())c.r[3]=survival_weapon_set;
+    else ssne_call_original(c,0x80167360u,survival_weapon_set_previous);
+}
+void survival_powerups_getter(PPCContext& c){
+    // Original 801673BC returns the DISALLOW flag, inverse to AllowPowerUps.
+    if(survival_rules_active())c.r[3]=survival_allow_powerups?0:1;
+    else ssne_call_original(c,0x801673BCu,survival_powerups_previous);
+}
+bool survival_getter_fingerprint(uint32_t address,unsigned length,uint64_t expected){
+    if(!readable(address,length) || !ssne_find_func(address))return false;
+    uint64_t hash=14695981039346656037ull;for(unsigned i=0;i<length;++i){hash^=mem_read8(address+i);hash*=1099511628211ull;}return hash==expected;
+}
 int prototype(uint32_t definition) {
     // Factory definition2 is MiniSam (PAL ctor80018E7C, class801E9258).
     // Player snapshots also use definition2, but EntityKind/vtable distinguish
@@ -31,6 +50,33 @@ int prototype(uint32_t definition) {
     return -1;
 }
 bool context_ok(const PPCContext& c){return mem_read32(0x80000000)==0x47334250u && c.r[13]==0x802E22A0 && c.r[1]>=0x80000800 && readable(c.r[1]-0x800,0x800);}
+// PAL KeyPickup::Initialize (800C899C) consumes config+2C as the
+// {localized-name hash, level-owned model description} pair. A generic
+// dynamically allocated pickup configuration has no such pair. Resolve it
+// from this process's original loaded map; never accept a foreign pointer or
+// guess between two different authored meanings of one key definition.
+std::optional<uint32_t> native_key_metadata(uint32_t definition,std::string& error){
+    auto fail=[&](const char* why)->std::optional<uint32_t>{error=why;return {};};
+    if(definition<46 || definition>53 || mem_read32(0x80000000u)!=0x47334250u)return fail("Native key definition/revision unavailable");
+    const auto owner=mem_read32(0x802DACC0u),manager=readable(owner,0x29C)?mem_read32(owner+0x298):0;
+    const auto resource=readable(manager,8)?mem_read32(manager+4):0;
+    if(!readable(resource,0x44) || mem_read32(resource)!=1 || mem_read32(resource+4)!=100)return fail("Original native key map is unavailable");
+    std::set<uint32_t> seen;std::optional<uint32_t> metadata;std::array<uint32_t,2> identity{};
+    for(auto node=mem_read32(resource+0x40);node;node=mem_read32(node)){
+        if(!readable(node,24) || !seen.insert(node).second || seen.size()>32768)return fail("Original native key prototype chain is invalid");
+        if(mem_read32(node+12)!=3210 || !mem_read32(node+4))continue;
+        const auto config=mem_read32(node+16);
+        if(!readable(config,0x40))return fail("Original native key prototype configuration is invalid");
+        if(mem_read32(config)!=definition)continue;
+        const auto pair=mem_read32(config+0x2C);
+        if(!readable(pair,8) || (mem_read32(pair+4) && !readable(mem_read32(pair+4),4)))return fail("Original native key model metadata is unavailable");
+        const std::array<uint32_t,2> current{mem_read32(pair),mem_read32(pair+4)};
+        if(metadata && identity!=current)return fail("Ambiguous original native key metadata for this definition");
+        if(!metadata){metadata=pair;identity=current;}
+    }
+    if(!metadata)return fail("No authored native key prototype for this definition in the current level");
+    return metadata;
+}
 template<uint32_t Address> void weapon_trace_hook(PPCContext& c){
     const auto actor=c.r[3],argument=c.r[4],caller=c.lr;
     const bool valid=readable(actor,0x790) && mem_read32(actor+0x48)==0x802121E8u;
@@ -104,6 +150,13 @@ void afk_fire_direction_hook(PPCContext& context){
     }
     const auto slot=mem_read32(actor+0x17C);
     if(slot>=ssne::native_party_capacity() || mem_read32(ssne::native_party_registry()+slot*4)!=actor){ssne_call_original(context,0x800C43A0,original_fire_direction);return;}
+    // Preserve the native target-selected direction when the temporary native
+    // option is on. Far/no-target/off states still use the camera fallback.
+    const auto aim=found->second;
+    if(readable(aim,0x60) && mem_read32(aim)==1 && mem_read32(aim+0x44)){
+        float length=0;for(unsigned i=0;i<3;++i){const auto v=u2f(mem_read32(aim+0x34+i*4));length+=v*v;}
+        if(std::isfinite(length) && length>=.01f && length<=100.f){ssne_call_original(context,0x800C43A0,original_fire_direction);return;}
+    }
     const auto camera=mem_read32(actor+0x368);
     if(!readable(camera,0x100) || !readable(mem_read32(camera),0x28) || !ssne_find_func(mem_read32(mem_read32(camera)+0x24))){ssne_call_original(context,0x800C43A0,original_fire_direction);return;}
     std::array<float,3> direction;
@@ -147,6 +200,44 @@ bool apply_native_preferences(PPCContext& context,uint32_t actor,const std::arra
     }
     for(const auto& [key,value]:changed)if(!write_native_configuration(context,root,{{key,value}},key,error))return false;
     return refresh_native_aim_preferences(context,actor,false,error);
+}
+bool read_native_auto_aim_binding(uint32_t actor,NativeAutoAimLease& out,std::string& error){
+    if(!readable(actor,0x790) || mem_read32(actor+0x48)!=0x802121E8u){error="Native auto-aim actor unavailable";return false;}
+    const auto slot=mem_read32(actor+0x17C);
+    if(slot>=ssne::native_party_capacity() || mem_read32(ssne::native_party_registry()+slot*4)!=actor){error="Native auto-aim actor registry differs";return false;}
+    const auto variable=mem_read32(actor+0x378),aim=mem_read32(actor+0x37C),profile=mem_read32(actor+0x18C);
+    if(!readable(variable,0x28) || !readable(aim,0x60) || !readable(profile,4)){error="Native auto-aim profile is not ready";return false;}
+    const auto mode=mem_read32(variable+0x24);
+    const auto preference=read_native_configuration(profile,"AutoAimType");
+    const auto found=preference.values.find("AutoAimType");
+    if(mode>2 || !preference.error.empty() || found==preference.values.end() || !std::holds_alternative<int64_t>(found->second) || std::get<int64_t>(found->second)!=mode){error="Native auto-aim option binding differs";return false;}
+    out={actor,aim,variable,profile,slot,mode};return true;
+}
+bool native_auto_aim_lease_matches(const NativeAutoAimLease& lease){
+    if(!lease.actor || lease.saved_mode>2 || !readable(lease.actor,0x790) || mem_read32(lease.actor+0x48)!=0x802121E8u)return false;
+    if(lease.slot>=ssne::native_party_capacity() || mem_read32(lease.actor+0x17C)!=lease.slot || mem_read32(ssne::native_party_registry()+lease.slot*4)!=lease.actor)return false;
+    // Validate the live object's pointers before reading any saved pointee.
+    if(mem_read32(lease.actor+0x37C)!=lease.aim || mem_read32(lease.actor+0x378)!=lease.variable || mem_read32(lease.actor+0x18C)!=lease.profile)return false;
+    return readable(lease.aim,0x60) && readable(lease.variable,0x28) && readable(lease.profile,4) && mem_read32(lease.variable+0x24)<=2;
+}
+bool begin_native_auto_aim_override(PPCContext& context,uint32_t actor,NativeAutoAimLease& lease,std::string& error){
+    if(!context_ok(context)){error="Native auto-aim context unavailable";return false;}
+    auto prepared=lease;const bool fresh=!prepared.actor;
+    if(!fresh){if(prepared.actor!=actor || !native_auto_aim_lease_matches(prepared)){error="Native auto-aim lease lifetime changed";return false;}}
+    else{
+        if(!read_native_auto_aim_binding(actor,prepared,error) || !validate_native_configuration(context,prepared.profile,{{"AutoAimType",int64_t(1)}},"AutoAimType",error))return false;
+    }
+    if(fresh && prepared.saved_mode!=1){mem_write32(prepared.aim+0xC,0);mem_write32(prepared.aim+0x44,0);}
+    mem_write32(prepared.variable+0x24,1);mem_write32(prepared.aim,1);lease=prepared;return true;
+}
+bool end_native_auto_aim_override(NativeAutoAimLease& lease){
+    if(!lease.actor){lease={};return true;}
+    const bool live=native_auto_aim_lease_matches(lease);
+    if(live){
+        mem_write32(lease.variable+0x24,lease.saved_mode);mem_write32(lease.aim,lease.saved_mode);
+        if(lease.saved_mode!=1){mem_write32(lease.aim+0xC,0);mem_write32(lease.aim+0x44,0);}
+    }
+    lease={};return live;
 }
 bool refresh_native_aim_preferences(PPCContext& context,uint32_t actor,bool presentation,std::string& error){
     if(!context_ok(context) || !readable(actor,0x790) || mem_read32(actor+0x48)!=0x802121E8u)return true;
@@ -335,6 +426,27 @@ bool native_player_fire_direction(PPCContext& context,uint32_t actor,std::array<
     StackScratch scratch(context);auto call=context;call.msr&=~0x8000u;call.r[1]-=0x100;mem_write32(call.r[1],context.r[1]);call.r[3]=actor;call.r[4]=call.r[1]+0x60;ssne_call(call,0x800C43A0);
     float length=0;for(unsigned i=0;i<3;++i){direction[i]=u2f(mem_read32(call.r[1]+0x60+i*4));length+=direction[i]*direction[i];}
     if(!std::isfinite(length) || length<.01f || length>100.f){error="Invalid native firing direction";return false;}return true;
+}
+bool configure_native_survival_rules(bool enabled,unsigned weapon_set,bool allow_powerups,std::string& error){
+    if(!enabled){survival_rules_enabled=false;return true;}
+    if(weapon_set>10){error="Invalid Survival weapon set";return false;}
+    if(!survival_weapon_set_previous){
+        // Exact original PAL no-argument getters: CVarInt+24 and inverse CVarBool+1C.
+        // Install both only after all validation, retaining earlier hook owners.
+        if(mem_read32(0x80000000u)!=0x47334250u ||
+           !survival_getter_fingerprint(0x80167360u,0x5C,0x165D70BEE9F21F88ull) ||
+           !survival_getter_fingerprint(0x801673BCu,0x70,0x003AD4F48721A57Eull)){
+            error="Original PAL Survival rule getters unavailable";return false;
+        }
+        auto* weapons=ssne_hook_slot(0x80167360u);auto* powerups=ssne_hook_slot(0x801673BCu);
+        if(!weapons || !powerups){error="Survival rule hook slots unavailable";return false;}
+        survival_weapon_set_previous=*weapons?*weapons:ssne_find_func(0x80167360u)->func;
+        survival_powerups_previous=*powerups?*powerups:ssne_find_func(0x801673BCu)->func;
+        ssne_install_hook(0x80167360u,survival_weapon_set_getter);ssne_install_hook(0x801673BCu,survival_powerups_getter);
+    }else if(*ssne_hook_slot(0x80167360u)!=survival_weapon_set_getter || *ssne_hook_slot(0x801673BCu)!=survival_powerups_getter){
+        error="Survival rule getter hook ownership changed";return false;
+    }
+    survival_weapon_set=weapon_set;survival_allow_powerups=allow_powerups;survival_rules_enabled=true;return true;
 }
 bool set_native_afk_manual_aim(PPCContext& context,uint32_t actor,bool active,std::string& error){
     if(!active){afk_manual_aim.erase(actor);return true;}
@@ -882,10 +994,12 @@ bool match_native_pickup_metadata(uint32_t object,const EntityState& e,std::stri
 bool validate_native_weapon_pickup_creation(const EntityState& e,std::string& error) {
     auto fail=[&](const char* why){error=why;return false;};
     if(!validate_render_metadata(e,error) || !validate_native_pickup_metadata(e,error) || !validate_pickup_glow_metadata(e,error))return false;
-    // 8010CEB8 routes ordinary health/armor/ammo/weapons (0..45) and
-    // Serious Bomb (55) through the same 80213CC8 pickup class. Mission
-    // subclasses 46..53 and random remaps still need their own schema.
-    if(e.kind!=EntityKind::Pickup || !e.id || (e.definition>45 && e.definition!=54 && e.definition!=55))return fail("Unsupported native dynamic pickup definition");
+    // Original PAL 8010CEB8 uses 80213CC8 for ordinary pickups0..45/55,
+    // KeyPickup80214090 for46..53 and custom-treasure80214448 for54.
+    // Random remaps57..76 remain excluded. Keys additionally require an
+    // unambiguous original prototype with local level-owned model metadata.
+    if(e.kind!=EntityKind::Pickup || !e.id || e.definition>55)return fail("Unsupported native dynamic pickup definition");
+    if(e.definition>=46 && e.definition<=53 && !native_key_metadata(e.definition,error))return false;
     for(const auto& [key,value]:e.properties) {
         if(render_field(key) || key=="pickup_model" || key=="pickup_value")continue;
         if(key=="position" || key=="spawn_position"){const auto* p=std::get_if<std::array<float,3>>(&value);if(!p)return fail("Invalid pickup position type");for(auto f:*p)if(!std::isfinite(f) || std::abs(f)>1000000.f)return fail("Invalid pickup position");}
@@ -906,11 +1020,19 @@ uint32_t create_native_weapon_pickup(PPCContext& context,const EntityState& e,st
     const auto value=e.definition==54?uint32_t(std::get<int64_t>(e.properties.at("pickup_value"))):0u;
     ssne::NativePickupConfig config(call,e.definition,model,value);const auto proto=config.address();
     if(!proto){error="Native pickup prototype allocation failed";return 0;}
+    const bool key=e.definition>=46 && e.definition<=53;
+    if(key){
+        const auto metadata=native_key_metadata(e.definition,error);if(!metadata)return 0;
+        // Config alone is factory-owned. The original KeyPickup destructor
+        //800C8B18 delegates to800C6B60, which frees config, not config+2C.
+        // This immutable metadata remains owned by the same loaded level.
+        mem_write32(proto+0x2C,*metadata);
+    }
     const auto matrix=call.r[1]+0x80;const auto& position=std::get<std::array<float,3>>(e.properties.at("spawn_position"));
     for(unsigned i=0;i<12;++i)mem_write32(matrix+i*4,f2u(i==0 || i==5 || i==10?1.f:0.f));for(unsigned i=0;i<3;++i)mem_write32(matrix+12+i*16,f2u(position[i]));
     call.r[3]=mem_read32(0x802DACC0);call.r[4]=0;call.r[5]=matrix;call.r[6]=proto;call.r[7]=0;ssne_call(call,0x8010CEB8);const auto object=call.r[3];
     if(readable(object,0x1D4) && mem_read32(object+0xDC)==proto)config.transfer_to(object);
-    if(!readable(object,0x1D4) || mem_read32(object+0x48)!=(e.definition==54?0x80214448u:0x80213CC8u) || mem_read32(object+0x180)!=e.definition){error="Native weapon pickup factory failed";return 0;}
+    if(!readable(object,0x1D4) || mem_read32(object+0x48)!=(key?0x80214090u:e.definition==54?0x80214448u:0x80213CC8u) || mem_read32(object+0x180)!=e.definition){error="Native weapon pickup factory failed";return 0;}
     ssne::notify_native_entity({ssne::NativeEntityNotice::Event::CreatedPickup,object,e.definition});
     ssne::notify_native_entity({ssne::NativeEntityNotice::Event::Spawned,object,0,-2,position});
     return object;
@@ -1212,6 +1334,7 @@ bool validate_native_removal(const PPCContext& context,uint32_t object,std::stri
     auto fail=[&](const char* why){error=why;return false;};
     if(!context_ok(context) || !readable(object,0x54))return fail("Native removal context/object unavailable");
     const auto vt=mem_read32(object+0x48);if(!readable(vt,0x58))return fail("Native removal vtable unavailable");
+    if(vt==native_particles_vtable){EntityState verified;if(!capture_native_particles(object,verified,error))return false;}
     const auto* type=native_projectile_class_by_vtable(vt);
     const bool corpse=vt==0x8020C6B8u;
     const bool rotor=vt==0x8020B228u;
@@ -1243,12 +1366,13 @@ bool validate_native_removal(const PPCContext& context,uint32_t object,std::stri
         // These replica presentation factories do not install gameplay observers.
         if(mem_read32(object+0x38) || !ssne_find_func(0x8009B288) || mem_read32(0x8009B288)!=0x9421FFF0u || mem_read16(vt+0x18) || mem_read32(vt+0x1C)!=owned_destructor || !ssne_find_func(owned_destructor) || mem_read32(owned_destructor)!=(rotor?0x9421FFF0u:0x9421FFF8u))return fail("Native owned presentation destruction has unverified observers/lifecycle");
     }
-    if((vt==0x80213CC8u || vt==0x80214448u) && readable(object,0xE4) && mem_read32(object+0xE0)==1){
+    if((vt==0x80213CC8u || vt==0x80214090u || vt==0x80214448u) && readable(object,0xE4) && mem_read32(object+0xE0)==1){
         // Replica-created pickups own their configuration. Unregister alone
         // leaves it allocated forever because the native update list no
         // longer reaches the destructor. The full original destruction path
         // is safe here only without gameplay observer callbacks at +38.
-        if(mem_read32(object+0x38) || !ssne_find_func(0x8009B288) || mem_read32(0x8009B288)!=0x9421FFF0u || mem_read32(vt+0x1C)!=(vt==0x80214448u?0x800C8CC4u:0x800C6B60u))return fail("Owned native pickup destruction has unverified observers/lifecycle");
+        const auto destructor=vt==0x80214090u?0x800C8B18u:vt==0x80214448u?0x800C8CC4u:0x800C6B60u;
+        if(mem_read32(object+0x38) || !ssne_find_func(0x8009B288) || mem_read32(0x8009B288)!=0x9421FFF0u || mem_read32(vt+0x1C)!=destructor || !ssne_find_func(destructor))return fail("Owned native pickup destruction has unverified observers/lifecycle");
     }
     const auto getter=mem_read32(vt+0x34);if(!readable(getter,8) || (mem_read32(getter)&0xFFFF0000u)!=0x38600000u || mem_read32(getter+4)!=0x4E800020u)return fail("Native update group getter is not verified");
     const auto group=int16_t(mem_read32(getter));if(group==-1)return true;
@@ -1279,7 +1403,7 @@ bool remove_native_entity(PPCContext& context,uint32_t object,std::string& error
     // alone leaves their model standing in the renderer indefinitely.
     for(auto proxy:proxies)mem_write8(proxy+0x2D,0);
     const auto vt=mem_read32(object+0x48);
-    if((vt==0x80213CC8u || vt==0x80214448u) && mem_read32(object+0xE0)==1){
+    if((vt==0x80213CC8u || vt==0x80214090u || vt==0x80214448u) && mem_read32(object+0xE0)==1){
         StackScratch scratch(context);PPCContext call=context;call.msr&=~0x8000u;call.r[1]-=0x100;mem_write32(call.r[1],context.r[1]);call.r[3]=object;
         ssne_call(call,0x8009B288);return true;
     }

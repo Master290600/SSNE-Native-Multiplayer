@@ -31,6 +31,7 @@
 #include "ssne/scheduler.h"
 #include "ssne/audio.h"
 #include "ssne/checkpoint.h"
+#include "ssne/editor_logic_effects.h"
 #include "state_io.h"
 
 void ssne_timebase_shift(int64_t ticks);
@@ -153,6 +154,7 @@ std::vector<uint8_t> capture_runtime(const PPCContext& ctx) {
     si_state_save(pay);
     exi_state_save(pay);
     gx_state_save(pay);
+    editor_effect_state_save(pay);
     StateWriter w;
     w.bytes(kMagic, 8);
     w.u32(kVersion);
@@ -224,7 +226,7 @@ bool inspect_runtime(const PPCContext& ctx, const std::vector<uint8_t>& data,
     auto check = p;
     const bool valid = check.tag("RAM1") && check.block(nullptr, guest_ram_size()>0x02000000?kRamSize:0x02000000) && check.bytes(nullptr, kLockedCacheSize)
         && sched_state_load(check, false) && hw_state_load(check, false) && si_state_load(check, false)
-        && exi_state_load(check, false) && gx_state_load(check, false) && check.ok && check.pos == check.n;
+        && exi_state_load(check, false) && gx_state_load(check, false) && editor_effect_state_load(check,false) && check.ok && check.pos == check.n;
     if (!valid) { error = "The state layout is damaged or incompatible; running game unchanged"; return false; }
     if (tb > uint64_t(std::numeric_limits<int64_t>::max()) || ssne_timebase() > uint64_t(std::numeric_limits<int64_t>::max())) {
         error = "Invalid state timebase"; return false;
@@ -238,7 +240,7 @@ bool apply_runtime(PPCContext& ctx, RuntimeImage image) {
     ssne_timebase_shift(int64_t(image.timebase) - int64_t(ssne_timebase()));
     const bool ok = p.tag("RAM1") && p.block(g_ram, guest_ram_size()>0x02000000?kRamSize:0x02000000)
         && p.bytes(g_locked_cache, kLockedCacheSize) && sched_state_load(p) && hw_state_load(p)
-        && si_state_load(p) && exi_state_load_volatile(p) && gx_state_load(p) && p.ok && p.pos == p.n;
+        && si_state_load(p) && exi_state_load_volatile(p) && gx_state_load(p) && editor_effect_state_load(p) && p.ok && p.pos == p.n;
     if (ok) ctx = image.context;
     return ok;
 }

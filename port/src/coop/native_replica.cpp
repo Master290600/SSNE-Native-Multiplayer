@@ -1,8 +1,10 @@
 #include "native_replica.h"
+#include "native_scalar_projection.h"
 #include "native_vehicle.h"
 #include "ssne/native_entity.h"
 #include "ssne/performance.h"
 #include "native_lifecycle.h"
+#include "native_particles.h"
 #include "native_configuration.h"
 #include "native_presentation.h"
 #include "client_presentation.h"
@@ -83,7 +85,9 @@ const auto& render_property_names(){
     }};
     return names;
 }
-bool lifecycle_property(const std::string& key){return key=="brush_segment" || key=="brush_progress" || key=="movement_mode" || key=="camera_frozen" || key=="selected_weapon" || key=="weapon_modes";}
+bool lifecycle_property(const std::string& key){return key=="particles_enabled" || key=="brush_segment" || key=="brush_progress" || key=="movement_mode" || key=="camera_frozen" || key=="selected_weapon" || key=="weapon_modes";}
+bool reuse_lifecycle_scalars(){static const bool enabled=[] {const auto* value=std::getenv("SSNE_REPLICA_LIFECYCLE_REUSE");return !value || std::strcmp(value,"0");}();return enabled;}
+bool compare_lifecycle_scalars(){static const bool enabled=[] {const auto* hidden=std::getenv("SSNE_TEST_HIDDEN");const auto* value=std::getenv("SSNE_TEST_COMPARE_REPLICA_LIFECYCLE");return hidden && !std::strcmp(hidden,"1") && value && !std::strcmp(value,"1");}();return enabled;}
 template<class Keep> EntityState filtered_fields(const EntityState& e,Keep keep){
     EntityState out{e.id,e.kind,e.definition,e.resource,e.owner,{}};
     for(const auto& item:e.properties)if(keep(item.first))out.properties.emplace_hint(out.properties.end(),item);
@@ -96,7 +100,7 @@ enum class PlanField : unsigned char {
     Bomb, HeldFlash, MuzzleFlash, Powerups, Barrel, WeaponBones,
     WeaponModel, MarkerAnimation, Marker, Render, BodyRender, Corpse,
     PlayerNotice, Hint, Combo, Reentry, Sidebar, WeaponBar,
-    HeldResource, Destructible, BodyBones, Enemy, Script, Brush,
+    HeldResource, Destructible, BodyBones, Enemy, Script, Particles, Brush,
     WeaponsHidden, WeaponModes, Selection, CameraFrozen, Movement, Availability,
     ProjectileModel, ProjectileSource, ProjectileTrail, ProjectileSpin, ProjectileVisual, EnergyPhase,
     ExtraVisual, EnergyVisual, ProjectileScale, ProjectileRotation, Velocity, Identity,
@@ -153,6 +157,7 @@ PlanField plan_field(std::string_view key) {
         if(key=="netricsa_pages")return PlanField::PlayerNotice;
         break;
     case 'p':
+        if(key=="particles_kind" || key=="particles_enabled")return PlanField::Particles;
         if(key=="powerups")return PlanField::Powerups;
         if(key.starts_with("pickup_notice_") || key.starts_with("level_intro_"))return PlanField::PlayerNotice;
         if(key=="projectile_model")return PlanField::ProjectileModel;
@@ -240,7 +245,8 @@ bool build_writes(const EntityState& e,uint32_t object,std::vector<Write>& write
     const bool destructible=e.kind==EntityKind::Destructible && (e.definition==1 || e.definition==2);
     const bool trigger=e.kind==EntityKind::Mission && e.definition==1;
     const bool button=e.kind==EntityKind::Switch && e.definition==1;
-    const bool script=trigger || button;
+    const bool particles=e.kind==EntityKind::Mission && e.definition==native_particles_definition;
+    const bool script=trigger || button || particles;
     const bool marker=e.kind==EntityKind::Physics && (e.definition==1 || e.definition==2);
     const bool detached_rotor=e.kind==EntityKind::Physics && e.definition==4;
     if(detached_rotor && (mem_read32(object+0x48)!=0x8020B228u || !validate_native_detached_rotor(e,error)))return false;
@@ -248,7 +254,8 @@ bool build_writes(const EntityState& e,uint32_t object,std::vector<Write>& write
     const bool rocket=projectile_type!=nullptr;
     if(!player && !pickup && e.kind!=EntityKind::Enemy && !brush && !script && !rocket && !marker && !corpse && !detached_rotor && !(e.kind==EntityKind::Physics && e.definition==5) && !destructible)return fail("Native class schema is not supported");
     if(destructible && !validate_native_destructible(object,e,error))return false;
-    if(!readable(object,player?0x790:pickup?0x184:rocket?projectile_type->size:brush?0x13C:trigger?0xA8:button?0x68:0xD4))return fail("Native object storage is unavailable");
+    if(!readable(object,player?0x790:pickup?0x184:rocket?projectile_type->size:brush?0x13C:trigger?0xA8:button?0x68:particles?0x64:0xD4))return fail("Native object storage is unavailable");
+    if(particles && !validate_native_particles(object,e,defer_lifecycle,error))return false;
     if(rocket && (mem_read32(object+0x48)!=projectile_type->vtable || !validate_native_projectile_creation(e,error)))return false;
     auto add=[&](uint32_t address,uint32_t value,unsigned size=4){writes.push_back({address,value,size});};
     auto visible_write=[&](uint32_t proxy,uint32_t visible,bool presentation=false){
@@ -504,7 +511,7 @@ bool build_writes(const EntityState& e,uint32_t object,std::vector<Write>& write
             continue;
         }
         case PlanField::Script: {
-            if(!script || mem_read32(object+0x48)!=(trigger?0x80209758u:0x80208B60u))return fail("Script state targets another native class");
+            if(!script || mem_read32(object+0x48)!=(particles?native_particles_vtable:trigger?0x80209758u:0x80208B60u))return fail("Script state targets another native class");
             if(key=="script_index") {
                 const auto* index=std::get_if<int64_t>(&value);auto resolved=index?native_script_reference_address(*index):std::nullopt;
                 // Unindexed authored owners bind uniquely by class and spawn
@@ -512,7 +519,7 @@ bool build_writes(const EntityState& e,uint32_t object,std::vector<Write>& write
                 const bool unindexed=index && *index==0 && mem_read32(object+0x50)==0;
                 if(!unindexed && (!resolved || *resolved!=object))return fail("Native script level index mismatch");
             } else if(key=="script_references") {
-                const auto* references=std::get_if<std::vector<int64_t>>(&value);if(!references || references->size()!=(trigger?11u:1u))return fail("Invalid native script reference slots");
+                const auto* references=std::get_if<std::vector<int64_t>>(&value);if(particles || !references || references->size()!=(trigger?11u:1u))return fail("Invalid native script reference slots");
                 for(unsigned i=0;i<references->size();++i){auto target=native_script_reference_address((*references)[i]);if(!target)return fail("Native script reference cannot be resolved in this level");add(object+0x58+i*4,*target);}
             } else if(key=="trigger_timer") {
                 const auto* timer=std::get_if<float>(&value);if(!trigger || !timer || !std::isfinite(*timer) || *timer<0 || *timer>1000000.f)return fail("Invalid native trigger timer");add(object+0x98,f2u(*timer));
@@ -527,12 +534,18 @@ bool build_writes(const EntityState& e,uint32_t object,std::vector<Write>& write
                     else if(key=="trigger_dispatched")offset=0xA4;
                     else if(key=="trigger_pulses"){offset=0x90;counter=true;}
                     else if(key=="trigger_firings"){offset=0x94;counter=true;}
-                } else if(key=="switch_enabled")offset=0x60;
-                else if(key=="switch_available")offset=0x64;
+                } else if(button && key=="switch_enabled")offset=0x60;
+                else if(button && key=="switch_available")offset=0x64;
                 const auto* n=std::get_if<int64_t>(&value);
                 if(!offset || !n || *n<0 || uint64_t(*n)>(counter?0xFFFFFFFFull:1ull))return fail("Invalid native script scalar");
                 add(object+offset,uint32_t(*n));
             }
+            continue;
+        }
+        case PlanField::Particles: {
+            if(!particles)return fail("Particle field targets another native class");
+            // validate_native_particles checked identity, kind and desired
+            // emission together. Native activation commits after full preflight.
             continue;
         }
         case PlanField::Brush: {
@@ -750,7 +763,13 @@ bool commit_scalar_writes(std::vector<Write>& writes,std::string& error) {
     return true;
 }
 }
-void NativeReplica::reset(){end_presentation();bindings_.clear();combo_presented_.clear();combo_timers_.clear();epoch_=0;projectile_visuals_.clear();seen_projectiles_.clear();projectile_visual_sequence_=0;ssne::replica_clear_enemy_poses();}
+void NativeReplica::reset(){end_presentation();presentation_scratch_={};presentation_reference_={};presentation_plan_.clear();bindings_.clear();particle_ids_.clear();combo_presented_.clear();combo_timers_.clear();epoch_=0;projectile_visuals_.clear();seen_projectiles_.clear();projectile_visual_sequence_=0;ssne::replica_clear_enemy_poses();}
+bool NativeReplica::advance_particles(PPCContext& context,float seconds,std::string& error){
+    if(particle_ids_.empty())return true;
+    std::vector<uint32_t> objects;objects.reserve(particle_ids_.size());
+    for(const auto id:particle_ids_){const auto object=local_address(id);if(!object){error="Replica particle lifetime binding expired";return false;}objects.push_back(object);}
+    return update_native_particles(context,objects,seconds,error);
+}
 bool NativeReplica::advance_combo_huds(PPCContext& context,float seconds,std::string& error){
     if(!std::isfinite(seconds) || seconds<0 || seconds>60 || !ssne_find_func(0x800BC008) || mem_read32(0x800BC008)!=0x9421FFF0u || !readable(context.r[1]-0x800,0x800)){error="Invalid combo presentation clock";return false;}
     const auto base=context.r[1]-0x800;std::array<uint8_t,0x800> saved;std::memcpy(saved.data(),ssne::g_ram+(base-0x80000000u),saved.size());
@@ -768,6 +787,33 @@ bool NativeReplica::advance_combo_huds(PPCContext& context,float seconds,std::st
     }
     std::memcpy(ssne::g_ram+(base-0x80000000u),saved.data(),saved.size());return true;
 }
+namespace {
+bool render_bone_spans_enabled(){
+    static const bool enabled=[] {const auto* mode=std::getenv("SSNE_RENDER_BONE_SPANS");return !mode || std::strcmp(mode,"0")!=0;}();return enabled;
+}
+bool presentation_scratch_reuse_enabled(){
+    static const bool enabled=[] {const auto* mode=std::getenv("SSNE_PRESENTATION_SCRATCH_REUSE");return !mode || std::strcmp(mode,"0")!=0;}();return enabled;
+}
+bool visual_plan_reuse_enabled(){
+    // Process-only private A/B reference; never a saved or network preference.
+    static const bool enabled=[] {const auto* mode=std::getenv("SSNE_VISUAL_PLAN_REUSE");return !mode || std::strcmp(mode,"0")!=0;}();
+    return enabled;
+}
+}
+void NativeReplica::PresentationBuffers::clear_frame(){
+    // Keep owned capacities, but never carry a previous lease's pointers/values.
+    for(auto& pose:poses){pose.object=pose.model=pose.hand=0;pose.weapon=-1;pose.original.clear();pose.visual.clear();}
+    for(auto& span:saved_spans){span.address=0;span.original.clear();}
+    for(auto& packed:packed_spans)packed.clear();
+    spans.clear();scalar_ranges.clear();pose_count=span_count=0;
+}
+size_t NativeReplica::PresentationBuffers::retained_bytes() const{
+    size_t bytes=poses.capacity()*sizeof(BorrowedPose)+saved_spans.capacity()*sizeof(presentation_detail::SavedBoneSpan)+packed_spans.capacity()*sizeof(std::vector<uint8_t>)+spans.capacity()*sizeof(presentation_detail::NativeBoneSpan)+scalar_ranges.capacity()*sizeof(presentation_detail::BoneWriteRange);
+    for(const auto& pose:poses)bytes+=(pose.original.capacity()+pose.visual.capacity())*sizeof(float);
+    for(const auto& span:saved_spans)bytes+=span.original.capacity();
+    for(const auto& packed:packed_spans)bytes+=packed.capacity();
+    return bytes;
+}
 bool NativeReplica::begin_presentation(const std::map<EntityId,EntityState>& entities,std::string& error){
     return begin_presentation_native(entities,nullptr,error);
 }
@@ -775,13 +821,29 @@ bool NativeReplica::begin_presentation_with_vehicles(const std::map<EntityId,Ent
     return begin_presentation_native(entities,&vehicles,error);
 }
 bool NativeReplica::begin_presentation_native(const std::map<EntityId,EntityState>& entities,const Properties* vehicles,std::string& error){
-    if(!presentation_saved_.empty() || !presentation_poses_.empty()){error="Nested client presentation lease";return false;}
+    if(presentation_active_){error="Nested client presentation lease";return false;}
+    const bool reuse_scratch=presentation_scratch_reuse_enabled();
+    auto* buffers=reuse_scratch?&presentation_scratch_:&presentation_reference_;
+    buffers->clear_frame();
+    struct PreflightCleanup {
+        PresentationBuffers& buffers;bool retain,committed=false;
+        ~PreflightCleanup(){if(!committed){buffers.clear_frame();if(!retain || buffers.poses.size()>presentation_scratch_pose_limit_ || buffers.retained_bytes()>presentation_scratch_budget_)buffers={};}}
+    } cleanup{*buffers,reuse_scratch};
     // Bone matrices contain thousands of adjacent words. Avoid one tree node
     // allocation per word in both the write plan and its restoration copy.
-    struct VisualWrite {uint32_t address,value;bool replace;};
-    std::vector<VisualWrite> plan;plan.reserve(entities.size()*128);
-    std::vector<BorrowedPose> poses;
-    auto stage=[&](uint32_t address,float value){if(!readable(address,4) || !std::isfinite(value) || std::abs(value)>1000000.f)return false;plan.push_back({address,f2u(value),true});return true;};
+    const bool reuse_plan=visual_plan_reuse_enabled();
+    std::vector<presentation_detail::VisualWrite> reference_plan;
+    auto& plan=reuse_plan?presentation_plan_:reference_plan;
+    plan.clear();plan.reserve(entities.size()*128);
+    auto& poses=buffers->poses;auto& pose_count=buffers->pose_count;
+    auto next_pose=[&]() -> BorrowedPose& {if(pose_count==poses.size())poses.emplace_back();return poses[pose_count];};
+    const bool want_spans=render_bone_spans_enabled();bool vehicle_pose_words=false;
+    auto& spans=buffers->spans;uint64_t next_ordinal=0;
+    auto append=[&](uint32_t address,uint32_t value,bool replace){
+        const auto ordinal=next_ordinal;if(!presentation_detail::reserve_visual_ordinals(next_ordinal,1))return false;
+        plan.push_back({address,value,uint32_t(ordinal),replace});return true;
+    };
+    auto stage=[&](uint32_t address,float value){if(!readable(address,4) || !std::isfinite(value) || std::abs(value)>1000000.f)return false;return append(address,f2u(value),true);};
     auto matrix=[&](uint32_t address,const Properties& p,const std::string& prefix){if(!p.contains(prefix+"0") && !p.contains(prefix+"1") && !p.contains(prefix+"2"))return true;PresentationMatrix m;if(!presentation_matrix(p,prefix,m) || !readable(address,48))return false;for(unsigned i=0;i<12;++i)if(!stage(address+i*4,m[i]))return false;return true;};
     auto bone=[&](uint32_t object,const auto& binding,const Properties& p,const std::string& prefix,int weapon=-1,unsigned hand=0){
         const auto field=p.find(prefix+"matrices");if(field==p.end())return true;
@@ -789,21 +851,30 @@ bool NativeReplica::begin_presentation_native(const std::map<EntityId,EntityStat
         const auto count=p.find(prefix+"count"),layout=p.find(prefix+"layout");
         if(!binding || !binding->model)return true;
         if(!values || count==p.end() || layout==p.end() || std::get<int64_t>(count->second)!=binding->count || uint64_t(std::get<int64_t>(layout->second))!=binding->layout || values->size()!=binding->count*12 || !readable(binding->matrices,unsigned(values->size())*4))return false;
-        BorrowedPose pose{object,binding->model,weapon,hand,{},*values};
-        pose.original.reserve(values->size());
-        for(unsigned i=0;i<values->size();++i){if(!stage(binding->matrices+i*4,(*values)[i]))return false;pose.original.push_back(u2f(mem_read32(binding->matrices+i*4)));}
+        auto& pose=next_pose();pose.object=object;pose.model=binding->model;pose.weapon=weapon;pose.hand=hand;pose.visual.assign(values->begin(),values->end());
+        if(want_spans){
+            if(!presentation_detail::valid_bone_values(pose.visual))return false;
+            const auto ordinal=next_ordinal;if(!presentation_detail::reserve_visual_ordinals(next_ordinal,values->size()))return false;
+            spans.push_back({binding->matrices,uint32_t(values->size()),uint32_t(ordinal),pose_count});
+        }else{
+            pose.original.reserve(values->size());
+            for(unsigned i=0;i<values->size();++i){if(!stage(binding->matrices+i*4,(*values)[i]))return false;pose.original.push_back(u2f(mem_read32(binding->matrices+i*4)));}
+        }
         // Pose registration invalidates the mesh stamp; it belongs to this
         // lease too, and must not leak into a subsequent authority capture.
-        plan.push_back({binding->model+0x84,mem_read32(binding->model+0x84),false});poses.push_back(std::move(pose));return true;
+        if(!append(binding->model+0x84,mem_read32(binding->model+0x84),false))return false;++pose_count;return true;
     };
     if(vehicles){
         NativeVehiclePresentation vehicle;
         if(!prepare_native_vehicle_presentation(*vehicles,vehicle,error))return false;
         for(const auto& [address,value]:vehicle.words)if(!stage(address,value)){error="Invalid vehicle presentation word";return false;}
+        // Vehicle.words already contains its skeleton words. Keep this full
+        // legacy plan rather than retagging its separately duplicated poses.
+        vehicle_pose_words=!vehicle.poses.empty();
         for(auto& p:vehicle.poses){
-            const auto matrices=mem_read32(p.model+0x78);BorrowedPose pose{p.object,p.model,-1,0,{},std::move(p.bones)};
+            const auto matrices=mem_read32(p.model+0x78);auto& pose=next_pose();pose.object=p.object;pose.model=p.model;pose.weapon=-1;pose.hand=0;pose.visual.assign(p.bones.begin(),p.bones.end());
             for(unsigned i=0;i<pose.visual.size();++i)pose.original.push_back(u2f(mem_read32(matrices+i*4)));
-            plan.push_back({p.model+0x84,mem_read32(p.model+0x84),false});poses.push_back(std::move(pose));
+            if(!append(p.model+0x84,mem_read32(p.model+0x84),false)){error="Client vehicle presentation write plan is too large";return false;}++pose_count;
         }
     }
     {
@@ -907,24 +978,50 @@ bool NativeReplica::begin_presentation_native(const std::map<EntityId,EntityStat
     // Keep the old map's last-write semantics, including try_emplace for mesh
     // stamps and aliased projectile proxies. Validate the entire frame before
     // touching guest RAM, then save each unique address exactly once.
-    std::stable_sort(plan.begin(),plan.end(),[](const auto& a,const auto& b){return a.address<b.address;});
-    size_t unique=0;
-    for(size_t first=0;first<plan.size();){
-        size_t next=first+1;auto write=plan[first];
-        while(next<plan.size() && plan[next].address==write.address){if(plan[next].replace)write=plan[next];++next;}
-        plan[unique++]=write;first=next;
+    auto& scalar_ranges=buffers->scalar_ranges;
+    bool span_path=want_spans && !vehicle_pose_words;
+    if(span_path){scalar_ranges.reserve(plan.size());for(const auto& write:plan)scalar_ranges.push_back({write.address,4});span_path=presentation_detail::disjoint_bone_spans(spans,scalar_ranges,ssne::guest_ram_end());}
+    auto& saved_spans=buffers->saved_spans;auto& packed_spans=buffers->packed_spans;
+    auto& span_count=buffers->span_count;
+    if(span_path){
+        saved_spans.reserve(spans.size());if(packed_spans.size()<spans.size())packed_spans.resize(spans.size());
+        for(size_t i=0;i<spans.size();++i){const auto& span=spans[i];if(span_count==saved_spans.size())saved_spans.emplace_back();auto& saved=saved_spans[span_count];saved.address=span.address;saved.original.resize(size_t(span.count)*4);
+            std::memcpy(saved.original.data(),ssne::host_ptr(span.address),saved.original.size());
+            if(!presentation_detail::prepare_bone_bytes(saved.original,poses[span.pose_index].visual,poses[span.pose_index].original,packed_spans[i])){error="Invalid client bone span packing";return false;}
+            ++span_count;}
+    }else if(want_spans){
+        // Any span alias (including a scalar/mesh-stamp overlap), or an
+        // existing vehicle pose block, uses the complete old word semantics.
+        for(const auto& span:spans){auto& original=poses[span.pose_index].original;original.reserve(span.count);for(unsigned i=0;i<span.count;++i)original.push_back(u2f(mem_read32(span.address+i*4)));}
+        if(!presentation_detail::expand_bone_words(plan,spans,poses)){error="Invalid client bone span fallback";return false;}
     }
-    plan.resize(unique);presentation_saved_.reserve(unique);
+    presentation_detail::normalize_visual_plan(plan,reuse_plan);
+    presentation_saved_.reserve(plan.size());
     for(const auto& write:plan)presentation_saved_.emplace_back(write.address,mem_read32(write.address));
-    presentation_poses_=std::move(poses);
+    // All new owned buffers and the complete backup exist before any write.
+    // Every span has a corresponding owning pose, so the existing apply/detach
+    // lease guard remains active even when scalar word count is zero.
+    cleanup.committed=true;
+    // Enforce the retention bound using actual vector capacities. An oversized
+    // prepared frame keeps its complete owned backup only for this lease.
+    if(reuse_scratch && (poses.size()>presentation_scratch_pose_limit_ || buffers->retained_bytes()>presentation_scratch_budget_)){
+        presentation_reference_=std::move(*buffers);*buffers={};buffers=&presentation_reference_;
+    }
+    presentation_reference_active_=buffers==&presentation_reference_;presentation_active_=true;
     for(const auto& write:plan)mem_write32(write.address,write.value);
-    for(const auto& pose:presentation_poses_){const bool ok=pose.weapon<0?ssne::replica_enemy_pose(pose.object,pose.model,pose.visual):ssne::replica_weapon_pose(pose.object,unsigned(pose.weapon),pose.hand,pose.visual);if(!ok){end_presentation();error="Client visual pose registration failed";return false;}}
+    for(size_t i=0;i<buffers->span_count;++i)std::memcpy(ssne::host_ptr(buffers->saved_spans[i].address),buffers->packed_spans[i].data(),buffers->packed_spans[i].size());
+    for(size_t i=0;i<buffers->pose_count;++i){const auto& pose=buffers->poses[i];const bool ok=pose.weapon<0?ssne::replica_enemy_pose(pose.object,pose.model,pose.visual):ssne::replica_weapon_pose(pose.object,unsigned(pose.weapon),pose.hand,pose.visual);if(!ok){end_presentation();error="Client visual pose registration failed";return false;}}
     return true;
 }
 void NativeReplica::end_presentation(){
-    for(const auto& pose:presentation_poses_){const bool ok=pose.weapon<0?ssne::replica_enemy_pose(pose.object,pose.model,pose.original):ssne::replica_weapon_pose(pose.object,unsigned(pose.weapon),pose.hand,pose.original);if(!ok)ssne::fatal("Client presentation skeleton lifetime changed inside native render");}
+    if(!presentation_active_)return;
+    auto& buffers=presentation_reference_active_?presentation_reference_:presentation_scratch_;
+    for(size_t i=0;i<buffers.pose_count;++i){const auto& pose=buffers.poses[i];const bool ok=pose.weapon<0?ssne::replica_enemy_pose(pose.object,pose.model,pose.original):ssne::replica_weapon_pose(pose.object,unsigned(pose.weapon),pose.hand,pose.original);if(!ok)ssne::fatal("Client presentation skeleton lifetime changed inside native render");}
     for(const auto& [address,value]:presentation_saved_)mem_write32(address,value);
-    presentation_saved_.clear();presentation_poses_.clear();
+    for(size_t i=0;i<buffers.span_count;++i){const auto& span=buffers.saved_spans[i];std::memcpy(ssne::host_ptr(span.address),span.original.data(),span.original.size());}
+    presentation_saved_.clear();buffers.clear_frame();
+    if(presentation_reference_active_)buffers={};
+    presentation_reference_active_=false;presentation_active_=false;
 }
 uint32_t NativeReplica::local_address(EntityId id)const{auto it=bindings_.find(id);return it==bindings_.end()?0:local_.local_address(it->second);}
 bool NativeReplica::play_projectile_visual(PPCContext& context,uint64_t epoch,const NativeProjectileVisual& event,uint64_t frame,std::string& error){
@@ -980,6 +1077,9 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
     ssne::perf::detail::Scope perf_phase(ssne::perf::detail::CaptureBindings);
     ssne::perf::Laps timings;
     NativeReplicaResult result;
+    // A logical disconnect must not invalidate resources borrowed by a render
+    // lease. Reconcile only after the native render owner has restored RAM.
+    if(presentation_active_){result.error="Native replica apply during active presentation lease";return result;}
     // Reject an invalid guest call context before committing even scalar fields.
     if(mem_read32(0x80000000u)!=0x47334250u || context.r[13]!=0x802E22A0u || context.r[1]<0x80000800u || !readable(context.r[1]-0x800u,0x800u)){result.error="Native replica lifecycle context is unavailable";return result;}
     if(!epoch){result.error="Invalid replica epoch";return result;}
@@ -1000,13 +1100,38 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
         if(kind==EntityKind::Pickup && !native_pickup_glow_proxy(object)){result.error="Removal has no verified pickup glow";return false;}
         return true;
     };
+    // Session synchronized these owners from THIS snapshot's connection roster,
+    // not its ready/occupancy mask. Even an unready newly joined participant
+    // needs its reserved player state, including on the first epoch sample.
+    std::array<const EntityState*,max_players> source_players{};
+    for(const auto& [id,entity]:source)if(entity.kind==EntityKind::Player){
+        const auto field=entity.properties.find("player_slot");const auto* slot=field==entity.properties.end()?nullptr:std::get_if<int64_t>(&field->second);
+        if(!slot || *slot<0 || *slot>=max_players || source_players[size_t(*slot)]){result.error="Invalid/duplicate authoritative player slot";return result;}
+        source_players[size_t(*slot)]=&entity;
+    }
+    for(const auto& [id,entity]:local.entities)if(entity.kind==EntityKind::Player){
+        const auto field=entity.properties.find("player_slot");const auto* slot=field==entity.properties.end()?nullptr:std::get_if<int64_t>(&field->second);
+        if(!slot || *slot<0 || *slot>=max_players){result.error="Invalid local player slot";return result;}
+        const auto* published=source_players[size_t(*slot)];
+        if((*slot==0 || entity.owner.generation) && (!published || (entity.owner.generation && published->owner!=entity.owner))){result.error="Connected native player is absent or has stale ownership";return result;}
+    }
     // Verify the complete schema and every existing lifetime before calling any
     // native allocator/destructor. Invalid network batches cannot spawn actors.
     for(auto it=staged.begin();it!=staged.end();) {
         if(source.contains(it->first)){++it;continue;}
         auto object=local_.local_address(it->second);
-        if(!object || !local.entities.contains(it->second) || local.entities.at(it->second).kind==EntityKind::Player){result.error="Player/stale removal needs native session lifecycle handling";return result;}
-        const auto kind=local.entities.at(it->second).kind;if(!validate_removal(object,kind))return result;
+        if(!object || !local.entities.contains(it->second)){result.error="Stale removal needs native session lifecycle handling";return result;}
+        const auto& candidate=local.entities.at(it->second);const auto kind=candidate.kind;
+        if(kind==EntityKind::Player){
+            const auto field=candidate.properties.find("player_slot");const auto* slot=field==candidate.properties.end()?nullptr:std::get_if<int64_t>(&field->second);
+            const auto registry=ssne::native_party_registry();
+            // Reservations outlive socket identities. Detach only the logical
+            // server binding; occupancy owns body visibility, and the native
+            // actor/HUD/models remain available for same-slot later joins.
+            if(!slot || *slot<=0 || *slot>=ssne::native_party_capacity() || candidate.owner.generation || !readable(object,0x790) || mem_read32(object+0x48)!=0x802121E8u || mem_read32(object+0x17C)!=uint32_t(*slot) || !readable(registry+uint32_t(*slot)*4,4) || mem_read32(registry+uint32_t(*slot)*4)!=object){result.error="Player detach requires a disconnected verified native reservation";return result;}
+            it=staged.erase(it);continue;
+        }
+        if(!validate_removal(object,kind))return result;
         used.insert(it->second);
         removals.emplace_back(object,kind);it=staged.erase(it);
     }
@@ -1052,6 +1177,15 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
         staged[id]=match;
     }
     } // Native lifecycle work below cannot see cached resource layouts.
+    std::vector<std::pair<uint32_t,const EntityState*>> particle_changes;
+    for(const auto&[id,e]:source)if(e.kind==EntityKind::Mission && e.definition==native_particles_definition){
+        if(!staged.contains(id) || particle_changes.size()>=4096 || !readable(context.r[1]-0x4000,0x4000)){
+            result.error="Replica particle lifecycle capacity/context unavailable";return result;
+        }
+        const auto object=local_.local_address(staged.at(id));
+        if(!validate_native_particles(object,e,true,result.error))return result;
+        particle_changes.emplace_back(object,&e);
+    }
     for(const auto& [id,e]:source)if(e.kind==EntityKind::Projectile) {
         if(!validate_native_projectile_creation(e,result.error))return result;
         const auto reference=std::get<EntityReference>(e.properties.at("projectile_source")).id;
@@ -1061,7 +1195,7 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
     // A late join loads the original level, including objects already removed
     // by the host before the first snapshot. They have no previous binding, so
     // the normal delta-removal loop above cannot discover them.
-    for(const auto& [id,e]:local.entities)if(!used.contains(id) && !visual_only.contains(id) && (e.kind==EntityKind::Pickup || e.kind==EntityKind::Enemy || e.kind==EntityKind::Projectile || (e.kind==EntityKind::Physics && (e.definition==3 || e.definition==4 || e.definition==5)))){
+    for(const auto& [id,e]:local.entities)if(!used.contains(id) && !visual_only.contains(id) && (e.kind==EntityKind::Pickup || e.kind==EntityKind::Enemy || e.kind==EntityKind::Projectile || (e.kind==EntityKind::Mission && e.definition==native_particles_definition) || (e.kind==EntityKind::Physics && (e.definition==3 || e.definition==4 || e.definition==5)))){
         const auto object=local_.local_address(id);if(!validate_removal(object,e.kind))return result;
         removals.emplace_back(object,e.kind);
     }
@@ -1166,9 +1300,14 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
         // rediscovering bindings, or copying each entity's writes again.
         result.applied=commit_scalar_writes(prepared_writes,result.error);
         result.objects=unsigned(source.size());result.writes=unsigned(prepared_writes.size());
+    } else if(reuse_lifecycle_scalars()) {
+        // Allocators can replace resource storage. Rebuild every native
+        // binding/write after lifecycle exactly as before, but borrow source
+        // entities whose scalar projection removes no fields (notably NPC
+        // skeletons and projectiles). No prepared RAM address crosses this gap.
+        result=apply_scalars(epoch,source,true);
     } else {
-        // Native creation can replace resource storage. Rebuild against the
-        // current bindings exactly as before, including all validation.
+        // Private reference: retain the original complete filtered-world copy.
         std::map<EntityId,EntityState> scalar_fields;
         for(const auto& [id,e]:source)scalar_fields.emplace_hint(scalar_fields.end(),id,filtered_fields(e,[&](const std::string& key){
             return !lifecycle_property(key) && key!="marker_active" && key!="powerups" && !key.starts_with("weapon_model") && !key.starts_with("weapon_bomb") &&
@@ -1218,6 +1357,7 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
     for(const auto& [id,e]:source)if(e.properties.contains("reentry_hud"))if(!apply_native_reentry_hud(context,local_address(id),e,result.error))ssne::fatal(result.error.c_str());
     for(const auto& [id,e]:source)if(e.properties.contains("powerups"))if(!apply_native_powerups(context,local_address(id),std::get<std::vector<float>>(e.properties.at("powerups")),result.error))ssne::fatal(result.error.c_str());
     timings.mark("hud");perf_phase.next(ssne::perf::detail::Markers);
+    for(const auto&[object,e]:particle_changes)if(!apply_native_particles(context,object,*e,result.error))ssne::fatal(result.error.c_str());
     for(const auto& marker:markers){
         if(!apply_native_marker(context,marker.object,marker.active,result.error))ssne::fatal(result.error.c_str());
         if(!marker.animation.empty() && !apply_native_arrow_animation(context,marker.object,marker.animation,result.error))ssne::fatal(result.error.c_str());
@@ -1323,50 +1463,79 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
     timings.mark("projectiles_retirement");
     for(auto [object,kind]:removals){if(!remove_native_entity(context,object,result.error,kind))ssne::fatal(result.error.c_str());ssne::log_message("[coop-replica-remove] native="+std::to_string(object));}
     if(vehicles && (!apply_native_vehicle_poses(*vehicles,result.error) || !update_native_vehicle_huds(context,*vehicles,result.error)))ssne::fatal(result.error.c_str());
+    particle_ids_.clear();
+    for(const auto&[id,e]:source)if(e.kind==EntityKind::Mission && e.definition==native_particles_definition)particle_ids_.push_back(id);
     return result;
 }
 NativeReplicaResult NativeReplica::apply(uint64_t epoch,const std::map<EntityId,EntityState>& source) {
     return apply_scalars(epoch,source);
 }
-NativeReplicaResult NativeReplica::apply_scalars(uint64_t epoch,const std::map<EntityId,EntityState>& source) {
-    NativeReplicaResult result;if(!epoch){result.error="Invalid replica epoch";return result;}
+NativeReplicaResult NativeReplica::apply_scalars(uint64_t epoch,const std::map<EntityId,EntityState>& source,bool lifecycle_projection) {
+    NativeReplicaResult result;
+    if(presentation_active_){result.error="Native replica apply during active presentation lease";return result;}
+    auto prepare=[&](const std::map<EntityId,EntityState>& source,bool project,std::map<EntityId,EntityId>& next,std::vector<Write>& writes,std::string& error){
+    if(!epoch){error="Invalid replica epoch";return false;}
+    if(!project){
     for(const auto& [id,e]:source)if(auto flag=e.properties.find("camera_frozen");flag!=e.properties.end()) {
         auto frozen=std::get_if<int64_t>(&flag->second);auto actor=local_address(id);
-        if(!frozen || (*frozen!=0 && *frozen!=1) || (actor && mem_read32(actor+0x370)!=uint32_t(*frozen))){result.error="Camera change requires native lifecycle context";return result;}
+        if(!frozen || (*frozen!=0 && *frozen!=1) || (actor && mem_read32(actor+0x370)!=uint32_t(*frozen))){error="Camera change requires native lifecycle context";return false;}
     }
     for(const auto& [id,e]:source)if(auto mode=e.properties.find("movement_mode");mode!=e.properties.end()) {
         auto value=std::get_if<int64_t>(&mode->second);auto actor=local_address(id);
-        if(!value || *value<0 || *value>3 || (actor && mem_read32(actor+0x340)!=uint32_t(*value))){result.error="Movement change requires native lifecycle context";return result;}
+        if(!value || *value<0 || *value>3 || (actor && mem_read32(actor+0x340)!=uint32_t(*value))){error="Movement change requires native lifecycle context";return false;}
+    }
     }
     const auto local=local_.capture_bindings();
-    if(!local.error.empty()){result.error=local.error;return result;}auto next=epoch==epoch_?bindings_:std::map<EntityId,EntityId>{};
-    for(const auto& [id,binding]:next)if(!source.contains(id)){result.error="Native removal requires lifecycle handling";return result;}
-    std::set<EntityId> used;std::vector<Write> writes;
+    if(!local.error.empty()){error=local.error;return false;}next=epoch==epoch_?bindings_:std::map<EntityId,EntityId>{};
+    for(const auto& [id,binding]:next)if(!source.contains(id)){error="Native removal requires lifecycle handling";return false;}
+    std::set<EntityId> used;
     {
     NativePoseReadScope pose_reads;
     for(const auto& [id,entity]:source) {
-        if(!id || entity.id!=id){result.error="Invalid server entity identity";return result;}
+        if(!id || entity.id!=id){error="Invalid server entity identity";return false;}
         EntityId match=0;
         if(auto it=next.find(id);it!=next.end()) {
-            if(!local.entities.contains(it->second) || !local_.local_address(it->second)){result.error="Replica binding expired";return result;}
+            if(!local.entities.contains(it->second) || !local_.local_address(it->second)){error="Replica binding expired";return false;}
             match=it->second;
         } else {
             for(const auto& [candidate_id,candidate]:local.entities) {
                 if(used.contains(candidate_id) || candidate.kind!=entity.kind || candidate.definition!=entity.definition)continue;
                 bool equal=entity.kind==EntityKind::Player?same_player(entity,candidate):same_spawn(entity,candidate);
-                if(!equal)continue;if(match){if(entity.kind==EntityKind::Pickup && !mem_read32(local_.local_address(match)+0x50) && !mem_read32(local_.local_address(candidate_id)+0x50))continue;result.error="Ambiguous native replica binding";return result;}match=candidate_id;
+                if(!equal)continue;if(match){if(entity.kind==EntityKind::Pickup && !mem_read32(local_.local_address(match)+0x50) && !mem_read32(local_.local_address(candidate_id)+0x50))continue;error="Ambiguous native replica binding";return false;}match=candidate_id;
             }
         }
-        if(!match){result.error="Native creation requires lifecycle handling";return result;}
-        if(!used.insert(match).second){result.error="Multiple server entities alias a local object";return result;}
+        if(!match){error="Native creation requires lifecycle handling";return false;}
+        if(!used.insert(match).second){error="Multiple server entities alias a local object";return false;}
         const auto& target=local.entities.at(match);
         if(target.kind!=entity.kind || target.definition!=entity.definition ||
-            (entity.kind==EntityKind::Player && !same_player(entity,target))){result.error="Replica class or player slot changed";return result;}
-        if(!build_writes(entity,local_.local_address(match),writes,result.error))return result;
+            (entity.kind==EntityKind::Player && !same_player(entity,target))){error="Replica class or player slot changed";return false;}
+        const auto projected=project?replica_detail::project_lifecycle_scalars(entity):std::nullopt;
+        const auto& scalar=projected?*projected:entity;
+        if(!build_writes(scalar,local_.local_address(match),writes,error))return false;
         next[id]=match;
     }
     } // Commit always follows the read-only phase.
-    // Validate the complete batch before any native data is modified.
+    return true;
+    };
+    std::map<EntityId,EntityId> next;std::vector<Write> writes;
+    const bool valid=prepare(source,lifecycle_projection,next,writes,result.error);
+    if(lifecycle_projection && compare_lifecycle_scalars()){
+        // Independent reference input: the old deep-copy projection, then
+        // fresh native validation on the same still-unmodified guest RAM.
+        std::map<EntityId,EntityState> reference_fields;
+        for(const auto& [id,e]:source)reference_fields.emplace_hint(reference_fields.end(),id,filtered_fields(e,[&](const std::string& key){
+            return !lifecycle_property(key) && key!="marker_active" && key!="powerups" && !key.starts_with("weapon_model") && !key.starts_with("weapon_bomb") &&
+                !(e.kind==EntityKind::Player && (render_field(key) || key.starts_with("body_flash") || key.starts_with("body_render") || key.starts_with("body0_bone_") || key.starts_with("body1_bone_") || key.starts_with("body2_bone_") || key.starts_with("body3_bone_")));
+        }));
+        std::map<EntityId,EntityId> reference_bindings;std::vector<Write> reference_writes;std::string reference_error;
+        const bool reference_valid=prepare(reference_fields,false,reference_bindings,reference_writes,reference_error);
+        const bool same_writes=writes.size()==reference_writes.size() && std::equal(writes.begin(),writes.end(),reference_writes.begin(),[](const Write& a,const Write& b){return a.address==b.address && a.value==b.value && a.size==b.size && a.pickup==b.pickup && a.presentation==b.presentation;});
+        if(valid!=reference_valid || result.error!=reference_error || (valid && (next!=reference_bindings || !same_writes)))ssne::fatal("Post-lifecycle scalar plan differs from the original full-copy path");
+        static uint64_t compared=0;if(++compared==1 || compared%120==0)ssne::log_message("[coop-lifecycle-plan-reference] compared="+std::to_string(compared)+" entities="+std::to_string(source.size())+" writes="+std::to_string(writes.size())+" valid="+std::to_string(valid)+" identical=1");
+    }
+    if(!valid)return result;
+    // Validate the complete batch before any native data is modified. Exactly
+    // one plan commits; diagnostic reference preparation never writes RAM.
     if(!commit_scalar_writes(writes,result.error))return result;
     bindings_=std::move(next);epoch_=epoch;result.applied=true;result.objects=unsigned(source.size());result.writes=unsigned(writes.size());return result;
 }

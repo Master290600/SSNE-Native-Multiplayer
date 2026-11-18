@@ -1,5 +1,5 @@
-// ssne-recomp: translates main.dol (from your own disc) into C++ source for the PC port.
-//   ssne-recomp <main.dol | game.iso> <out_dir> [--map symbols.map] [--no-comments] [--no-data-scan]
+// SSNE-RECOOP-Native: translates main.dol (from your own disc) into C++ source for the PC port.
+//   SSNE-RECOOP-Native <main.dol | game.iso> <out_dir> [--map symbols.map] [--no-comments] [--no-data-scan]
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
@@ -13,7 +13,7 @@
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: ssne-recomp <main.dol|game.iso> <out_dir> [--map file] [--no-comments] [--no-data-scan]\n");
+        fprintf(stderr, "usage: SSNE-RECOOP-Native <main.dol|game.iso> <out_dir> [--map file] [--no-comments] [--no-data-scan]\n");
         return 2;
     }
     std::string input = argv[1];

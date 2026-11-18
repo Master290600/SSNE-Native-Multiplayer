@@ -1,5 +1,7 @@
 #include "native_bootstrap.h"
+#include "custom_levels_runtime.h"
 #include "ssne/native_party.h"
+#include "ssne/native_survival.h"
 #include "ssne/game_addresses.h"
 #include "ssne/recomp_hooks.h"
 #include <algorithm>
@@ -114,10 +116,12 @@ bool queue_native_coop_presentation(PPCContext& context,uint32_t scene,std::stri
 bool queue_native_coop_level(PPCContext& context,const NativeBootstrapRequest& request,std::string& error) {
     if(mem_read32(0x80000000u)!=0x47334250u){error="Native bootstrap has not been verified for this game revision";return false;}
     if(request.level.empty() || request.level.size()>64 || std::any_of(request.level.begin(),request.level.end(),[](unsigned char c){return !((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_');})){error="Invalid native level identifier";return false;}
+    if(is_custom_level_alias(request.level) && !verify_custom_level_identity(request.level,request.mode,request.game_setup,error))return false;
     const auto* change=ssne_find_func(0x80155568);
     if(!change || mem_read32(change->address)!=0x9421FFF8u || context.r[13]!=0x802E22A0 || context.r[1]<0x80001000u || context.r[1]>=ssne::guest_ram_end()){error="Native scene transition context unavailable";return false;}
     std::vector<uint32_t> menus;std::set<uint32_t> visited;
-    if(mem_read32(ssne::game_address(0x802DB0E0))==3) {
+    const bool leaving_frontend=mem_read32(ssne::game_address(0x802DB0E0))==3;
+    if(leaving_frontend) {
         auto gui=mem_read32(0x8028BFA4);
         while(gui) {
             if(gui<0x80000000 || gui>ssne::guest_ram_end()-0x90 || !visited.insert(gui).second || menus.size()>=256){error="Invalid native menu chain";return false;}
@@ -126,9 +130,11 @@ bool queue_native_coop_level(PPCContext& context,const NativeBootstrapRequest& r
         if(!ssne_find_func(0x800F6498)){error="Native menu close function unavailable";return false;}
         if(!ssne_find_func(0x80155BC8) || mem_read32(0x80155BC8)!=0x9421FFF8u){error="Native menu resume function unavailable";return false;}
     }
+    const auto survival=request.game_setup.find("Session.Survival.Active");
+    ssne::configure_native_survival(survival!=request.game_setup.end() && survival->second==Property(int64_t(1)));
     const auto rules=native_rules_prefix(request.mode);if(!rules){error="Invalid native multiplayer mode";return false;}
     if(request.mode!=1)ssne::native_party_configure(4);
-    auto setup=request.game_setup;setup[std::string(rules)+".Level"]=request.level;
+    auto setup=native_game_setup_fields(request.game_setup);setup[std::string(rules)+".Level"]=request.level;
     if(!write_native_configuration(context,native_global_configuration(),setup,"GameSetup",error))return false;
     // Native game initialization reads the selected mode and its rules, then
     // opens the Level string through 801674F8. Scene 4 is the actual game scene.
@@ -146,6 +152,11 @@ bool queue_native_coop_level(PPCContext& context,const NativeBootstrapRequest& r
             PPCContext resume=call;resume.r[3]=0;resume.r[4]=0;ssne_call(resume,0x80155BC8);
         }
         ssne_call(call,0x80155568);
+        // Original Start Game (80101170) transfers ownership back to the
+        // scene manager as it leaves the front end. Its destructor releases
+        // both registered menu banks and their shared texture references.
+        if(leaving_frontend && mem_read32(context.r[13]-0x69F4u) && mem_read32(context.r[13]-0x69F0u))
+            mem_write32(context.r[13]-0x69F8u,1);
     }catch(...){for(unsigned i=0;i<stack.size();++i)mem_write8(context.r[1]-0x200+i,stack[i]);throw;}
     for(unsigned i=0;i<stack.size();++i)mem_write8(context.r[1]-0x200+i,stack[i]);return true;
 }

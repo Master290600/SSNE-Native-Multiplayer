@@ -1,6 +1,9 @@
 #pragma once
 #include "ssne/bot.h"
 #include "ssne/ppc_context.h"
+#include <array>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 namespace ssne {
@@ -62,6 +65,15 @@ struct ModBoneMarker {
   bool target = false;
   int parent = -1; // Recognized anatomical-name link; absent for unknown names.
 };
+// Copied after the local game's final camera update, independently of cheats.
+// No guest pointers escape this snapshot; presentation threads never read RAM.
+struct ModViewCamera {
+  std::array<float,12> view{};
+  float projection_x=0,projection_y=0;
+  int local_player=-1;
+  uint64_t sampled_ms=0;
+};
+std::optional<ModViewCamera> mod_view_camera(); // Fresh local MP view, <=250ms.
 std::vector<ModItemMarker> mod_item_markers();
 std::vector<ModBoneMarker> mod_bone_markers();
 std::vector<ModMarker> mod_markers();

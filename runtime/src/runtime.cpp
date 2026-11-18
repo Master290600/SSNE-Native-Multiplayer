@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <ctime>
@@ -32,6 +34,7 @@ int64_t ssne::perf::detail::thread_cpu_ns(){
 #include "ssne/ppc_context.h"
 #include "ssne/recomp_hooks.h"
 #include "ssne/runtime.h"
+#include "ssne/gx_decode_context.h"
 #include "ssne/native_party.h"
 #include "ssne/game_addresses.h"
 
@@ -71,14 +74,37 @@ void ssne_call(PPCContext& ctx, uint32_t addr) {
             }
         }
     }
-    PPCFunc hook = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_hook_mutex);
-        auto h = g_hooks.find(addr);
-        if (h != g_hooks.end()) hook = h->second;
+    // PAL CcEngine::Render invokes both native view groups through this one
+    // vtable method. The current-view SDA index has already been stored; mark
+    // before the callback can emit FIFO bytes (world, weapon, GUI or info).
+    if(ctx.lr==0x801176D8u || ctx.lr==0x801178CCu)ssne::gx_mark_native_view_context(ctx.lr);
+    static const bool cache_indirect=[] {const auto* value=std::getenv("SSNE_INDIRECT_CALL_CACHE");return !value || std::strcmp(value,"0");}();
+    if(cache_indirect){
+        struct Target {uint32_t address=0;PPCFunc* slot=nullptr;PPCFunc original=nullptr;};
+        static thread_local std::array<Target,512> targets{};
+        auto& target=targets[((addr>>2)^(addr>>11))&(targets.size()-1)];
+        if(!target.slot || target.address!=addr){
+            // Map nodes are never erased; rehash preserves these slot pointers.
+            // Cache the slot, never its current hook, so install/uninstall stays
+            // immediately visible exactly as in generated SSNE_HOOK calls.
+            auto* slot=ssne_hook_slot(addr);
+            const auto* original=ssne_find_func(addr);
+            target={addr,slot,original?original->func:nullptr};
+        }
+        const auto hook=*target.slot;
+        const auto original=target.original;
+        if(hook){hook(ctx);return;}
+        if(original){original(ctx);return;}
+    }else{
+        PPCFunc hook = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_hook_mutex);
+            auto h = g_hooks.find(addr);
+            if (h != g_hooks.end()) hook = h->second;
+        }
+        if (hook) { hook(ctx); return; }
+        if (auto* f = ssne_find_func(addr)) { f->func(ctx); return; }
     }
-    if (hook) { hook(ctx); return; }
-    if (auto* f = ssne_find_func(addr)) { f->func(ctx); return; }
     {
         char line[240];
         snprintf(line,sizeof(line),"[party-bad-call] target=%08X lr=%08X sp=%08X r3=%08X r4=%08X r5=%08X r6=%08X r9=%08X r11=%08X",addr,ctx.lr,ctx.r[1],ctx.r[3],ctx.r[4],ctx.r[5],ctx.r[6],ctx.r[9],ctx.r[11]);ssne::log_message(line);

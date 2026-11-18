@@ -46,7 +46,7 @@ bool validate_party_checkpoint(const PartyCheckpoint& s,std::string& error){
     std::set<uint32_t> pickup_storage;
     for(const auto& [object,storage]:s.pickups)if(!valid(object,0x184) || storage<a+0x2D80 || storage>pick || pick-storage<32 || (storage-a-0x2D80)%32 || !pickup_storage.insert(storage).second)return fail("Invalid saved pickup ownership storage");
     for(const auto& [object,slot]:s.owners)if(!valid(object,4) || slot>=s.count)return fail("Invalid saved native view owner");
-    for(const auto& [actor,p]:s.pending)if(!player(actor) || s.delays.at(actor)>1000000)return fail("Invalid saved pending respawn");
+    for(const auto& [actor,p]:s.pending)if(!player(actor) || s.delays.at(actor)>1000000 || (p.full_respawn && (!p.local || !p.force_safe)))return fail("Invalid saved pending respawn");
     for(const auto& [actor,point]:s.prepared){if(!player(actor))return fail("Invalid saved prepared respawn");for(float v:point)if(!std::isfinite(v) || std::abs(v)>1000000.f)return fail("Invalid saved respawn coordinates");}
     for(const auto& [actor,revision]:s.completed)if(!player(actor) || !revision || revision>s.revision)return fail("Invalid saved completed respawn");
     return true;
@@ -54,7 +54,7 @@ bool validate_party_checkpoint(const PartyCheckpoint& s,std::string& error){
 }
 bool native_party_save_state(std::vector<uint8_t>& output,std::string& error){
     error.clear();if(!party_state_safe(error))return false;
-    PartyStateWriter w;w.u32(0x4E504350);w.u32(1);w.u32(mem_read32(0x80000000u));w.u32(guest_ram_size());w.u32(roster);
+    PartyStateWriter w;w.u32(0x4E504350);w.u32(2);w.u32(mem_read32(0x80000000u));w.u32(guest_ram_size());w.u32(roster);
     w.u32(unsigned(configured)|(unsigned(profiles_prepared)<<1)|(unsigned(extended_memory)<<2)|(unsigned(occupancy_enabled)<<3)|(unsigned(extra_loadouts_initialized)<<4));
     w.u32(occupied_slots);w.u32(connected_slots);
     for(auto v:{arena,original_bank,second_bank,second_status,registry,views,engine_base,pickup_next,arena_heap,arena_size})w.u32(v);
@@ -66,7 +66,7 @@ bool native_party_save_state(std::vector<uint8_t>& output,std::string& error){
     w.u32(pickup_flags.size());for(const auto& [object,storage]:pickup_flags){w.u32(object);w.u32(storage);}
     w.u32(view_owners.size());for(const auto& [object,slot]:view_owners){w.u32(object);w.u32(slot);}
     const auto now=std::chrono::steady_clock::now();
-    w.u32(pending_spawns.size());for(const auto& [actor,p]:pending_spawns){w.u32(actor);w.u32(p.request);w.u32(p.flags);w.u32(p.attempts);w.u32(unsigned(p.local)|(unsigned(p.force_safe)<<1));const auto us=std::chrono::duration_cast<std::chrono::microseconds>(p.next-now).count();w.u32(uint32_t(std::clamp<int64_t>(us,0,1000000)));}
+    w.u32(pending_spawns.size());for(const auto& [actor,p]:pending_spawns){w.u32(actor);w.u32(p.request);w.u32(p.flags);w.u32(p.attempts);w.u32(unsigned(p.local)|(unsigned(p.force_safe)<<1)|(unsigned(p.full_respawn)<<2));const auto us=std::chrono::duration_cast<std::chrono::microseconds>(p.next-now).count();w.u32(uint32_t(std::clamp<int64_t>(us,0,1000000)));}
     w.u32(prepared_spawns.size());for(const auto& [actor,point]:prepared_spawns){w.u32(actor);for(float v:point)w.u32(f2u(v));}
     w.u32(completed_spawns.size());for(const auto& [actor,revision]:completed_spawns){w.u32(actor);w.u64(revision);}
     w.u64(party_state_hash(w.bytes.data(),w.bytes.size()));output=std::move(w.bytes);return true;
@@ -76,7 +76,7 @@ bool native_party_load_state(const std::vector<uint8_t>& bytes,std::string& erro
     auto fail=[&](const char* message){error=message;return false;};
     if(bytes.size()<584 || bytes.size()>1024*1024)return fail("Invalid native party checkpoint size");
     PartyStateReader checksum{bytes,bytes.size()-8};if(checksum.u64()!=party_state_hash(bytes.data(),bytes.size()-8))return fail("Native party checkpoint checksum differs");
-    PartyStateReader r{bytes};if(r.u32()!=0x4E504350 || r.u32()!=1)return fail("Unsupported native party checkpoint");
+    PartyStateReader r{bytes};if(r.u32()!=0x4E504350)return fail("Unsupported native party checkpoint");const auto version=r.u32();if(version!=1 && version!=2)return fail("Unsupported native party checkpoint");
     PartyCheckpoint s;s.game=r.u32();s.ram=r.u32();s.count=r.u32();s.flags=r.u32();s.occupied=r.u32();s.connected=r.u32();
     for(auto& v:s.pointers)v=r.u32();for(auto& v:s.profile)v=r.u32();for(auto& record:s.loadouts)for(auto& v:record)v=r.u32();for(auto& v:s.actors)v=r.u32();
     for(auto& p:s.inputs){const auto buttons=r.u32();if(buttons>65535)r.ok=false;p.buttons=uint16_t(buttons);for(auto field:{&p.stick_x,&p.stick_y,&p.cstick_x,&p.cstick_y,&p.trigger_l,&p.trigger_r}){const auto v=r.u32();if(v>255)r.ok=false;*field=uint8_t(v);}}
@@ -84,7 +84,7 @@ bool native_party_load_state(const std::vector<uint8_t>& bytes,std::string& erro
     auto n=r.count(8);for(unsigned i=0;i<n;++i){const auto actor=r.u32(),proxy=r.u32(),mask=r.u32();if(!s.bodies.emplace(actor,ReservedBodyMask{proxy,mask}).second)r.ok=false;}
     n=r.count(1684);for(unsigned i=0;i<n;++i){const auto object=r.u32(),storage=r.u32();if(!s.pickups.emplace(object,storage).second)r.ok=false;}
     n=r.count(256);for(unsigned i=0;i<n;++i){const auto object=r.u32(),slot=r.u32();if(!s.owners.emplace(object,slot).second)r.ok=false;}
-    n=r.count(8);for(unsigned i=0;i<n;++i){const auto actor=r.u32();PendingSpawn p;p.request=r.u32();p.flags=r.u32();p.attempts=r.u32();const auto flags=r.u32();if(flags>3)r.ok=false;p.local=flags&1;p.force_safe=flags&2;const auto delay=r.u32();if(!s.pending.emplace(actor,p).second)r.ok=false;s.delays[actor]=delay;}
+    n=r.count(8);for(unsigned i=0;i<n;++i){const auto actor=r.u32();PendingSpawn p;p.request=r.u32();p.flags=r.u32();p.attempts=r.u32();const auto flags=r.u32();if(flags>(version==1?3u:7u))r.ok=false;p.local=flags&1;p.force_safe=flags&2;p.full_respawn=flags&4;const auto delay=r.u32();if(!s.pending.emplace(actor,p).second)r.ok=false;s.delays[actor]=delay;}
     n=r.count(8);for(unsigned i=0;i<n;++i){const auto actor=r.u32();std::array<float,3> point;for(auto& v:point)v=u2f(r.u32());if(!s.prepared.emplace(actor,point).second)r.ok=false;}
     n=r.count(8);for(unsigned i=0;i<n;++i){const auto actor=r.u32();const auto revision=r.u64();if(!s.completed.emplace(actor,revision).second)r.ok=false;}
     if(!r.ok || r.pos!=bytes.size()-8)return fail("Malformed native party checkpoint");
