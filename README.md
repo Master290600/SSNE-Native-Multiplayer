@@ -15,6 +15,8 @@ game locally from your own supported GameCube disc image.
 
 Build Game also installs the 15 official PS2 multiplayer maps, their previews, six player skins and the Online menu icon from the included content pack. Your European GameCube disc is the only disc you need.
 
+The launcher includes **Map Editor (Alpha 0.13)**. Open **Map Editor** after building the game to edit a level, place enemies or create triggers. Press **F1** in the editor for a guided exercise in your game language. [Map Editor guide](docs/MAP-EDITOR.md)
+
 Upgrading from v1.2.7.204 requires a manual update. Close the game and launcher, extract the complete 1.2.8.1 Windows ZIP into your installation folder, then open `SSNE-RECOOP-Native.exe` and choose **Build Game**. The older updater expects the previous launcher name and protocol.
 
 Open **F12 > Game and menu language** for English, German or French. F12 applies the choice immediately. Restart the game to apply the language to the original PAL menus.

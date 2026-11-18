@@ -1,7 +1,11 @@
-# Local object and spawn editor (preview 0.7)
+# Map Editor (Alpha 0.13)
 
-Open **Map Editor** in the normal SSNE-Native launcher after installing your game.
+Open **Map Editor** in the SSNE-RECOOP-Native launcher after installing your game.
 The editor loads existing native CLIMAX `.ssw` maps from your installation.
+Press **F1** or **Help / Tutorial** for searchable help and a guided practice map
+in English, German or French. **Start practice** opens an in-memory copy.
+For a list of camera controls, transform tools and logic actions, see the
+[scene and logic guide](MAP-EDITOR-PROFESSIONAL.md).
 
 1. Select a level and choose **Open original**.
 2. Find an object by name or category. Player starts are green triangles;
@@ -9,8 +13,8 @@ The editor loads existing native CLIMAX `.ssw` maps from your installation.
 3. Click a marker or list entry. In 3D, drag the red X, green Y or blue Z handle
    to constrain movement to that axis. Drag an icon to move in X/Z, or enter
    X, Y (height) and Z and choose **Apply position**.
-4. **Turn (degrees)** / **Rotate around Y** changes its orientation while keeping
-   the original scale. **Reset object** restores its original transform.
+4. Use **W**, **E** or **R** in the viewport for Move, Rotate or Scale.
+   Available handles depend on the object. **Reset object** restores its original transform.
 5. Enter an ASCII project name and choose **Save project**.
 6. **Open project** restores saved changes. **Undo/Redo** and Ctrl+Z / Ctrl+Y
    undo or repeat edits; Ctrl+S saves. Leaving with unsaved edits offers
@@ -31,7 +35,7 @@ size, so larger exports can be loaded by the original native disc reader.
 The test game has its own executable copy, settings and copied memory card.
 The installed game runtime and normal Play target are unchanged.
 
-This first version edits **existing object/spawn positions and Y rotation**.
+You can place and transform objects, add enemy waves and connect logic controllers.
 The default viewport renders original visible level surfaces, material textures,
 static prop instances, sky geometry, pickups/keys/custom items and enemy previews
 from your own game data. Enemy spawners follow their original authored entity ID
@@ -62,21 +66,19 @@ CMPR cutouts and RGBA alpha, uses the authored UV channels, material layers and
 wrapping, and generates mipmaps for distant surfaces. Model transforms follow
 object edits and drag previews without modifying source asset data.
 
-This remains a static editor preview rather than the full running game renderer:
-script-driven visibility, enemy AI, running character animation, dynamic lighting, particles,
-reflections and animated water are not simulated. Spawns and script-only objects
-keep their selectable icons. Geometry remains read-only. Geometry editing, enemy-wave properties,
-script/link editing, automatic custom-map multiplayer distribution and
-arbitrary map-format variants are not implemented in this preview.
+The viewport shows a static preview of the level. Use **Test in game** to see
+enemy AI, animation, dynamic effects and script-driven visibility in action.
+Spawns and script-only objects keep their selectable icons. Terrain geometry is read-only.
 
 Transform-only exports preserve the original compressed relocation block. Structural exports rebuild the relocation table, including each new pointer and excluding null links. Object IDs are unique signed 16-bit identifiers. Props retain their own instance, frame, mutable colors, bounds and optional destruction configuration while sharing immutable geometry/materials. Render instances append at the end to preserve existing scene indices; removed instances remain inert index slots. A no-op export
 is byte-identical. Changed exports use a standard zlib stored-block stream,
 so they can be larger than the originals. A project requires the same original
 map hash when reopened. Cyclic/out-of-range object pointers, damaged compression,
-non-finite transforms and scale/shear changes are rejected. Global scene records
+non-finite transforms and unsupported transformations are rejected. Global scene records
 without a transform are preserved but never offered as movable objects.
 
-Everything in this preview is local; no release or upload is performed.
+**Save project** writes your work to your computer. To play a shared level,
+add it to **Custom Level** and select it when hosting a multiplayer session.
 
 Material preview follows the native base-color mode and explicit material blend
 option. Terrain mask alpha is kept separate from surface opacity; alpha testing
@@ -104,8 +106,8 @@ and reopen, so Reset object returns an added object to its initial placement.
 
 The last player start, enemy templates referenced by existing spawners, doors,
 triggers and unsupported story/control types cannot be deleted or duplicated.
-This is object placement within an existing level; new terrain geometry and
-script editing are not included. Adding/deleting gameplay objects can change the
+The editor places objects in an existing level and can edit supported native
+logic connections. Adding or deleting gameplay objects can change the
 encounter balance; test your project in the native game. Creation has bounded
 map/ID/history limits and respects the original model-holder capacity.
 
@@ -132,8 +134,7 @@ This imports object archetypes and assets; it does not transplant a foreign
 level's boss scripting, triggers, routes or campaign logic. Test special scripted
 enemies in-game. Missing original assets remain reported by the preview. The
 project retains bounded format/ID/model-holder limits, and very large mixtures
-remain subject to the native game's memory budget. Custom maps are not distributed
-automatically to multiplayer peers. All work and test artifacts stay local.
+remain subject to the native game's memory budget.
 
 ## Area triggers, enemy waves and project Survival (0.8)
 
@@ -157,8 +158,8 @@ protected; deleting a trigger restores unreferenced templates as active enemies.
 Survival host. Choose an original game profile if requested. Automatic Survival
 waves and authored trigger waves can coexist. This uses a private exported map,
 disc table, resource alias and test memory card; original maps and saves stay
-unchanged. Multiplayer peers need the same edited project data; maps are not
-automatically transferred. Test very large waves against the game's memory budget.
+unchanged. For a shared session, add the project to **Custom Level** and choose
+the package as host. Test very large waves against the game's memory budget.
 
 ## Camera orientation correction (local 0.8.1)
 
@@ -236,7 +237,7 @@ Opening a door after an entire wave
 requires an actual counter, rather than treating incoming lines as an AND gate.
 Edits support Undo / Redo and **Save project**, persist in the exported SSW, and
 invalidate observations from an older test until a new test starts. Original
-maps and normal saves stay unchanged. Everything remains local.
+maps and normal saves stay unchanged.
 
 ## Custom Level category, names and previews (local 0.11)
 
@@ -262,8 +263,8 @@ are retained and multiple copies of a base level can coexist. Completed caches
 are immutable, including when host and client run on the same PC. Changes to a
 package become available after restarting the game through the launcher.
 
-For multiplayer, runtime226/protocol69 transfers the host's selected package
-automatically: map bytes, display name, base map, supported modes and optional
+For multiplayer, the host automatically transfers the selected package to each
+joining player, including map bytes, display name, base map, supported modes and optional
 PNG preview. The original Connecting page shows progress and Cancel in the
 selected menu language. A client validates the complete package before mounting
 it into the running game's virtual disc; no restart or manual package copy is
@@ -273,5 +274,5 @@ Received versions live separately in `DownloadedCustomLevels/`. Authored local
 packages, memory cards and original maps are preserved. The manifest is checked
 on each join, while identical verified packages reuse their cache without a
 payload download. Changed names or previews refresh even if the map bytes stay
-the same. Invalid or interrupted transfers cannot become active maps. Both host
-and client need protocol69. Exporting locally publishes nothing.
+the same. Invalid or interrupted transfers cannot become active maps. Use
+version 1.2.8.1 (multiplayer build 245, protocol 70) on the host and clients.

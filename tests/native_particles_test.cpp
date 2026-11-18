@@ -5,6 +5,7 @@
 #include "native_scalar_projection.h"
 #include "native_world.h"
 #include "ssne/native_effect.h"
+#include "ssne/mods.h"
 #include "ssne/native_entity.h"
 #include "ssne/recomp_hooks.h"
 #include "ssne/replica_simulation.h"
@@ -74,6 +75,7 @@ std::optional<std::array<float,12>> native_weapon_camera_reference(uint32_t){
 }
 [[noreturn]] void fatal(const char*message){throw std::runtime_error(message);}
 int netplay_local_player(){throw std::runtime_error("Unexpected local-player query");}
+bool mod_is_registered_enemy(uint32_t){throw std::runtime_error("Unexpected enemy registry query");}
 bool netplay_world_ready(){throw std::runtime_error("Unexpected world-ready query");}
 void audio_track_weapon_voice(uint32_t,uint32_t,uint32_t,uint64_t){
   throw std::runtime_error("Unexpected weapon audio ownership");

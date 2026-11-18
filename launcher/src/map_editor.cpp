@@ -454,7 +454,7 @@ bool MapEditor::draw() {
   ImGui::TextUnformatted("SERIOUS SAM - OBJECT & SPAWN EDITOR");
   ImGui::PopStyleColor();
   ImGui::SameLine();
-  ImGui::TextDisabled("Local preview 0.13 - Scene & Logic tools");
+  ImGui::TextDisabled("Alpha 0.13 - Scene & Logic tools");
   ImGui::SameLine(ImGui::GetWindowWidth() - 95);
   if (button("Back", "back", !test_future_.valid()))
     request([this] {
