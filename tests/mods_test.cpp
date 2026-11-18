@@ -2,6 +2,7 @@
 #include "ssne/game_addresses.h"
 using ssne::game_address;
 #include "ssne/recomp_hooks.h"
+#include "ssne/native_effect.h"
 #include "ssne/native_entity.h"
 #include "ssne/native_party.h"
 #include <cassert>
@@ -15,6 +16,10 @@ namespace ssne {
 // Synthetic mod-hook harness: no live renderer, network session or extended party.
 // These collaborators are deliberately inert; native campaign behavior is tested separately.
 void install_ammo_rule_hooks() {}
+int hitmarker_hook_installs = 0;
+int hitmarker_resets = 0;
+void install_native_hitmarker_hooks() { ++hitmarker_hook_installs; }
+void clear_native_hitmarkers() { ++hitmarker_resets; }
 void native_entity_hooks_installed(bool) {}
 void notify_native_entity(NativeEntityNotice) {}
 void notify_native_entity(PPCContext&, NativeEntityNotice notice) { notify_native_entity(notice); }
@@ -164,6 +169,7 @@ int main(int argc,char** argv) {
   seed(game_address(0x8010C228), {0x8003033C, 0x2C000000, 0x4C820020});
   seed(0x8008462C, {0x9421FFF8, 0x7C0802A6, 0x9001000C});
   ssne::install_mod_hooks();
+  assert(ssne::hitmarker_hook_installs == 1);
   assert(ssne::mod_state().available);
   assert(!ssne::mod_state().active);
   constexpr unsigned player = 0x80300000, inv = 0x80340000, flag = 0x80350000;
@@ -608,6 +614,7 @@ int main(int argc,char** argv) {
   ssne::mod_tick(c, player);
   slots[game_address(0x801664D8)](c);
   assert(ssne::netplay_world_resets == 1);
+  assert(ssne::hitmarker_resets == 1);
   assert(u2f(mem_read32(modes + 0x1C)) == 8);
   ssne::mod_options({});
   mem_write32(game_address(0x802DB1BC), 2);
@@ -619,6 +626,7 @@ int main(int argc,char** argv) {
   assert(mem_read32(game_address(0x802DA284)) == 1);
   slots[game_address(0x801664D8)](c);
   assert(ssne::mod_state().templates.empty());
+  assert(ssne::hitmarker_resets == 2);
   assert(ssne::mod_item_markers().empty() && ssne::mod_bone_markers().empty());
   assert(mem_read32(game_address(0x802DA284)) == 7);
   ssne::mod_spawn(s.templates[0].id, 1, 6);
