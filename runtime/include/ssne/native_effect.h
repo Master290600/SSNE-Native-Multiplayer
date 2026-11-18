@@ -18,6 +18,15 @@ bool set_native_scene_particle_enabled(PPCContext&,uint32_t holder,unsigned kind
 inline constexpr uint64_t native_automatic_ray_tag=uint64_t(1)<<62;
 inline constexpr uint64_t native_uzi_ray_tag=native_automatic_ray_tag;
 struct NativeHitIdentity {uint64_t entity=0,generation=0;};
+struct NativeHitmarkerPulse {float intensity=0;bool kill=false;};
+struct NativeHitmarkerCounts {uint64_t generation=0,hits=0,kills=0;};
+// Render threads only read the pulse. Damage and session publication run on the guest thread.
+NativeHitmarkerPulse native_hitmarker_pulse(unsigned view_slot=0);
+void show_native_hitmarker(bool kill,unsigned view_slot=0);
+void clear_native_hitmarkers();
+std::array<NativeHitmarkerCounts,8> native_hitmarker_counts();
+void install_native_hitmarker_hooks();
+void native_hitmarker_player_damage(PPCContext&,void (*original)(PPCContext&));
 // A confirmation observes original host damage. It never asks a replica to
 // subtract health; authoritative world state remains the only health source.
 // Source/target are NativeWorld lifetime IDs, including already retired targets.

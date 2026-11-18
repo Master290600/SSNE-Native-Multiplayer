@@ -117,9 +117,18 @@ struct Settings {
     // General
     bool pause_in_menu = true;
     bool pause_unfocused = true;     // pause (and silence) the game while the window is in the background
-    bool skip_intros = true;         // boot straight to the main menu (logos, videos and title screen skipped)
+    bool skip_intros = false;         // boot straight to the main menu (logos, videos and title screen skipped)
     int state_slot = 1;              // save state slot used by F5 / F9 (1..5)
     int game_language = -1;          // next start: -1 saved game choice, 0 English, 1 German, 2 French
+
+    // Hit feedback uses its own RGB colors with either the native or a custom crosshair.
+    static constexpr uint32_t kDefaultHitRgb = 0xffffff, kDefaultKillRgb = 0xff0000;
+    static constexpr int kMinHitmarkerSize = 50, kMaxHitmarkerSize = 200;
+    bool hitmarker_enabled = true;
+    int hitmarker_size = 100;       // percentage of the native-port marker size
+    int hitmarker_opacity = 100;    // percentage before the hit pulse fades
+    uint32_t hitmarker_hit_rgb = kDefaultHitRgb;
+    uint32_t hitmarker_kill_rgb = kDefaultKillRgb;
 
     Settings();
     void reset_graphics();

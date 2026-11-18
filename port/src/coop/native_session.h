@@ -1,5 +1,6 @@
 #pragma once
 #include "host_capture_clock.h"
+#include "hitmarker_replica.h"
 #include "authoritative_session.h"
 #include "native_bootstrap.h"
 #include "native_replica.h"
@@ -163,6 +164,7 @@ private:
     uint64_t replica_surface_epoch_=0,replica_surface_sequence_=0;
     uint64_t replica_beam_epoch_=0,replica_beam_sequence_=0;
     uint64_t replica_hit_epoch_=0,replica_hit_sequence_=0;
+    HitmarkerReplica hitmarker_replica_;
     mutable std::mutex combat_mutex_;PlayerId combat_owner_{};CombatFeedback combat_feedback_{};std::chrono::steady_clock::time_point combat_flash_until_{};
     std::array<ParticipantHealth,max_players> participant_health_{};
     void accept_confirmed_hit(const ssne::NativeConfirmedHit&,PlayerId);

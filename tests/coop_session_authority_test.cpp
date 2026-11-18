@@ -1,4 +1,5 @@
 #include "session_authority.h"
+#include "hitmarker_replica.h"
 #include "authority_checkpoint_cases.h"
 #include <cstdlib>
 #include <iostream>
@@ -7,6 +8,31 @@
 using namespace port::coop;
 void require(bool result,const char* message){if(!result){std::cerr<<message<<'\n';std::exit(1);}}
 int main() {
+    {
+        HitmarkerReplica cursor;
+        const PlayerId shooter{1,7},replacement{1,8};
+        std::array<int64_t,3*max_players> values{};
+        values[0]=6;values[1]=5;values[2]=1;
+        values[3]=7;
+        require(cursor.consume(1,shooter,{})==HitmarkerEvent::None,"Legacy snapshot flashed a hit");
+        require(cursor.consume(1,shooter,values)==HitmarkerEvent::None,"Other player's hit was shown");
+        values[4]=1;
+        require(cursor.consume(1,shooter,values)==HitmarkerEvent::Hit,"First shot after joining lost");
+        require(cursor.consume(1,shooter,values)==HitmarkerEvent::None,"Repeated snapshot flashed twice");
+        values[4]=5;values[5]=2;
+        require(cursor.consume(1,shooter,values)==HitmarkerEvent::Kill,"Coalesced lethal blast lost");
+        require(cursor.consume(1,replacement,values)==HitmarkerEvent::None,"Stale slot owner flashed");
+        values[3]=8;values[4]=1;values[5]=1;
+        require(cursor.consume(1,replacement,values)==HitmarkerEvent::Kill,"New slot owner's first kill lost");
+        values[4]=1;values[5]=0;
+        require(cursor.consume(2,replacement,values)==HitmarkerEvent::Hit,"New level's first hit lost");
+        require(cursor.consume(1,replacement,values)==HitmarkerEvent::None,"Previous level flashed");
+        values[4]=2;values[5]=3;
+        require(cursor.consume(2,replacement,values)==HitmarkerEvent::None,"Invalid counters flashed");
+        HitmarkerReplica fresh;
+        values[4]=2;values[5]=1;
+        require(fresh.consume(2,replacement,values)==HitmarkerEvent::Kill,"First snapshot's own kill lost");
+    }
     authority_checkpoint_test::checkpoint_regression();
     for(unsigned capacity=1;capacity<=8;++capacity) {
         SessionAuthority server(capacity);std::array<PlayerId,8> ids;

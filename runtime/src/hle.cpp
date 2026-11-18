@@ -28,6 +28,7 @@
 #include "ssne/runtime.h"
 #include "ssne/weapon_groups.h"
 #include "ssne/native_render_list.h"
+#include "ssne/native_effect.h"
 #include "ssne/performance.h"
 #include "ssne/gx_gpu.h"
 #include "ssne/gx.h"
@@ -291,6 +292,8 @@ std::atomic<int64_t> g_last_gameplay_ms{-1000000};
 std::atomic<int64_t> g_cam_zoom_ms{-1000000};
 std::atomic<float> g_frame_factor{1.0f};  // factor used by the most recent camera projection
 std::atomic<float> g_loading_canvas_factor{1.f};
+std::atomic<bool> g_info_canvas{false};
+bool g_level_overlay = false;  // Guest thread only. The renderer reads the published frame factor.
 std::atomic<bool> g_frame_zoom{false};    // that projection's scene camera was zoomed in (the sniper scope)
 int64_t now_ms() {
     using namespace std::chrono;
@@ -310,42 +313,60 @@ float player_zoom_fov(uint32_t player) {
     return zoom > 1.01f && zoom < 100.0f ? 80.0f / zoom : 0;
 }
 
-float effective_widescreen(uint32_t caller) {
+bool scene_camera_caller(uint32_t lr) {
+    for (auto address : g_ver->cam_lr)
+        if (lr == address || lr == address + 0x98) return true;
+    return false;
+}
+bool overlay_player_projection(const PPCContext& ctx) {
+    const bool weapon = ctx.lr == g_ver->weapon_lr || ctx.lr == g_ver->weapon_lr + 0x20 ||
+                        ctx.lr == g_ver->weapon_lr + 0x40;
+    if (!weapon && !scene_camera_caller(ctx.lr)) return false;
+    const auto view = mem_read32(ctx.r[13] - (g_ver == &kVersions[1] ? 0x6D94u : 0x6D9Cu));
+    return view < 4;
+}
+void publish_frame_aspect(float factor, bool zoom) {
+    if (factor == g_frame_factor.load() && zoom == g_frame_zoom.load()) return;
+    gx_sync();
+    g_frame_factor = factor;
+    g_frame_zoom = zoom;
+}
+float effective_widescreen(const PPCContext& ctx) {
     const bool frontend=mem_read32(game_address(0x802DB0E0u))==3;
     if(frontend || g_netplay_active){
         // Keep native widget cameras unchanged while presenting the original
         // frontend artwork across the selected display aspect. Local network
         // gameplay corrects its camera/UI in the GPU executor, not twice here.
-        const float factor=frontend?g_widescreen.load():1.f;
-        if(factor!=g_frame_factor.load() || g_frame_zoom.load())gx_sync();
-        g_frame_factor=factor;g_frame_zoom=false;
+        publish_frame_aspect(frontend || g_level_overlay ? g_widescreen.load() : 1.f, false);
         return 1.f;
     }
-    if (caller == g_ver->weapon_lr) g_last_gameplay_ms = now_ms();
+    if (ctx.lr == g_ver->weapon_lr) g_last_gameplay_ms = now_ms();
+    if (g_level_overlay) {
+        // The level is still visible behind these menus. Its projections keep their
+        // gameplay aspect, while widget cameras use the original GUI projection.
+        publish_frame_aspect(g_widescreen.load(), g_frame_zoom.load());
+        return overlay_player_projection(ctx) ? g_widescreen.load() : 1.f;
+    }
     bool gameplay = now_ms() - g_last_gameplay_ms.load() < 400 && (g_control_hooks.load() < 2 || g_player_control.load());
     float f = gameplay ? g_widescreen.load() : 1.0f;
     // Zoomed in, the scope overlay is laid out for 4:3: the GPU recorder keeps it round (see note_hud).
     bool zoom = gameplay && zoomed_in();
     // The GX thread reads the factor when it records the frame's display copy: let it finish the frames rendered
     // with the old factor first (the factor changes only between gameplay and the menus, the zoom with the scope).
-    if (f != g_frame_factor.load() || zoom != g_frame_zoom.load()) gx_sync();
-    g_frame_factor = f;
-    g_frame_zoom = zoom;
+    publish_frame_aspect(f, zoom);
     return f;
 }
 
 // Gameplay field of view (FOV slider). The scene camera (8014C090) builds its projections from these call
 // sites; the first-person weapon (8014CDF0) keeps its own. 0 = the game's own FOV (63 degrees vertical).
 std::atomic<float> g_fov{0.0f};
-bool scene_camera_caller(uint32_t lr) {
-    return lr == g_ver->cam_lr[0] || lr == g_ver->cam_lr[1] || lr == g_ver->cam_lr[2] || lr == g_ver->cam_lr[3];
-}
 // Widens (or narrows) the game's vertical FOV by the ratio of the chosen FOV to the default, applied to the
 // tangent so the game's own zooms keep their proportions.
-float adjust_fov(uint32_t lr, float fovy) {
+float adjust_fov(const PPCContext& ctx, float fovy) {
     if(g_netplay_active) return fovy;
     float target = g_fov.load();
-    if (target <= 0 || !scene_camera_caller(lr) || now_ms() - g_last_gameplay_ms.load() >= 400) return fovy;
+    if (target <= 0 || !scene_camera_caller(ctx.lr)) return fovy;
+    if (g_level_overlay ? !overlay_player_projection(ctx) : now_ms() - g_last_gameplay_ms.load() >= 400) return fovy;
     constexpr float d2r = 0.017453292f;
     float k = std::tan(0.5f * target * d2r) / std::tan(0.5f * kGameFov * d2r);
     float out = 2.0f * std::atan(std::tan(0.5f * fovy * d2r) * k) / d2r;
@@ -365,7 +386,6 @@ float game_tanf(PPCContext& ctx, float x) {
 
 // C_MTXPerspective(Mtx44 m, f32 fovY, f32 aspect, f32 n, f32 f)  @ 801BA874
 void hle_MTXPerspective(PPCContext& ctx) {
-    if(scene_camera_caller(ctx.lr) && ctx.ps0[1]<kGameFov-.5f)g_cam_zoom_ms=now_ms();
     if (static const char* tp = getenv("SSNE_TRACE_PROJ"); tp) {
         static const int every = std::max(1, atoi(tp));
         static std::map<uint32_t, int> seen;
@@ -373,9 +393,10 @@ void hle_MTXPerspective(PPCContext& ctx) {
             fprintf(stdout, "[proj] persp from %08X aspect %.3f fovy %.2f (x%d)\n", ctx.lr, ctx.ps0[2], ctx.ps0[1], seen[ctx.lr]);
     }
     uint32_t m = ctx.r[3];
-    if (scene_camera_caller(ctx.lr) && ctx.ps0[1] < kGameFov - 0.5) g_cam_zoom_ms = now_ms();
-    float aspect = float(ctx.ps0[2]) * effective_widescreen(ctx.lr), n = float(ctx.ps0[3]), f = float(ctx.ps0[4]);
-    float fovy = adjust_fov(ctx.lr, float(ctx.ps0[1]));
+    if (scene_camera_caller(ctx.lr) && ctx.ps0[1] < kGameFov - 0.5 &&
+        (!g_level_overlay || overlay_player_projection(ctx))) g_cam_zoom_ms = now_ms();
+    float aspect = float(ctx.ps0[2]) * effective_widescreen(ctx), n = float(ctx.ps0[3]), f = float(ctx.ps0[4]);
+    float fovy = adjust_fov(ctx, float(ctx.ps0[1]));
     float half = sda2_float(ctx, -0x44B0), d2r = sda2_float(ctx, -0x44AC);  // 0.5, pi/180
     float one = sda2_float(ctx, -0x44C0), zero = sda2_float(ctx, -0x44B8), mone = sda2_float(ctx, -0x44B4);
     float angle = d2r * (half * fovy);
@@ -390,8 +411,8 @@ void hle_MTXPerspective(PPCContext& ctx) {
 void hle_MTXLightPerspective(PPCContext& ctx) {
     if (getenv("SSNE_TRACE_PROJ")) { static std::map<uint32_t, int> seen; if (seen[ctx.lr]++ % 600 == 0) fprintf(stdout, "[proj] light from %08X aspect %.3f fovy %.1f (x%d)\n", ctx.lr, ctx.ps0[2], ctx.ps0[1], seen[ctx.lr]); }
     uint32_t m = ctx.r[3];
-    float aspect = float(ctx.ps0[2]) * effective_widescreen(ctx.lr);
-    float fovy = adjust_fov(ctx.lr, float(ctx.ps0[1]));
+    float aspect = float(ctx.ps0[2]) * effective_widescreen(ctx);
+    float fovy = adjust_fov(ctx, float(ctx.ps0[1]));
     float sS = float(ctx.ps0[3]), sT = float(ctx.ps0[4]), tS = float(ctx.ps0[5]), tT = float(ctx.ps0[6]);
     float half = sda2_float(ctx, -0x4518), d2r = sda2_float(ctx, -0x4504);
     float one = sda2_float(ctx, -0x4520), zero = sda2_float(ctx, -0x451C), mone = sda2_float(ctx, -0x4508);
@@ -2490,7 +2511,7 @@ void hle_damage(PPCContext& ctx) {
     }
     PPCFunc* slot = ssne_hook_slot(kDamage);
     *slot = nullptr;
-    g_orig_damage(ctx);
+    native_hitmarker_player_damage(ctx,g_orig_damage);
     *slot = &hle_damage;
 }
 
@@ -2525,13 +2546,16 @@ void install_cheats() {
 PPCFunc g_boot_update_original = nullptr, g_boot_exit_original = nullptr;
 uint32_t g_boot_update_address = 0, g_boot_exit_address = 0;
 float g_scene_canvas_factor = 1.f;
+bool g_scene_info_canvas = false;
 bool g_loading_flip_pending = false;
-void set_scene_canvas_factor(float factor) {
-    if (factor == g_scene_canvas_factor) return;
+void set_scene_canvas_factor(float factor, bool info = false) {
+    if (factor == g_scene_canvas_factor && info == g_scene_info_canvas) return;
     g_scene_canvas_factor = factor;
+    g_scene_info_canvas = info;
     if (!g_loading_flip_pending) {
         gx_sync();
         g_loading_canvas_factor = factor;
+        g_info_canvas = info;
     }
 }
 void hle_boot_update(PPCContext& ctx) {
@@ -2567,10 +2591,6 @@ void install_boot_canvas_aspect() {
 }
 
 
-// NETRICSA keeps the same canvas and selected player while browsing messages,
-// enemies, weapons or the level briefing.
-PPCFunc g_info_select_original = nullptr, g_info_close_original = nullptr;
-uint32_t g_info_select_address = 0, g_info_close_address = 0, g_info_owner = 0;
 bool briefing_range(uint32_t p, unsigned n) {
     return p >= 0x80000000u && p <= guest_ram_end() - n;
 }
@@ -2579,25 +2599,36 @@ bool briefing_range(uint32_t p, unsigned n) {
 // another local player does not widen an unrelated screen.
 uint32_t g_score_gui = 0, g_open_menu_address = 0;
 PPCFunc g_open_menu_original = nullptr;
-bool score_root_linked(uint32_t gui) {
-    if (!briefing_range(gui,0x90) || mem_read32(gui+0x14)) return false;
+constexpr uint16_t kScoreRoot = 0xbc, kInfoRoot = 0xe3, kPauseRoot = 0x129;
+struct PlayerOverlay { uint32_t gui = 0; uint16_t root = 0; };
+std::array<PlayerOverlay,8> g_player_overlays{};
+bool menu_root_linked(uint32_t gui, uint16_t root) {
+    if (!briefing_range(gui,0x90)) return false;
     uint32_t node = mem_read32(gui+0x6c);
     for (unsigned depth=0; depth<32 && briefing_range(node,0x28); ++depth) {
         const uint32_t definition = mem_read32(node+0x1c);
-        if (briefing_range(definition,4) && mem_read16(definition+2)==0xbc) return true;
+        if (briefing_range(definition,4) && mem_read16(definition+2)==root) return true;
         node=mem_read32(node+8);
     }
     return false;
 }
-void score_menu_open(PPCContext& ctx) {
+void level_menu_open(PPCContext& ctx) {
     const uint32_t gui = ctx.r[3], id = ctx.r[4];
     ssne_call_original(ctx,g_open_menu_address,g_open_menu_original);
-    if (id==0xbc && score_root_linked(gui)) {
+    if (id==kScoreRoot && menu_root_linked(gui,kScoreRoot)) {
         g_score_gui=gui;
         set_scene_canvas_factor(g_widescreen.load());
+    } else if ((id == kInfoRoot || id == kPauseRoot) && briefing_range(gui,0x90) &&
+               mem_read32(game_address(0x802DB0E0u)) == 4) {
+        const auto slot = mem_read16(gui+0x84);
+        if (slot >= g_player_overlays.size() || (g_netplay_active && slot != g_netplay_local_player.load())) return;
+        g_player_overlays[slot] = {gui, uint16_t(id)};
+        g_level_overlay = true;
+        publish_frame_aspect(g_widescreen.load(), g_frame_zoom.load());
+        if (id == kInfoRoot) set_scene_canvas_factor(g_widescreen.load(), true);
     }
 }
-void install_score_canvas_aspect() {
+void install_level_menu_aspect() {
     const uint32_t address=g_ver==&kVersions[1] ? 0x800F9978u : 0x800F993Cu;
     const uint32_t signature[]{0x9421FFE8u,0x7C0802A6u,0xBF810008u,0x9001001Cu,0x7C7E1B78u,0x816D89A4u,0xA93E0084u};
     const auto entry=ssne_find_func(address);
@@ -2605,25 +2636,32 @@ void install_score_canvas_aspect() {
     g_open_menu_address=address;
     const auto previous=*ssne_hook_slot(address);
     g_open_menu_original=previous ? previous : entry->func;
-    ssne_install_hook(address,score_menu_open);
+    ssne_install_hook(address,level_menu_open);
 }
-void hle_info_select(PPCContext& ctx) {
-    const uint32_t owner = ctx.r[3];
-    ssne_call_original(ctx, g_info_select_address, g_info_select_original);
-    if (!briefing_range(owner, 0x98) || mem_read32(game_address(0x802DB0E0u)) != 4) return;
-    const uint32_t player = mem_read32(owner + 0x90);
-    if (!briefing_range(player, 0x724) || mem_read32(player + 0x720) != owner) return;
-    if (g_netplay_active ? mem_read32(player + 0x17C) != uint32_t(g_netplay_local_player.load()) :
-        mem_read32(game_address(0x802DB1BCu)) != 0) return;
-    g_info_owner = mem_read32(owner + 0x6C) ? owner : 0;
-    set_scene_canvas_factor(g_info_owner ? g_widescreen.load() : 1.f);
-}
-void hle_info_close(PPCContext& ctx) {
-    if (ctx.r[3] == g_info_owner) {
-        g_info_owner = 0;
-        set_scene_canvas_factor(1.f);
+void finish_level_menu_frame(uint32_t sda) {
+    if (!g_level_overlay && !g_score_gui) return;
+    const bool in_level = mem_read32(game_address(0x802DB0E0u)) == 4;
+    const auto open_mask = mem_read32(sda-0x765Cu);
+    bool overlay = false, info = false;
+    for (size_t slot = 0; slot < g_player_overlays.size(); ++slot) {
+        auto& menu = g_player_overlays[slot];
+        if (!menu.gui) continue;
+        // Close clears the input mask before the last visible frame. The native
+        // GUI releases its backdrop at the end of the fade, including submenus.
+        if (in_level && mem_read16(menu.gui+0x84) == slot &&
+            ((open_mask & (1u << slot)) || mem_read32(menu.gui+0x20) || menu_root_linked(menu.gui,menu.root))) {
+            overlay = true;
+            info |= menu.root == kInfoRoot;
+        } else menu = {};
     }
-    ssne_call_original(ctx, g_info_close_address, g_info_close_original);
+    if (g_score_gui && (!in_level || mem_read32(g_score_gui+0x14) || !menu_root_linked(g_score_gui,kScoreRoot)))
+        g_score_gui = 0;
+    set_scene_canvas_factor(info || g_score_gui ? g_widescreen.load() : 1.f, info && !g_score_gui);
+    // Offline, the control flag describes the previous tick. Hand the world
+    // camera back only when its ordinary gameplay projection is ready again.
+    g_level_overlay = overlay || (g_level_overlay && in_level && !g_netplay_active &&
+                                 !g_player_control.load() && !g_score_gui && !native_movie_presenting() &&
+                                 !native_cutscene_presenting());
 }
 // Each of the original GUI backdrop's nine strips advances by four times its
 // signed speed per retrace. The update receives seconds, but the native loop
@@ -2670,24 +2708,6 @@ void install_backdrop_scroll() {
     ssne_install_hook(address,hle_backdrop_scroll);
 }
 
-void install_info_canvas_aspect() {
-    const bool pal = g_ver == &kVersions[1];
-    g_info_select_address = pal ? 0x801024B8u : 0x8010247Cu;
-    g_info_close_address = pal ? 0x801020F8u : 0x801020BCu;
-    const uint32_t select_sig[]{0x9421FFD0,0x7C0802A6,0xDBE10028,0xBF410010,0x90010034,0x7C7D1B78};
-    const uint32_t close_sig[]{0x9421FFF0,0x7C0802A6,0x93E1000C,0x90010014,0x7C7F1B78,0x801F006C};
-    const auto select = ssne_find_func(g_info_select_address);
-    const auto close = ssne_find_func(g_info_close_address);
-    if (!select || !close || !code_matches(g_info_select_address, select_sig) ||
-        !code_matches(g_info_close_address, close_sig)) return;
-    const auto prior_select = *ssne_hook_slot(g_info_select_address);
-    const auto prior_close = *ssne_hook_slot(g_info_close_address);
-    g_info_select_original = prior_select ? prior_select : select->func;
-    g_info_close_original = prior_close ? prior_close : close->func;
-    ssne_install_hook(g_info_select_address, hle_info_select);
-    ssne_install_hook(g_info_close_address, hle_info_close);
-}
-
 PPCFunc g_loading_bounds_original = nullptr;
 uint32_t g_loading_hold_offset = 0;
 uint32_t g_loading_bounds_address = 0, g_loading_bounds_return = 0;
@@ -2698,6 +2718,7 @@ void hle_loading_bounds(PPCContext& ctx) {
             gx_sync();
             g_loading_flip_pending = true;
             g_loading_canvas_factor = wide;
+            g_info_canvas = false;
         }
     }
     ssne_call_original(ctx, g_loading_bounds_address, g_loading_bounds_original);
@@ -2740,13 +2761,9 @@ void hle_flip(PPCContext& ctx) {
         gx_sync();
         g_loading_flip_pending = false;
         g_loading_canvas_factor = g_scene_canvas_factor;
+        g_info_canvas = g_scene_info_canvas;
     }
-    if (g_info_owner || g_score_gui) {
-        const bool gameplay = mem_read32(game_address(0x802DB0E0u)) == 4;
-        if (g_info_owner && (!gameplay || !mem_read32(g_info_owner + 0x6C))) g_info_owner = 0;
-        if (g_score_gui && (!gameplay || !score_root_linked(g_score_gui))) g_score_gui = 0;
-        set_scene_canvas_factor(g_info_owner || g_score_gui ? g_widescreen.load() : 1.f);
-    }
+    finish_level_menu_frame(sda);
     if(deferred){
         // This late fence protects every real GX source before fresh native
         // capture, including unusual SDKFlip render tails. It follows the SDK's
@@ -2770,9 +2787,8 @@ void install_savestates() {
     ssne_install_hook(g_ver->flip, hle_flip);
     install_loading_aspect();
     install_boot_canvas_aspect();
-    install_info_canvas_aspect();
     install_backdrop_scroll();
-    install_score_canvas_aspect();
+    install_level_menu_aspect();
     g_control_hooks++;
 }
 
@@ -3294,6 +3310,7 @@ float fov() { return g_fov.load(); }
 void set_widescreen(float factor) { g_widescreen = factor < 1.0f ? 1.0f : factor; }
 float widescreen() { return g_widescreen.load(); }
 float loading_canvas_factor() { return g_loading_canvas_factor.load(); }
+bool netricsa_canvas() { return g_info_canvas.load(); }
 float widescreen_frame_factor() {
     const float loading = loading_canvas_factor();
     return loading > 1.f ? loading : g_frame_factor.load();

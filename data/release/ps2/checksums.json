@@ -1,5 +1,5 @@
 {
-  "build": 242,
+  "build": 245,
   "protocol": 70,
   "dol_sha256": "c0b8ba71e0dd99ca632a2a6931db0a8f610d69c00a423d34c96a579eaa3710ad",
   "donor_sha256": "63896cb433b75f0fc8145b4fcaf8259ef0950272cbfc96187df56762aa04e3c4",
@@ -424,6 +424,6 @@
       "bytes": 4054
     }
   },
-  "kit_sha256": "80a11daad0d99e7517798d679be683a9865bda79bd6440456668179f8795be3a",
+  "kit_sha256": "12df61adffc37caf73decd1e65320f3881479aca9e1b19cf98a8bc1e839632da",
   "content_sha256": "e71a875938228a2e3b90299a0d3db5e32eb57153c1fea3a859e7ad9cbd214157"
 }

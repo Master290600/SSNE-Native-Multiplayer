@@ -180,6 +180,11 @@ Settings::Settings() {
 
 void Settings::reset_graphics() {
     crosshair_enabled=false;crosshair_native_color=true;crosshair_file.clear();crosshair_size=32;crosshair_opacity=100;
+    hitmarker_enabled = true;
+    hitmarker_size = 100;
+    hitmarker_opacity = 100;
+    hitmarker_hit_rgb = kDefaultHitRgb;
+    hitmarker_kill_rgb = kDefaultKillRgb;
     renderer = "gpu"; scale = 0; aspect = 1; antialiasing = "off"; anisotropy = 1; fps_limit = 60; fov = 63; vsync = true; sync_display = true; gx_thread = true; gpu_vertex = true; hud_edges = true; side_fill = true; fullscreen = false; top_bar = 2; shader_notice = true;
 }
 
@@ -386,16 +391,29 @@ bool load_settings(Settings& s, const std::string& path) {
     get("side_fill", s.side_fill);
     get("crosshair_enabled",s.crosshair_enabled);
     get("crosshair_native_color",s.crosshair_native_color);
+    get("hitmarker_enabled",s.hitmarker_enabled);
+    auto read_rgb = [&](const char* key, uint32_t& color) {
+        const auto it = kv.find(key);
+        if (it == kv.end() || it->second.size() != 6) return;
+        const char* first = it->second.data();
+        uint32_t rgb = 0;
+        const auto parsed = std::from_chars(first, first + 6, rgb, 16);
+        if (parsed.ec == std::errc{} && parsed.ptr == first + 6) color = rgb;
+    };
+    read_rgb("hitmarker_hit_rgb", s.hitmarker_hit_rgb);
+    read_rgb("hitmarker_kill_rgb", s.hitmarker_kill_rgb);
     if(const auto field=kv.find("crosshair_file");field!=kv.end()) {
         if(!crosshair_filename_from_ini(field->second,s.crosshair_file)) {s.crosshair_file.clear();s.crosshair_enabled=false;}
     }
-    auto crosshair_number=[&](const char* key,int& value,int low,int high) {
+    auto bounded_number=[&](const char* key,int& value,int low,int high) {
         if(const auto field=kv.find(key);field!=kv.end()) {int parsed=0;const auto& text=field->second;
             const auto result=std::from_chars(text.data(),text.data()+text.size(),parsed);
             if(result.ec==std::errc{}&&result.ptr==text.data()+text.size())value=std::clamp(parsed,low,high);}
     };
-    crosshair_number("crosshair_size",s.crosshair_size,8,256);
-    crosshair_number("crosshair_opacity",s.crosshair_opacity,1,100);
+    bounded_number("crosshair_size",s.crosshair_size,8,256);
+    bounded_number("crosshair_opacity",s.crosshair_opacity,1,100);
+    bounded_number("hitmarker_size", s.hitmarker_size, Settings::kMinHitmarkerSize, Settings::kMaxHitmarkerSize);
+    bounded_number("hitmarker_opacity", s.hitmarker_opacity, 0, 100);
     {
         bool old = true;  // before version 5: show_top_bar = 0/1
         auto it = kv.find("show_top_bar");
@@ -616,6 +634,16 @@ bool save_settings(const Settings& s, const std::string& path) {
     o << "crosshair_file = " << crosshair_filename_ini(custom_file) << "    # UTF-8 filename in crosshairs/, percent-escaped for INI\n";
     o << "crosshair_size = " << std::clamp(s.crosshair_size,8,256) << "    # 32 = original reticle size; scales with weapon/player view\n";
     o << "crosshair_opacity = " << std::clamp(s.crosshair_opacity,1,100) << "    # 1-100 percent\n";
+    o << "hitmarker_enabled = " << (s.hitmarker_enabled ? 1 : 0) << "\n";
+    o << "hitmarker_size = " << std::clamp(s.hitmarker_size, Settings::kMinHitmarkerSize, Settings::kMaxHitmarkerSize) << "\n";
+    o << "hitmarker_opacity = " << std::clamp(s.hitmarker_opacity, 0, 100) << "\n";
+    auto write_rgb = [&](const char* key, uint32_t color) {
+        char rgb[7];
+        std::snprintf(rgb, sizeof(rgb), "%06X", static_cast<unsigned>(color & 0xffffff));
+        o << key << " = " << rgb << "\n";
+    };
+    write_rgb("hitmarker_hit_rgb", s.hitmarker_hit_rgb);
+    write_rgb("hitmarker_kill_rgb", s.hitmarker_kill_rgb);
     o << "[audio]\n";
     o << "volume = " << s.volume << "\n";
     o << "music_volume = " << s.music_volume << "    # music and video sound, % of the volume\n";

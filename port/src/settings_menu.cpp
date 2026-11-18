@@ -120,6 +120,19 @@ bool bind_button(const Bind& b, bool pad, int action, int slot, bool multiplayer
     return false;
 }
 
+bool hitmarker_color(const char* label, uint32_t& rgb) {
+    float color[3] = {
+        float((rgb >> 16) & 0xff) / 255.f,
+        float((rgb >> 8) & 0xff) / 255.f,
+        float(rgb & 0xff) / 255.f
+    };
+    if (!ImGui::ColorEdit3(menu_ui::label(label).c_str(), color,
+                           ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoOptions)) return false;
+    const auto channel = [](float value) { return uint32_t(std::clamp(value, 0.f, 1.f) * 255.f + .5f); };
+    rgb = (channel(color[0]) << 16) | (channel(color[1]) << 8) | channel(color[2]);
+    return true;
+}
+
 bool crosshair_controls(Settings& s,const MenuInfo& info) {
     // The entire F12 menu follows the selected display language.
     bool changed=false;
@@ -176,6 +189,24 @@ bool crosshair_controls(Settings& s,const MenuInfo& info) {
         ImGui::PopStyleColor();
     }
     if(menu_ui::Button("Use original crosshair###crosshair_original")) {s.crosshair_enabled=false;s.crosshair_native_color=true;changed=true;}trace_crosshair_widget("original");
+    menu_ui::SeparatorText("Hit feedback");
+    changed |= menu_ui::Checkbox("Show hit markers", &s.hitmarker_enabled);
+    trace_crosshair_widget("hitmarker_enabled");
+    ImGui::BeginDisabled(!s.hitmarker_enabled);
+    changed |= hitmarker_color("Hit color", s.hitmarker_hit_rgb);
+    trace_crosshair_widget("hitmarker_hit_rgb", s.hitmarker_enabled);
+    ImGui::SameLine();
+    changed |= hitmarker_color("Kill color", s.hitmarker_kill_rgb);
+    trace_crosshair_widget("hitmarker_kill_rgb", s.hitmarker_enabled);
+    ImGui::SetNextItemWidth(280);
+    changed |= menu_ui::SliderInt("Size###hitmarker_size", &s.hitmarker_size, Settings::kMinHitmarkerSize,
+                                  Settings::kMaxHitmarkerSize, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+    trace_crosshair_widget("hitmarker_size", s.hitmarker_enabled);
+    ImGui::SetNextItemWidth(280);
+    changed |= menu_ui::SliderInt("Opacity###hitmarker_opacity", &s.hitmarker_opacity, 0, 100,
+                                  "%d%%", ImGuiSliderFlags_AlwaysClamp);
+    trace_crosshair_widget("hitmarker_opacity", s.hitmarker_enabled);
+    ImGui::EndDisabled();
     return changed;
 }
 

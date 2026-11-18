@@ -37,6 +37,8 @@
 namespace port::coop { unsigned native_root_id(uint32_t owner); namespace {
 constexpr unsigned group=0x148,title=group+1,first=group+2,description=group+6;
 constexpr unsigned result_connection=0x151,lobby_start=0x152,lobby_connection=0x153,lobby_bots=0x154,options_button=0x155,survival_button=0x156,custom_levels_button=0x157,lobby_map=0x158,lobby_ready_button=0x159,profile_skin_selector=0x15b,lobby_invite=0x169;
+// The native GUI looks up children by ID across retained menu panels.
+constexpr unsigned no_custom_levels_label=0x16c;
 enum class Page {Closed,Home,Host,Join,Connecting,Error,Bots,Connection,Rooms,Options,BrowserTools,InviteHost,InviteJoin,InviteStatus,OnlineSetup,SessionOptions,Direct};
 enum class Edit {None,Address,Pin,Port,Name,Invitation,HostName};
 bool name_field(Edit field){return field==Edit::Name || field==Edit::HostName;}
@@ -335,7 +337,7 @@ void prepare_mouse_footers(PPCContext& c){
         mouse_footer(c,custom_gui,0x4b,custom_levels_button,576,170.f,190.f,custom_level_menu_active()?FrontText::OriginalLevels:FrontText::CustomLevels,available,has_levels);
         // A separate disabled native caption never replaces the selected map
         // title/category. The PS2 carousel remains usable with no user maps.
-        mouse_footer(c,custom_gui,0x4b,0x15a,960,170.f,165.f,FrontText::NoCustomLevels,available&&!has_levels,false,.34f);
+        mouse_footer(c,custom_gui,0x4b,no_custom_levels_label,960,170.f,165.f,FrontText::NoCustomLevels,available&&!has_levels,false,.34f);
     }
     if(!active())return;
     if(host() && gui && native_root_id(gui)==0xA7){
@@ -865,7 +867,7 @@ bool native_frontend_mouse_allowed(uint32_t owner,uint32_t node,uint16_t root,ui
     // Native button captions still report selectable when their disabled flag
     // only changes the draw colour. Keep the empty custom category inert, and
     // never let its informational caption consume a carousel confirmation.
-    if(root==0x4b && (id==0x15a || (id==custom_levels_button && node &&
+    if(root==0x4b && (id==no_custom_levels_label || (id==custom_levels_button && node &&
        (mem_read32(mem_read32(node+0x1c)+0xc)&0x10u))))return false;
     if(visible){
         if(owner!=gui || root!=group)return false;

@@ -127,7 +127,9 @@ uint32_t prompt_variant(uint32_t sample) {
 
 uint32_t prompt_apply(Texture& t, uint32_t sample) {
     int layout = find_layout(t);
-    if(layout>=0)t.font=layout<=1;
+    // All three recognized atlases contain interface glyphs. The menu button
+    // bar draws its buttons separately from the labels, on the same text grid.
+    if (layout >= 0) t.font = true;
     const auto keyboard=ssne::input_glyph_config();
     auto patches=ssne::find_input_glyphs(t.w,t.h,t.rgba);
     if (layout < 0 && patches.empty()) return 0;

@@ -1645,6 +1645,19 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         const auto ammo_rules=ssne::ammo_rules();
         state.mission["Session.AmmoCapacity"]=int64_t(ammo_rules.capacity);
         state.mission["Session.AmmoPickupMultiplier"]=int64_t(ammo_rules.pickup_multiplier);
+        if(!demand || demand->tcp_peers){
+            const auto& counts=ssne::native_hitmarker_counts();
+            std::vector<int64_t> values(3*max_players);
+            for(unsigned slot=0;slot<capacity_;++slot){
+                const auto generation=players_[slot].generation;
+                values[3*slot]=int64_t(generation);
+                if(generation && counts[slot].generation==generation){
+                    values[3*slot+1]=int64_t(counts[slot].hits);
+                    values[3*slot+2]=int64_t(counts[slot].kills);
+                }
+            }
+            state.mission["Session.Hitmarkers"]=std::move(values);
+        }
         publish_survival(state.mission);
         publish_native_lobby_characters(state.mission);
         if(sample.scene==4 && sample.mode>=2 && sample.mode<=4)capture_versus(context,sample,state.mission);
@@ -2212,7 +2225,15 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
            !play_visual_events(surfaces,10,replica_surface_epoch_,replica_surface_sequence_,ssne::play_native_weapon_surface) ||
            !play_visual_events(beams,11,replica_beam_epoch_,replica_beam_sequence_,ssne::play_native_weapon_beam))return;
 
-        if(replica_hit_epoch_!=state->epoch){replica_hit_epoch_=state->epoch;replica_hit_sequence_=journaled?event_tails[0]:confirmed_hits.empty()?0:confirmed_hits.back().sequence;{std::lock_guard lock(combat_mutex_);combat_feedback_={};combat_flash_until_={};}if(log_)log_("[coop-confirmed-hit-baseline] epoch="+std::to_string(state->epoch)+" sequence="+std::to_string(replica_hit_sequence_)+" slot="+std::to_string(client_->status().player.slot)+" generation="+std::to_string(client_->status().player.generation));}else for(const auto& hit:confirmed_hits)if(hit.sequence>replica_hit_sequence_){accept_confirmed_hit(hit,client_->status().player);if(log_)log_("[coop-confirmed-hit-client] sequence="+std::to_string(hit.sequence)+" shot="+std::to_string(hit.shot)+" source="+std::to_string(hit.source)+" target="+std::to_string(hit.target)+" slot="+std::to_string(hit.slot)+" generation="+std::to_string(hit.generation)+" before="+std::to_string(hit.before)+" after="+std::to_string(hit.after)+" amount="+std::to_string(hit.amount)+" weapon="+std::to_string(hit.weapon)+" pellet="+std::to_string(hit.pellet)+" retired_target="+std::to_string(!state->entities.contains(hit.target)));replica_hit_sequence_=hit.sequence;}
+        const auto markers=state->mission.find("Session.Hitmarkers");
+        const auto marker_values=markers!=state->mission.end()?std::get_if<std::vector<int64_t>>(&markers->second):nullptr;
+        const bool has_hitmarker_counts_=marker_values && marker_values->size()==3*max_players;
+        const auto own=client_->status().player;
+        if(has_hitmarker_counts_){
+            const auto event=hitmarker_replica_.consume(state->epoch,own,*marker_values);
+            if(event!=HitmarkerEvent::None)ssne::show_native_hitmarker(event==HitmarkerEvent::Kill);
+        }
+        if(replica_hit_epoch_!=state->epoch){replica_hit_epoch_=state->epoch;replica_hit_sequence_=journaled?event_tails[0]:confirmed_hits.empty()?0:confirmed_hits.back().sequence;{std::lock_guard lock(combat_mutex_);combat_feedback_={};combat_flash_until_={};}if(log_)log_("[coop-confirmed-hit-baseline] epoch="+std::to_string(state->epoch)+" sequence="+std::to_string(replica_hit_sequence_)+" slot="+std::to_string(own.slot)+" generation="+std::to_string(own.generation));}else for(const auto& hit:confirmed_hits)if(hit.sequence>replica_hit_sequence_){accept_confirmed_hit(hit,own);if(!has_hitmarker_counts_ && hit.slot==own.slot && hit.generation==own.generation)ssne::show_native_hitmarker(hit.after<=0);if(log_)log_("[coop-confirmed-hit-client] sequence="+std::to_string(hit.sequence)+" shot="+std::to_string(hit.shot)+" source="+std::to_string(hit.source)+" target="+std::to_string(hit.target)+" slot="+std::to_string(hit.slot)+" generation="+std::to_string(hit.generation)+" before="+std::to_string(hit.before)+" after="+std::to_string(hit.after)+" amount="+std::to_string(hit.amount)+" weapon="+std::to_string(hit.weapon)+" pellet="+std::to_string(hit.pellet)+" retired_target="+std::to_string(!state->entities.contains(hit.target)));replica_hit_sequence_=hit.sequence;}
         if(replica_impact_epoch_!=state->epoch){replica_impact_epoch_=state->epoch;replica_impact_sequence_=journaled?event_tails[4]:impacts.empty()?0:impacts.back().sequence;if(log_)log_("[coop-bullet-impact-baseline] epoch="+std::to_string(state->epoch)+" sequence="+std::to_string(replica_impact_sequence_));}else for(const auto& impact:impacts)if(impact.sequence>replica_impact_sequence_){std::string why;if(!ssne::play_native_bullet_impact(context,impact,why)){report(why);return;}replica_impact_sequence_=impact.sequence;}
         if(replica_loop_epoch_!=state->epoch){weapon_sounds_.clear();weapon_sound_order_=0;std::string why;if(!ssne::stop_native_weapon_loops(context,why)){report(why);return;}replica_loop_epoch_=state->epoch;replica_loop_sequence_=journaled?event_tails[3]:loops.empty()?0:loops.back().sequence;if(log_)log_("[coop-uzi-loop-baseline] epoch="+std::to_string(state->epoch)+" sequence="+std::to_string(replica_loop_sequence_));}
         if(replica_shot_epoch_!=state->epoch){replica_shot_epoch_=state->epoch;replica_shot_sequence_=journaled?event_tails[2]:shots.empty()?0:shots.back().sequence;if(log_)log_("[coop-weapon-shot-baseline] epoch="+std::to_string(state->epoch)+" sequence="+std::to_string(replica_shot_sequence_));}

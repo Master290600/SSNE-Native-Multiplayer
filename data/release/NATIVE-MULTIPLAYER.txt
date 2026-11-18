@@ -1,4 +1,4 @@
-SSNE-RECOOP-Native 1.2.8 · Multiplayer-Build 242 · Windows x64
+SSNE-RECOOP-Native 1.2.8.1 · Multiplayer-Build 245 · Windows x64
 
 Spiel installieren
 
@@ -11,4 +11,8 @@ Für die Kartenbearbeitung und einen erneuten Build öffnest du SSNE-RECOOP-Nati
 
 Offizielle Mehrspieler-Inhalte der PS2-Fassung
 
-„Build Game“ richtet die 15 zusätzlichen Karten, ihre Vorschaubilder, sechs Skins und das Online-Symbol automatisch ein. Für die Einrichtung genügt dieselbe europäische GameCube-Disc wie für die Kampagne. Alle Teilnehmer einer gemeinsamen Runde sollten Version 1.2.8 verwenden.
+„Build Game“ richtet die 15 zusätzlichen Karten, ihre Vorschaubilder, sechs Skins und das Online-Symbol automatisch ein. Für die Einrichtung genügt dieselbe europäische GameCube-Disc wie für die Kampagne. Alle Teilnehmer einer gemeinsamen Runde sollten Version 1.2.8.1 verwenden.
+
+Bekannte Probleme
+
+Bei den Bots und im Spielmodus Survival können derzeit noch Fehler auftreten.

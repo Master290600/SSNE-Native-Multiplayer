@@ -83,6 +83,7 @@ void mod_aim_input(bool held,
 void set_enemy_multiplier(unsigned value);
 unsigned enemy_multiplier();
 void install_mod_hooks();
+bool mod_is_registered_enemy(uint32_t actor);
 void mod_tick(PPCContext &, unsigned player);
 ModState mod_state();
 ModOptions mod_current_options();

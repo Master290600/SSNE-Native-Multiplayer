@@ -600,7 +600,7 @@ glyphs that followed the group so far). A group moves to a side only in
 * The disc reader reports every file read (`intro_skip_file_read`); once Legal.sst has been read the SI report
   ORs in Start for 200 ms after 0.8 s, retried every 1.5 s up to 4 times until FrontEnd.ssg is read. Nothing is
   pressed before Legal.sst, so memory card prompts and the PAL language choice are left to the player. Main menu
-  at ~9 s (USA and PAL verified). Setting `skip_intros` (default on); headless `--skip-intros`.
+  at ~9 s (USA and PAL verified). Set `skip_intros` to enable skipping. Intros play by default. The headless tool also accepts `--skip-intros`.
 
 ## Button prompts
 * The game draws controller buttons as glyphs: two 512x256 font atlases (menu/HUD font and the large font) and

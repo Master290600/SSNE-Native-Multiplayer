@@ -6,14 +6,16 @@ game locally from your own supported GameCube disc image.
 
 ## Download and play on Windows
 
-1. Download the Windows x64 launcher ZIP under **Assets** on the [1.2.8 release page](https://github.com/Master290600/SSNE-Native-Multiplayer/releases/tag/v1.2.8).
+1. Download the Windows x64 launcher ZIP under **Assets** on the [1.2.8.1 release page](https://github.com/Master290600/SSNE-Native-Multiplayer/releases/tag/v1.2.8.1).
 2. Extract the complete ZIP into a writable folder with a short ASCII path, such as `C:/Games/SSNE`.
 3. Run `SSNE-RECOOP-Native.exe`, select your own European GameCube disc image (G3BP9G, revision 0, English/French/German), and choose **Install Game** or **Build Game**. The package includes the compiler and recompiler.
-4. Choose **Play** or open `SSNE-Native-Game.exe` in the installation folder. Choose **Online** in the main menu to host or join. All participants should use version 1.2.8 (multiplayer build 242, protocol 70).
+4. Choose **Play** or open `SSNE-Native-Game.exe` in the installation folder. Choose **Online** in the main menu to host or join. All participants should use version 1.2.8.1 (multiplayer build 245, protocol 70).
+
+**Known issues:** Bots and the Survival game mode may still have bugs.
 
 Build Game also installs the 15 official PS2 multiplayer maps, their previews, six player skins and the Online menu icon from the included content pack. Your European GameCube disc is the only disc you need.
 
-Upgrading from v1.2.7.204 requires a manual update. Close the game and launcher, extract the complete 1.2.8 Windows ZIP into your installation folder, then open `SSNE-RECOOP-Native.exe` and choose **Build Game**. The older updater expects the previous launcher name and protocol.
+Upgrading from v1.2.7.204 requires a manual update. Close the game and launcher, extract the complete 1.2.8.1 Windows ZIP into your installation folder, then open `SSNE-RECOOP-Native.exe` and choose **Build Game**. The older updater expects the previous launcher name and protocol.
 
 Open **F12 > Game and menu language** for English, German or French. F12 applies the choice immediately. Restart the game to apply the language to the original PAL menus.
 
@@ -68,7 +70,7 @@ size; **14** means 14/32 of that size, rather than 14 fixed screen pixels.
 - A GPU with **OpenGL 3.3** and an up-to-date driver, and about **3 GB** of free disk space.
 - **Linux:** a C++ compiler, which builds the game on your PC. `clang` is recommended (faster), `g++` works too:
   `sudo pacman -S clang` (Arch), `sudo apt install clang` (Debian/Ubuntu), `sudo dnf install clang` (Fedora).
-- **Windows:** the 1.2.8 launcher package includes the LLVM-MinGW compiler for the local game build.
+- **Windows:** the 1.2.8.1 launcher package includes the LLVM-MinGW compiler for the local game build.
 
 ## How to play
 

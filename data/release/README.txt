@@ -109,7 +109,7 @@ GRAPHICS PRESETS AND AUDIO
   The window remembers its size, position and maximized state.
 
 GENERAL OPTIONS (top of the F12 menu)
-  Skip intros (on): starts at the main menu; the memory card check (and language choice on PAL) still shows.
+  Intros play by default. Enable Skip intros in F12 to start at the main menu after the memory card check and PAL language selection.
   Pause in the background (on): Alt+Tab or clicking another window pauses and silences the game.
   Exit: F12 > "Exit game" (or close the window / Alt+F4).
 

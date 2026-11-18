@@ -117,12 +117,15 @@ inline bool prepare(PPCContext& ctx,uint32_t gui,uint32_t scratch){
     const bool hidden=(mem_read32(live+0xc)&0x30u)!=0;
     mem_write32(live+0xc,mem_read32(live+0xc)&~0x30u);
     if(created || hidden)invoke(ctx,0x800fa3cc,node);
-    if(entry.profile!=selected.id || entry.model!=selected.model || !mem_read32(node+0xd4)){
-        // Original801081E4 uses exactly this catalog/profile selector contract.
+    if(!mem_read32(node+0xd4)){
+        // All profiles use the same catalog. Recreating its text helpers on
+        // every profile change briefly draws the first skin in the list.
         invoke(ctx,0x8010151c,gui,enum_id,profiles_id);
         if(!mem_read32(node+0xd4))return false;
-        entry.profile=selected.id;entry.model=selected.model;
+    }else if(entry.profile!=selected.id || entry.model!=selected.model){
+        invoke(ctx,0x800f15d0,node,selected.model);
     }
+    entry.profile=selected.id;entry.model=selected.model;
     if(const auto name=invoke(ctx,0x800f6030,gui,name_id)){
         const auto d=mem_read32(name+0x1c);if(readable(d,16))mem_write32(d+0xc,mem_read32(d+0xc)|0x20u);
     }
@@ -135,11 +138,18 @@ inline bool changed(PPCContext& ctx,uint32_t gui){
     const auto index=mem_read32(entry.node+0xd0),count=mem_read32(entry.node+0xd4);
     if(!count || index>=count)return false;
     // Original801082B4: only the selected existing profile's Model changes.
-    if(index!=selected.model)invoke(ctx,0x801155f0,selected.variable,index);
+    if(index!=selected.model){
+        invoke(ctx,0x801155f0,selected.variable,index);
+        const auto portrait=invoke(ctx,0x800f6030,gui,0xb4);
+        if(readable(portrait,0xc4)){
+            const auto state=mem_read32(portrait+0xc0);
+            // The selector already displays the skin name. Refresh the model
+            // alone and leave the selected profile's level caption in place.
+            if(readable(state,0x14))invoke(ctx,0x8010a114,state,0);
+        }
+    }
     entry.profile=selected.id;entry.model=index;
-    // Original character confirmation sends B1 event14 to refresh its model.
-    // Rebuilding the profile list does not emit that event or change a preview.
-    invoke(ctx,0x800f6e3c,gui,profiles_id,14);return true;
+    return true;
 }
 inline void forget(uint32_t gui){entries.erase(gui);}
 } // namespace port::coop::profile_skin_native

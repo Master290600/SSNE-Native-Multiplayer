@@ -399,10 +399,11 @@ void gpu_select_ctx(int k) { R = &g_rec[k & 1]; }
 namespace {
 
 // Brings the TEV / PE part of R->state up to date (when g_cfg_dirty says its inputs changed).
-float refresh_state() {
+template<class Read>
+float refresh_state(std::size_t count, Read position) {
     const bool perspective=!(g.xf_reg[0x26]&1);
     const bool ui=frontend_presenting() || (perspective?netplay_render_gui_camera():netplay_render_ui());
-    const float canvas_factor = (!perspective || R->saw_art_backdrop) ? loading_canvas_factor() : 1.f;
+    const float canvas_factor = draw_canvas_factor(loading_canvas_factor(), !perspective, R->saw_art_backdrop, count, position);
     const bool canvas_fitted = canvas_factor > 1.f;
     if (R->state.perspective != perspective || R->state.local_ui != ui || R->state.canvas_fitted != canvas_fitted)
         g_cfg_dirty = true;
@@ -515,7 +516,9 @@ void gpu_record_draw(uint8_t prim, const std::vector<Vtx>& v) {
     if (prim == PRIM_LINES || prim == PRIM_LINESTRIP || prim == PRIM_POINTS) { counters.lines_skipped++; return; }
     GpuFrame& f = cur();
     GpuState& st = R->state;
-    const float canvas_factor = refresh_state();
+    const float canvas_factor = refresh_state(v.size(), [&](size_t i) {
+        return std::array<float,4>{v[i].x,v[i].y,v[i].z,v[i].w};
+    });
     if (R->state_vx != 0) {  // R->state holds GPU vertex processing parameters: back to mode 0
         memset(&st.vcfg, 0, sizeof(st.vcfg));
         memset(&st.xf, 0, sizeof(st.xf));
@@ -586,7 +589,11 @@ void gpu_record_vertices(uint8_t prim, uint32_t n, const GpuVcfg& vcfg, const Gp
     uint32_t tris = triangle_count(prim, n);
     if (!tris) { f.vtx.resize(off); return; }
     counters.triangles += tris;
-    const float canvas_factor = refresh_state();
+    const float canvas_factor = refresh_state(n, [&](size_t i) {
+        std::array<float,4> p;
+        std::memcpy(p.data(),f.vtx.data()+off+i*stride,sizeof(p));
+        return p;
+    });
     if (R->state_vx != vx_version) {
         R->state.vcfg = vcfg;
         R->state.xf = xf;

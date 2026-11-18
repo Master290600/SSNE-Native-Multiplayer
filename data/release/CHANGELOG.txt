@@ -1,3 +1,10 @@
+SSNE-RECOOP-Native 1.2.8.1 (Windows x64, multiplayer build 245, protocol 70)
+
+  - Pause and NETRICSA preserve the current aspect ratio, including the transitions.
+  - F12 > Graphics includes hit markers with size, opacity and hit/kill colors.
+  - Intros play by default on a fresh installation.
+  - Known issues: Bots and the Survival game mode may still have bugs.
+
 SSNE-Native (Serious Sam: Next Encounter Native) - changes since the first public release of Silly ReEncounter
 =========================================================
 

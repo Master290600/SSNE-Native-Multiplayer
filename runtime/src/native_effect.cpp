@@ -5,6 +5,8 @@
 #include "ssne/audio.h"
 #include "ssne/replica_simulation.h"
 #include "ssne/native_party.h"
+#include "ssne/mods.h"
+#include "hitmarker_view.h"
 #include "ssne/native_spatial_audio_pan.h"
 #include <cmath>
 #include <atomic>
@@ -44,6 +46,13 @@ std::map<uint64_t,uint32_t> replica_cue_voices;
 std::deque<NativeWeaponLoop> loop_history;uint64_t loop_sequence=0,audio_order=0;
 PPCFunc original_voice=nullptr;
 PPCFunc original_subtract=nullptr;
+std::array<NativeHitmarkerCounts,8> marker_counts{};
+struct MarkerExpiry {std::atomic<int64_t> hit{0},kill{0};};
+std::array<MarkerExpiry,4> marker_expiry{};
+constexpr int64_t hit_duration_ms=200,kill_duration_ms=320;
+int64_t hitmarker_clock_ms(){
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 std::function<NativeHitIdentity(uint32_t)> hit_resolver;std::deque<NativeConfirmedHit> confirmed_hits;uint64_t hit_sequence=0,automatic_ray_sequence=0;
 std::map<uint32_t,uint64_t> weapon_shot_ids;
 struct AttackTrace {uint32_t actor=0;unsigned slot=0,weapon=0,pellet=0;uint64_t shot=0;};thread_local AttackTrace attack_trace;
@@ -208,7 +217,7 @@ bool update_replica_bullet_trails(PPCContext& context,std::string& error){
 }
 void voice_probe(PPCContext& c){const bool trace=presenting && c.lr==0x8010EB80u;const auto manager=c.r[3],wave=c.r[4];ssne_call_original(c,0x80157840,original_voice);if(trace && int32_t(c.r[3])<0){unsigned free=0;for(unsigned i=0;i<48;++i)free+=mem_read32(0x802D69C8u+i*192)==0;unsigned loaded=0;if(readable(manager,0x60) && wave<65536){const auto table=mem_read32(manager+0x58);if(readable(table+wave*16,16))loaded=mem_read8(table+wave*16);}log_message("[coop-native-voice-rejected] wave="+std::to_string(wave)+" free="+std::to_string(free)+" loaded="+std::to_string(loaded)+" resource_count="+std::to_string(wave<65536?mem_read8(0x80292620u+wave):0)+" gate="+std::to_string(mem_read32(c.r[13]-0x5BB0)));}}
 void subtract_probe(PPCContext& c){const auto victim=c.r[3],payload=c.r[4],caller=c.lr;const bool trace=authoritative && !rocket_damage_trace && attack_trace.actor && caller==0x80093C2Cu && readable(victim,0xD4) && readable(payload,0x10) && mem_read32(payload+8)==attack_trace.actor;const auto before=trace?u2f(mem_read32(victim+0xCC)):0.f;const auto amount=float(c.ps0[1]);const auto actor=attack_trace;const auto table=trace?mem_read32(victim+0x48):0;std::function<NativeHitIdentity(uint32_t)> resolver;if(trace){std::lock_guard lock(effect_mutex);resolver=hit_resolver;}const auto source_id=resolver?resolver(actor.actor):NativeHitIdentity{},target_id=resolver?resolver(victim):NativeHitIdentity{};ssne_call_original(c,0x8009D014,original_subtract);if(trace && readable(victim,0xD4) && mem_read32(victim+0x48)==table){const auto after=u2f(mem_read32(victim+0xCC));if(std::isfinite(before) && std::isfinite(after) && std::isfinite(amount) && amount>0 && after<before){if(source_id.entity && source_id.generation && target_id.entity && actor.shot){NativeConfirmedHit hit;hit.shot=actor.shot;hit.source=source_id.entity;hit.target=target_id.entity;hit.generation=source_id.generation;hit.slot=actor.slot;hit.weapon=actor.weapon;hit.pellet=actor.pellet;hit.before=before;hit.after=after;hit.amount=amount;std::lock_guard lock(effect_mutex);hit.sequence=hit_sequence+1;std::string why;if(!validate_native_confirmed_hit(hit,why))fatal(why.c_str());hit_sequence=hit.sequence;retain_native_event(confirmed_hits,hit);log_message("[coop-confirmed-hit-host] sequence="+std::to_string(hit.sequence)+" shot="+std::to_string(hit.shot)+" source="+std::to_string(hit.source)+" target="+std::to_string(hit.target)+" slot="+std::to_string(hit.slot)+" generation="+std::to_string(hit.generation)+" before="+std::to_string(hit.before)+" after="+std::to_string(hit.after)+" amount="+std::to_string(hit.amount)+" weapon="+std::to_string(hit.weapon)+" pellet="+std::to_string(hit.pellet));}log_message("[coop-host-attributed-hit] slot="+std::to_string(actor.slot)+" weapon="+std::to_string(actor.weapon)+" source="+std::to_string(actor.actor)+" shot="+std::to_string(actor.shot)+" victim="+std::to_string(victim)+" before="+std::to_string(before)+" after="+std::to_string(after)+" amount="+std::to_string(amount));}}}
-void subtract_diagnostic(PPCContext& c) {
+void subtract_with_provenance(PPCContext& c) {
     const auto victim=c.r[3],payload=c.r[4],caller=c.lr;
     const auto provenance=rocket_damage_trace;
     if(authoritative && getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_COOP_TRACE_LIFETIMES")){
@@ -236,6 +245,55 @@ void subtract_diagnostic(PPCContext& c) {
         if(std::isfinite(before) && std::isfinite(after) && std::isfinite(amount) && amount>0 && after<before && getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_COOP_TRACE_LIFETIMES"))
             log_message("[coop-rocket-damage-observed] shot="+std::to_string(provenance->attack.shot)+" source="+std::to_string(provenance->attack.actor)+" stable_source="+std::to_string(provenance->identity.entity)+" slot="+std::to_string(provenance->attack.slot)+" generation="+std::to_string(provenance->identity.generation)+" victim="+std::to_string(victim)+" target="+std::to_string(target.entity)+" before="+std::to_string(before)+" after="+std::to_string(after)+" amount="+std::to_string(amount));
     }
+}
+struct MarkerDamage {
+    uint32_t victim=0;
+    unsigned slot=0;
+    uint64_t generation=0;
+    float health=0,armor=0;
+};
+MarkerDamage marker_damage(const PPCContext& c,bool player) {
+    if(presenting || replica_simulation() || !readable(c.r[4],12))return {};
+    const uint32_t source=mem_read32(c.r[4]+8),victim=c.r[3];
+    const auto slot=combo_feedback_slot(source);
+    if(!slot || source==victim || (player ? !combo_feedback_slot(victim) : !mod_is_registered_enemy(victim)))return {};
+    const float health=u2f(mem_read32(victim+0xCC));
+    if(!std::isfinite(health) || health<=0)return {};
+    MarkerDamage result{victim,*slot,0,health,player?u2f(mem_read32(victim+0x390)):0.f};
+    if(authoritative && int(*slot)!=netplay_local_player()){
+        std::function<NativeHitIdentity(uint32_t)> resolver;
+        {std::lock_guard lock(effect_mutex);resolver=hit_resolver;}
+        const auto shooter=resolver?resolver(source):NativeHitIdentity{};
+        if(!shooter.entity || !shooter.generation)return {};
+        // A delayed blast belongs to the player generation that launched it.
+        if(rocket_damage_trace && (rocket_damage_trace->identity.entity!=shooter.entity ||
+                                   rocket_damage_trace->identity.generation!=shooter.generation))return {};
+        result.generation=shooter.generation;
+    }
+    return result;
+}
+void commit_marker(PPCContext& ctx,const MarkerDamage& damage,float health,float armor){
+    if(!damage.victim || !std::isfinite(health) || !(health<damage.health || armor<damage.armor))return;
+    const bool kill=health<=0;
+    if(damage.generation){
+        std::lock_guard lock(effect_mutex);
+        auto& counts=marker_counts[damage.slot];
+        if(counts.generation!=damage.generation)counts={damage.generation,0,0};
+        ++counts.hits;
+        counts.kills+=kill;
+    }else if(authoritative){
+        show_native_hitmarker(kill);
+    }else if(damage.slot<marker_expiry.size()){
+        offline_hitmarker_view(ctx,damage.slot);
+        show_native_hitmarker(kill,damage.slot);
+    }
+}
+void subtract_diagnostic(PPCContext& c){
+    // At this call site the game has accepted the damage message and r4 still
+    // holds that message. Other callers use the same helper for scripted HP changes.
+    const auto damage=c.lr==0x80093C2Cu ? marker_damage(c,false) : MarkerDamage{};
+    subtract_with_provenance(c);
+    if(damage.victim)commit_marker(c,damage,float(c.ps0[1]),0);
 }
 void area_receiver_diagnostic(PPCContext& c) {
     const auto victim=c.r[3],payload=c.r[4];
@@ -440,8 +498,41 @@ NativePickupNotice native_pickup_notice(uint32_t actor){
     // the GUI component pointer (which lives at +0x30 in this class).
     if(!readable(widget,0xC8) || !mem_read32(widget))notice.text.clear();return notice;
 }
+NativeHitmarkerPulse native_hitmarker_pulse(unsigned view_slot){
+    if(view_slot>=marker_expiry.size())return {};
+    const auto& timer=marker_expiry[view_slot];
+    const auto kill=timer.kill.load(std::memory_order_relaxed);
+    const auto hit=timer.hit.load(std::memory_order_relaxed);
+    if(!kill && !hit)return {};
+    const auto now=hitmarker_clock_ms();
+    if(kill>now)return {float(kill-now)/kill_duration_ms,true};
+    if(hit>now)return {float(hit-now)/hit_duration_ms,false};
+    return {};
+}
+void show_native_hitmarker(bool kill,unsigned view_slot){
+    if(view_slot>=marker_expiry.size())return;
+    auto& timer=marker_expiry[view_slot];
+    auto& expiry=kill?timer.kill:timer.hit;
+    expiry.store(hitmarker_clock_ms()+(kill?kill_duration_ms:hit_duration_ms),std::memory_order_relaxed);
+}
+void clear_native_hitmarkers(){
+    std::lock_guard lock(effect_mutex);
+    marker_counts={};
+    for(auto& timer:marker_expiry){timer.hit.store(0,std::memory_order_relaxed);timer.kill.store(0,std::memory_order_relaxed);}
+}
+std::array<NativeHitmarkerCounts,8> native_hitmarker_counts(){std::lock_guard lock(effect_mutex);return marker_counts;}
+void install_native_hitmarker_hooks(){
+    if(original_subtract || mem_read32(0x80000000u)!=0x47334250u || mem_read32(0x8009D014u)!=0x9421FFF0u)return;
+    if(const auto entry=ssne_find_func(0x8009D014u)){original_subtract=entry->func;ssne_install_hook(0x8009D014u,subtract_diagnostic);}
+}
+void native_hitmarker_player_damage(PPCContext& c,void (*original_damage_fn)(PPCContext&)){
+    const auto damage=marker_damage(c,true);
+    original_damage_fn(c);
+    if(damage.victim)commit_marker(c,damage,u2f(mem_read32(damage.victim+0xCC)),u2f(mem_read32(damage.victim+0x390)));
+}
 void set_native_hit_identity_resolver(std::function<NativeHitIdentity(uint32_t)> resolver){std::lock_guard lock(effect_mutex);hit_resolver=std::move(resolver);}
 void rebind_native_effect_sources(const std::array<uint64_t,8>& saved,const std::array<uint64_t,8>& live){
+    clear_native_hitmarkers();
     std::lock_guard lock(effect_mutex);
     auto rebind=[&](RocketSource& source){const auto slot=source.attack.slot;
         if(slot>=8 || !live[slot] || source.identity.generation!=saved[slot])return false;
@@ -592,7 +683,7 @@ bool apply_native_weapon_loop(PPCContext& context,const NativeWeaponLoop& event,
     PartySoundGate gate(call,event.weapon==4);ssne_call(call,local_player?0x8010EB9Cu:0x8010EC58u);gate.restore();if(getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_COOP_TRACE_LIFETIMES") && event.weapon==4)log_message("[coop-minigun-audio-gate] order="+std::to_string(event.order)+" previous="+std::to_string(gate.previous)+" restored="+std::to_string(mem_read32(call.r[13]-0x5BB0)));if(int32_t(call.r[3])<0){error="Native Uzi loop voice not started";return false;}replica_loops[key]={call.r[3],event.origin,std::chrono::steady_clock::now()-std::chrono::milliseconds(event.elapsed_ms),{},event.weapon};track_shot_voice(call.r[3],0x100000000ull+event.sequence);
     log_message(std::string(event.weapon==2?"[coop-uzi-loop-client] sequence=":"[coop-minigun-loop-client] sequence=")+std::to_string(event.sequence)+" slot="+std::to_string(event.slot)+" lane="+std::to_string(event.lane)+" active=1 duration_ms=0 voice="+std::to_string(call.r[3])+" local="+std::to_string(local_player)+" origin="+std::to_string(event.origin)+" damage_calls="+std::to_string(presentation_damage_calls)+" order="+std::to_string(event.order)+" elapsed_ms="+std::to_string(event.elapsed_ms));return true;
 }
-void disable_native_rocket_effect_capture(){authoritative=false;test_fire_request=false;std::lock_guard lock(effect_mutex);rocket_sources.clear();queued_rockets.clear();pickup_notices={};pickup_notice_serial=0;++producer_epoch;producer_accepted={};history.clear();shots.clear();confirmed_hits.clear();loop_history.clear();impacts.clear();feedback_events.clear();pending_splatters.clear();feedback_sequence=0;trails.clear();replica_trails.clear();replica_trail_views.clear();trail_sequence=0;replica_trail_frame.reset();emitters.clear();emitter_sequence=0;casings.clear();replica_casings.clear();casing_sequence=0;surfaces.clear();replica_surfaces.clear();surface_sequence=0;beams.clear();replica_beams.clear();beam_sequence=0;replica_beam_frames.clear();replica_bomb_frame.reset();host_loops.clear();host_cue_voices.clear();replica_cue_voices.clear();replica_loops.clear();hit_resolver={};weapon_shot_ids.clear();hit_sequence=0;automatic_ray_sequence=0;sequence=shot_sequence=loop_sequence=impact_sequence=audio_order=0;}
+void disable_native_rocket_effect_capture(){clear_native_hitmarkers();authoritative=false;test_fire_request=false;std::lock_guard lock(effect_mutex);rocket_sources.clear();queued_rockets.clear();pickup_notices={};pickup_notice_serial=0;++producer_epoch;producer_accepted={};history.clear();shots.clear();confirmed_hits.clear();loop_history.clear();impacts.clear();feedback_events.clear();pending_splatters.clear();feedback_sequence=0;trails.clear();replica_trails.clear();replica_trail_views.clear();trail_sequence=0;replica_trail_frame.reset();emitters.clear();emitter_sequence=0;casings.clear();replica_casings.clear();casing_sequence=0;surfaces.clear();replica_surfaces.clear();surface_sequence=0;beams.clear();replica_beams.clear();beam_sequence=0;replica_beam_frames.clear();replica_bomb_frame.reset();host_loops.clear();host_cue_voices.clear();replica_cue_voices.clear();replica_loops.clear();hit_resolver={};weapon_shot_ids.clear();hit_sequence=0;automatic_ray_sequence=0;sequence=shot_sequence=loop_sequence=impact_sequence=audio_order=0;}
 // Native stop API retires records by generation-tagged handle; stale handles
 // must never stop a newly reused sound record.
 std::vector<int64_t> native_weapon_cue_state(){

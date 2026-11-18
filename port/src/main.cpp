@@ -79,6 +79,7 @@
 #include "ssne/native_music.h"
 #include "ssne/replica_simulation.h"
 #include "ssne/native_effect.h"
+#include "ssne/hitmarker_view.h"
 #include "coop/native_vehicle.h"
 #include "coop/startup_support.h"
 #include "coop/startup_trace.h"
@@ -499,6 +500,44 @@ void update_auto_scale(SDL_Window* win) {
     }
 }
 
+void draw_hitmarker(ImDrawList& draw, const port::GameViewRect& image,
+                    ssne::HitmarkerView view, ssne::NativeHitmarkerPulse pulse) {
+    if (view.right <= view.left || view.bottom <= view.top) return;
+    const uint32_t rgb = pulse.kill ? g_set.hitmarker_kill_rgb : g_set.hitmarker_hit_rgb;
+    const float opacity = g_set.hitmarker_opacity / 100.f;
+    const int alpha = static_cast<int>(255.f * opacity * std::min(1.f, pulse.intensity * 2.f));
+    if (alpha == 0) return;
+    const ImU32 color = IM_COL32((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, alpha);
+    const ImU32 outline = IM_COL32(0, 0, 0, alpha * 3 / 4);
+    const float view_scale = std::max(0.65f, (view.bottom-view.top)*image.height / 720.f);
+    const float scale = view_scale * (g_set.hitmarker_size / 100.f);
+    const ImVec2 center(image.x + image.width*(view.left+view.right)*0.5f,
+                        image.y + image.height*(view.top+view.bottom)*0.5f);
+    const float inner = 6.f * scale, outer = 13.f * scale;
+    for (int x : {-1, 1}) {
+        for (int y : {-1, 1}) {
+            const ImVec2 a(center.x + x * inner, center.y + y * inner);
+            const ImVec2 b(center.x + x * outer, center.y + y * outer);
+            draw.AddLine(a, b, outline, 4.f * scale);
+            draw.AddLine(a, b, color, 2.f * scale);
+        }
+    }
+}
+
+void draw_hitmarkers(ImDrawList& draw, const port::GameViewRect& image) {
+    if (!g_set.hitmarker_enabled || g_coop_spectating || port::menu_open() || port::mod_menu_open()) return;
+    const bool online = g_coop_host || g_coop_client;
+    for (unsigned slot=0; slot<(online?1u:4u); ++slot) {
+        const auto pulse = ssne::native_hitmarker_pulse(slot);
+        if (pulse.intensity <= 0.f) continue;
+        if (ssne::local_information_open() || ssne::local_pause_menu_open() ||
+            ssne::native_results_presenting() || ssne::native_cutscene_presenting()) return;
+        const auto view = online ? ssne::HitmarkerView{} : ssne::hitmarker_view(slot);
+        if ((view.right-view.left)>.99f && (view.bottom-view.top)>.99f && !ssne::player_control_active()) continue;
+        draw_hitmarker(draw, image, view, pulse);
+    }
+}
+
 void draw_game_view() {
     GLuint tex=g_tex,fill=0;
     float factor=g_software_frame_wide;uint64_t image_sequence=g_frame_seq;
@@ -525,6 +564,7 @@ void draw_game_view() {
     if (movie) port::draw_movie(*dl, (ImTextureID)(intptr_t)tex, p0.x, p0.y, w, h, rendered_factor, movie);
     else dl->AddImage((ImTextureID)(intptr_t)tex, p0, ImVec2(p0.x + w, p0.y + h));
     dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+    if (!movie) draw_hitmarkers(*dl, image);
     port::draw_mod_overlay(p0.x,p0.y,w,h);
 }
 

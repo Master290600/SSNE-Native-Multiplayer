@@ -818,11 +818,12 @@ void tev_reg_write(uint32_t reg, uint32_t v) {
 // recorder places whole groups of draws at the end of the frame (gx_gpu_record.cpp, place_hud), which also allows
 // moving the HUD out to the screen edges (hud_edges): per draw, that splits text, which is drawn one glyph per draw.
 const std::vector<Vtx>& widescreen_hud(const std::vector<Vtx>& v, std::vector<Vtx>& tmp, float& fitted_canvas) {
-    const float loading = loading_canvas_factor();
     const bool ortho=(g.xf_reg[0x26] & 1)!=0;
-    if (loading > 1.f && (ortho || g_saw_art_backdrop) && !v.empty()) {
+    const auto position=[&](size_t i){return std::array<float,4>{v[i].x,v[i].y,v[i].z,v[i].w};};
+    const float loading=draw_canvas_factor(loading_canvas_factor(),ortho,g_saw_art_backdrop,v.size(),position);
+    if (loading > 1.f && !v.empty()) {
         tmp=v;
-        const bool backdrop=fit_loading_canvas(loading,v.size(),[&](size_t i){return std::array<float,4>{v[i].x,v[i].y,v[i].z,v[i].w};},
+        const bool backdrop=fit_loading_canvas(loading,v.size(),position,
             [&](size_t i,float x,float y){tmp[i].x=x;tmp[i].y=y;},ortho);
         g_saw_art_backdrop |= backdrop;
         fitted_canvas = loading;

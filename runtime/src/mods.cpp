@@ -4,6 +4,7 @@
 #include <atomic>
 #include "ssne/native_party.h"
 #include "ssne/native_entity.h"
+#include "ssne/native_effect.h"
 #include "ssne/native_pickup.h"
 #include "ssne/game_addresses.h"
 #include "ssne/hw.h"
@@ -846,6 +847,7 @@ void enemy_hook(PPCContext &c) {
   }
 }
 void exit_hook(PPCContext &c) {
+  clear_native_hitmarkers();
   notify_native_entity(c,{NativeEntityNotice::Event::LevelExit});
   netplay_reset_world();
   {
@@ -981,7 +983,14 @@ void clear_overrides() {
 } // namespace
 void set_enemy_multiplier(unsigned value) {spawn_multiplier.store(value>=1 && value<=5?value:1,std::memory_order_relaxed);}
 unsigned enemy_multiplier() {return spawn_multiplier.load(std::memory_order_relaxed);}
+bool mod_is_registered_enemy(uint32_t actor) {
+  std::lock_guard<std::recursive_mutex> guard(lock);
+  const auto entry=enemies.find(actor);
+  return entry!=enemies.end() && entry->second.registered && valid(actor,0xD4) &&
+         mem_read32(actor+0x48)==entry->second.vtable;
+}
 void install_mod_hooks() {
+  install_native_hitmarker_hooks();
   install_ammo_rule_hooks();
   std::lock_guard<std::recursive_mutex> guard(lock);
   bool a = install(game_address(0x8010CF00), {0x9421FFD0, 0x7C0802A6, 0xBF61001C}, item_hook,
