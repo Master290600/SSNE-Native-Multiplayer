@@ -1,5 +1,8 @@
 #include "spectator.h"
+#include "world_state.h"
+#ifdef SSNE_TEST_SESSION_TRANSPORT
 #include "authoritative_session.h"
+#endif
 #include "checkpoint_codec.h"
 #include <chrono>
 #include <cmath>
@@ -11,8 +14,6 @@ using namespace port::coop;
 namespace {
 unsigned checks=0;
 void require(bool value,const char* why){++checks;if(!value)throw std::runtime_error(why);}
-void wait_for(const std::function<bool()>& condition,const char* why){const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(6);while(!condition()){require(std::chrono::steady_clock::now()<deadline,why);std::this_thread::sleep_for(std::chrono::milliseconds(2));}}
-void actor(WorldState& world,PlayerId player){EntityState entity;entity.id=100+player.slot;entity.kind=EntityKind::Player;entity.definition=2;entity.owner=player;entity.properties={{"position",std::array<float,3>{float(player.slot),0,0}},{"health",100.f},{"player_slot",int64_t(player.slot)}};world.entities[entity.id]=std::move(entity);}
 void authority_test(){
     SessionAuthority authority(3);const auto host=*authority.join("Host"),client=*authority.join("Client"),bot=*authority.join("Bot",true);for(const auto id:{host,client,bot})require(authority.attach_character(id,100+id.slot) && authority.finish_join(id),"Authority actor readiness failed");
     require(authority.request_spectator(client,1,true)==CommandResult::Applied,"Voluntary watching rejected");require(authority.participant(client)->spectator,"Watch preference missing");
@@ -51,6 +52,9 @@ void codec_test(){
     auto legacy=truncated;legacy[32]&=1;require(decode_delta(legacy,decoded,error) && !decoded.players[0].spectator,"Old209 world checkpoint could not migrate");
     bytes.push_back(0);require(!decode_delta(bytes,decoded,error),"Trailing malformed spectator payload accepted");world.players[0].connected=false;require(!validate_world(world,error),"Disconnected watcher state accepted");
 }
+#ifdef SSNE_TEST_SESSION_TRANSPORT
+void wait_for(const std::function<bool()>& condition,const char* why){const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(6);while(!condition()){require(std::chrono::steady_clock::now()<deadline,why);std::this_thread::sleep_for(std::chrono::milliseconds(2));}}
+void actor(WorldState& world,PlayerId player){EntityState entity;entity.id=100+player.slot;entity.kind=EntityKind::Player;entity.definition=2;entity.owner=player;entity.properties={{"position",std::array<float,3>{float(player.slot),0,0}},{"health",100.f},{"player_slot",int64_t(player.slot)}};world.entities[entity.id]=std::move(entity);}
 void host_guard_test(){
     AuthoritativeServer server(4);require(server.start(0,"123456",98765,"Solo host"),"Solo host start failed");
     const auto host=server.status().player;WorldState world;world.epoch=1;world.tick=1;world.level="Rlevel1_1";actor(world,host);std::string error;
@@ -94,5 +98,22 @@ void tcp_test(){
     client.set_spectator(false);wait_for([&]{return !server.participants()[remote.slot].spectator;},"Fresh voluntary leave rejected");require(server.set_spectator_lock(bit) && server.participants()[remote.slot].spectator && !(server.voluntary_spectator_mask()&bit),"Forced elimination became voluntary watch");require(server.set_spectator_lock(0) && !server.participants()[remote.slot].spectator,"Round restart did not release eliminated active player");
     require(server.set_spectator_lock(bit),"Leave fixture lock failed");client.stop();wait_for([&]{return !server.participants()[remote.slot].connected;},"Client leave timed out");AuthoritativeClient next;require(next.start("127.0.0.1",server.status().port,"123456",98765,"Replacement"),"Replacement start failed");wait_for([&]{return next.status().connected;},"Replacement join timed out");require(next.status().player.slot==remote.slot && next.status().player.generation!=remote.generation && !server.participants()[remote.slot].spectator,"Slot reuse inherited forced spectator");next.stop();server.stop();
 }
+#endif
 }
-int main(){try{authority_test();controller_test();codec_test();host_guard_test();tcp_test();std::cout<<"Spectator generation/epoch selection, native-menu sanitation, solo-host guard, round locks, legacy checkpoints and real TCP publication passed "<<checks<<" assertions\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+
+int main() {
+    try {
+        authority_test();
+        controller_test();
+        codec_test();
+#ifdef SSNE_TEST_SESSION_TRANSPORT
+        host_guard_test();
+        tcp_test();
+#endif
+        std::cout << "Spectator checks passed: " << checks << '\n';
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}
