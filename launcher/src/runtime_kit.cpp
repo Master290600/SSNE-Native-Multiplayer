@@ -69,7 +69,8 @@ bool load_runtime_kit(const std::string& project_dir,const std::string& data_dir
         RuntimeKit k;k.project_dir=S(fs::weakly_canonical(P(project_dir)));k.kit_dir=S(P(k.project_dir)/"build-kit/multiplayer");k.data_dir=S(fs::weakly_canonical(P(data_dir)));
         const auto project=P(k.project_dir),kit=P(k.kit_dir);auto side=json(kit/"launcher-kit.json");need(number(side,"schema")==1,"Unsupported native launcher kit schema");
         k.sidecar_sha256=runtime_text_sha256(bytes(kit/"launcher-kit.json"));k.descriptor_sha256=hash_field(side,"runtime_kit_sha256");matches(kit/"runtime-kit.json",k.descriptor_sha256);
-        auto d=json(kit/"runtime-kit.json");k.build=number(d,"build");k.protocol=number(d,"protocol");need(k.build>=202&&(k.protocol==63||k.protocol==64||k.protocol==65||k.protocol==66||k.protocol==67||k.protocol==68||k.protocol==69||k.protocol==70),"Unsupported native multiplayer runtime build/protocol");
+        auto d=json(kit/"runtime-kit.json");k.build=number(d,"build");k.protocol=number(d,"protocol");
+        need(k.build >= 202 && k.protocol >= 63 && k.protocol <= 71, "Unsupported native multiplayer runtime build/protocol");
         if (side.find("ps2_content_sha256")) k.ps2_content_sha256=hash_field(side,"ps2_content_sha256");
         k.recipe=S(contained(project,relative(str(side,"patch_recipe"))));k.recipe_sha256=hash_field(side,"patch_recipe_sha256");
         k.symbols=S(contained(project,relative(str(side,"symbols"))));k.symbols_sha256=hash_field(side,"symbols_sha256");

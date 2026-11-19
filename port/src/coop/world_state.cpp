@@ -13,6 +13,9 @@ constexpr size_t max_entities=32768,max_properties=256,max_mission_properties=40
 // A bounded native-event batch contains up to 128 rows with several integer
 // tags per row (flame particles use five). Keep encode/decode limits identical.
 constexpr size_t max_integer_values=1024;
+size_t float_limit(const std::string& key){
+    return key=="Session.Vehicles.Values"?16*(104+128*12):4096;
+}
 bool text_ok(const std::string& s,size_t limit,bool empty=true) {
     return (empty || !s.empty()) && s.size()<=limit &&
         std::none_of(s.begin(),s.end(),[](unsigned char c){return c<32 || c==127;});
@@ -33,7 +36,7 @@ bool properties_ok(const Properties& fields,size_t limit) {
                 return std::all_of(value.begin(),value.end(),[](float f){return std::isfinite(f);});
             else if constexpr(std::is_same_v<T,std::string>)return name=="pickup_notice_text"?notice_text_ok(value):text_ok(value,512);
             else if constexpr(std::is_same_v<T,std::vector<int64_t>>)return value.size()<=(name=="netricsa_pages"?16384:max_integer_values);
-            else if constexpr(std::is_same_v<T,std::vector<float>>)return value.size()<=4096 && std::all_of(value.begin(),value.end(),[](float f){return std::isfinite(f);});
+            else if constexpr(std::is_same_v<T,std::vector<float>>)return value.size()<=float_limit(name) && std::all_of(value.begin(),value.end(),[](float f){return std::isfinite(f);});
             else return true;
         },p);
         if(!ok)return false;
@@ -101,7 +104,7 @@ struct Reader {
         case 4:return EntityReference{u64()};
         case 5:return text(key=="pickup_notice_text"?127:512,key=="pickup_notice_text");
         case 6:{std::vector<int64_t> v;auto n=count(key=="netricsa_pages"?16384:max_integer_values);for(unsigned i=0;i<n && ok;++i)v.push_back(std::bit_cast<int64_t>(u64()));return v;}
-        case 7:{std::vector<float> v;auto n=count(4096);for(unsigned i=0;i<n && ok;++i)v.push_back(std::bit_cast<float>(u32()));return v;}
+        case 7:{std::vector<float> v;auto n=count(float_limit(key));for(unsigned i=0;i<n && ok;++i)v.push_back(std::bit_cast<float>(u32()));return v;}
         default:ok=false;return int64_t(0);
         }
     }

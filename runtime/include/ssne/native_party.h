@@ -7,7 +7,7 @@
 #include <string>
 #include <functional>
 namespace ssne {
-void native_party_stabilize_idle(PPCContext&,uint32_t actor,const std::array<float,3>& before);
+void native_party_install_ground_collision();
 struct NativeSegmentHit {std::array<float,3> position{},normal{};uint32_t flags=0;};
 // Executes the native PAL geometry query at a guest-thread safe point. No hit
 // is distinct from unavailable/invalid context; callers must check both.

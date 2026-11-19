@@ -39,13 +39,20 @@ bool extra_loadouts_initialized=false;
 std::map<uint32_t,uint32_t> pickup_flags;
 std::map<uint32_t,unsigned> view_owners;
 std::array<PadState,8> pads;
+// PAL's wheeled-vehicle camera has two four-sample histories and one 3x4
+// output matrix. The console stores all three in one global block.
+constexpr uint32_t wheeled_camera_history=0x802ACD80u;
+struct DriverCamera {
+    uint32_t car=0;
+    std::array<uint8_t,0x90> history{};
+};
+std::array<DriverCamera,8> driver_cameras{};
 std::array<uint32_t,8> known_player_actors{};
 struct PendingSpawn {unsigned request=0,flags=0,attempts=0;bool local=true,force_safe=false,full_respawn=false;std::chrono::steady_clock::time_point next{};};
 std::map<uint32_t,PendingSpawn> pending_spawns;
 std::map<uint32_t,std::array<float,3>> prepared_spawns;
 std::map<uint32_t,uint64_t> completed_spawns;
 uint64_t next_spawn_revision=0;
-thread_local uint32_t last_segment_source=~0u;
 thread_local bool probing_spawn=false,probe_success=false;
 thread_local bool force_safe_spawn=false;
 thread_local uint32_t probing_actor=0;
@@ -72,24 +79,124 @@ int actor_slot(uint32_t actor) {
 }
 }
 namespace {
-PPCFunc sphere_trace_original=nullptr;
-void native_sphere_trace(PPCContext& ctx) {
-    static unsigned samples=0;const bool trace=samples++<24;
-    const auto output=ctx.r[6];
-    if(trace) {
+PPCFunc sphere_move_original = nullptr;
+PPCFunc ground_collision_original = nullptr;
+bool trace_sphere_queries = false;
+struct RestingSweep {
+    PPCContext* context = nullptr;
+    uint32_t start = 0, destination = 0;
+};
+thread_local RestingSweep resting_sweep;
+
+bool static_contacts(uint32_t hits, uint32_t count) {
+    if (count > 20 || !valid(hits, count * 48)) return false;
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto hit = hits + i * 48;
+        const auto kind = mem_read32(hit + 36);
+        if (kind == 3) continue; // Touch fields have no solid response.
+        // World geometry and placed level objects. Animated brushes, bounce
+        // pads, actors and contacts with their own motion keep the solver result.
+        if ((kind != 0 && kind != 4) || (mem_read32(hit + 32) & 0x80000000u)) return false;
+    }
+    return true;
+}
+
+void native_sphere_move(PPCContext& ctx) {
+    static unsigned samples = 0;
+    const bool trace = trace_sphere_queries && samples++ < 24;
+    const auto from = ctx.r[4], output = ctx.r[6], hits = ctx.r[7];
+    // Only the first world sweep inside this particular player's actorMoveSphere.
+    const bool at_rest = resting_sweep.context == &ctx && ctx.lr == 0x800C065Cu &&
+                         from == resting_sweep.start && output == resting_sweep.destination;
+    if (trace) {
         std::string line="[coop-native-sphere-call] caller="+std::to_string(ctx.lr)+" radius="+std::to_string(ctx.ps0[1]);
         for(unsigned i=3;i<=10;++i)line+=" r"+std::to_string(i)+"="+std::to_string(ctx.r[i]);
         for(unsigned reg:{4u,5u})if(valid(ctx.r[reg],12))line+=" p"+std::to_string(reg)+"="+std::to_string(u2f(mem_read32(ctx.r[reg])))+","+std::to_string(u2f(mem_read32(ctx.r[reg]+4)))+","+std::to_string(u2f(mem_read32(ctx.r[reg]+8)));
         log_message(line);
     }
-    ssne_call_original(ctx,0x80140620,sphere_trace_original);
+    ssne_call_original(ctx, 0x80140620u, sphere_move_original);
+    if (at_rest && static_contacts(hits, ctx.r[3])) {
+        // The only motion was our ground probe. Its separation bias, including
+        // any lateral part on an incline, is not locomotion. Leave the contacts
+        // intact. PAL now does its normal support sweep here to choose the height.
+        for (unsigned axis = 0; axis < 12; axis += 4)
+            mem_write32(output + axis, mem_read32(from + axis));
+    }
     if(trace && valid(output,12))log_message("[coop-native-sphere-result] contacts="+std::to_string(ctx.r[3])+" output="+std::to_string(u2f(mem_read32(output)))+","+std::to_string(u2f(mem_read32(output+4)))+","+std::to_string(u2f(mem_read32(output+8))));
+}
+
+void ground_player_collision(PPCContext& ctx) {
+    const auto actor = ctx.r[4], down = ctx.r[6], start = ctx.r[7];
+    const auto motion = ctx.r[8], additional = ctx.r[9], destination = ctx.r[10];
+    const auto original = [&] { ssne_call_original(ctx, 0x800C04ACu, ground_collision_original); };
+    if (ctx.lr != 0x800A92A8u || actor_slot(actor) < 0 || !valid(down, 12) ||
+        !valid(start, 12) || !valid(motion, 12) || !valid(additional, 12) || !valid(destination, 12)) {
+        original();
+        return;
+    }
+    std::array<uint32_t, 3> saved;
+    std::array<float, 3> gravity;
+    double length2 = 0;
+    bool zero_request = true;
+    for (unsigned i = 0; i < 3; ++i) {
+        saved[i] = mem_read32(motion + 4*i);
+        const float request = u2f(saved[i]), carry = u2f(mem_read32(additional + 4*i));
+        const float pos = u2f(mem_read32(start + 4*i));
+        gravity[i] = u2f(mem_read32(down + 4*i));
+        if (!std::isfinite(pos) || pos + (request + carry) != pos) {
+            original();
+            return;
+        }
+        zero_request &= request == 0.f && carry == 0.f;
+        length2 += double(gravity[i]) * gravity[i];
+    }
+    if (!(length2 > .5 && length2 < 1.5)) {
+        original();
+        return;
+    }
+    // PAL zeroes the movement vector itself after braking. Leave actual moves,
+    // pending steps, deliberate slides, attached platforms and jump pads alone.
+    const bool resting = zero_request && mem_read32(ctx.r[1] + 8) && mem_read32(actor + 0x6D0) &&
+        !mem_read32(actor + 0x6E4) && !mem_read32(actor + 0x330) && !mem_read32(actor + 0x704) &&
+        !mem_read32(actor + 0x6FC) && u2f(mem_read32(actor + 0x708)) == 0.f;
+
+    struct Restore {
+        RestingSweep previous;
+        uint32_t motion;
+        std::array<uint32_t, 3> saved;
+        ~Restore() {
+            resting_sweep = previous;
+            for (unsigned i = 0; i < 3; ++i) mem_write32(motion + 4*i, saved[i]);
+        }
+    } restore{resting_sweep, motion, saved};
+    resting_sweep = resting ? RestingSweep{&ctx, start, destination} : RestingSweep{};
+    // Keep PAL's contact callbacks and avoid a degenerate zero-length sweep.
+    const float distance = .001f / float(std::sqrt(length2));
+    for (unsigned i = 0; i < 3; ++i)
+        mem_write32(motion + 4*i, f2u(u2f(saved[i]) + gravity[i]*distance));
+    original();
+}
+
+void install_sphere_move() {
+    if (sphere_move_original) return;
+    const auto* entry = ssne_find_func(0x80140620u);
+    if (!entry || mem_read32(entry->address) != 0x9421FDF8u) fatal("Unsupported PAL sphere move");
+    sphere_move_original = entry->func;
+    ssne_install_hook(entry->address, native_sphere_move);
 }
 }
 void native_party_install_geometry_trace() {
-    if(!getenv("SSNE_TEST_HIDDEN") || !getenv("SSNE_COOP_TEST_SPAWN_PROBE") || sphere_trace_original)return;
-    const auto* query=ssne_find_func(0x80140620);
-    if(query && mem_read32(query->address)==0x9421FDF8u){sphere_trace_original=query->func;ssne_install_hook(query->address,native_sphere_trace);}
+    if (getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_COOP_TEST_SPAWN_PROBE")) {
+        trace_sphere_queries = true;
+        install_sphere_move();
+    }
+}
+void native_party_install_ground_collision() {
+    install_sphere_move();
+    const auto* entry = ssne_find_func(0x800C04ACu);
+    if (!entry || mem_read32(entry->address) != 0x9421FE98u) fatal("Unsupported native player collision routine");
+    ground_collision_original = entry->func;
+    ssne_install_hook(entry->address, ground_player_collision);
 }
 bool native_world_segment(PPCContext& context,const std::array<float,3>& from,const std::array<float,3>& to,std::optional<NativeSegmentHit>& hit,std::string& error) {
     hit.reset();error.clear();
@@ -107,35 +214,11 @@ bool native_world_segment(PPCContext& context,const std::array<float,3>& from,co
     if(call.r[3]) {
         NativeSegmentHit found;
         for(unsigned i=0;i<3;++i){found.position[i]=u2f(mem_read32(result+i*4));found.normal[i]=u2f(mem_read32(result+12+i*4));}
-        found.flags=mem_read32(result+32);last_segment_source=mem_read32(result+28);hit=found;
+        found.flags=mem_read32(result+32);hit=found;
     }
     restore();
     if(hit)for(auto point:{hit->position,hit->normal})for(float value:point)if(!std::isfinite(value)){hit.reset();error="Invalid native geometry result";return false;}
     return true;
-}
-// Static friction for the native solver's sub-millimetre gravity correction
-// on almost level ground. Never latch world position or discard real input,
-// falling/jumping, knockback, vehicles, or moving geometry.
-void native_party_stabilize_idle(PPCContext& ctx,uint32_t actor,const std::array<float,3>& before){
-    if(replica_simulation() || mem_read32(0x802DB8CC)<2 || mem_read32(0x802DB8CC)>4 || !valid(actor,0x790) || mem_read32(actor+0x340)!=1 || mem_read32(actor+0x6c4) || mem_read32(actor+0x370) || mem_read32(actor+0x328) || u2f(mem_read32(actor+0xcc))<=0)return;
-    const auto slot=mem_read32(actor+0x17c);if(slot>=roster)return;const auto& pad=pads[slot];
-    if(pad.stick_x!=128 || pad.stick_y!=128 || pad.trigger_l || pad.trigger_r || (pad.buttons&(PAD_L|PAD_R)))return;
-    std::array<float,3> after;for(unsigned i=0;i<3;++i){after[i]=u2f(mem_read32(actor+0x20+i*4));if(!std::isfinite(before[i]) || !std::isfinite(after[i]))return;}
-    const float elapsed=u2f(mem_read32(ctx.r[13]-0x7a08));if(!std::isfinite(elapsed) || elapsed<=0)return;
-    const float seconds=std::clamp(elapsed,1.f/240.f,.1f),limit=.1f*seconds;
-    const float horizontal=std::hypot(after[0]-before[0],after[2]-before[2]);
-    if(horizontal==0 || horizontal>limit || std::abs(after[1]-before[1])>limit*.2f)return;
-    const auto radius=native_player_collision_radius(actor);if(!radius)return;
-    auto to=after;to[1]-=*radius+.05f;std::optional<NativeSegmentHit> floor;std::string why;
-    if(!native_world_segment(ctx,after,to,floor,why) || !floor)return;
-    if(getenv("SSNE_TEST_HIDDEN")){static unsigned samples=0;if(++samples%120==1)log_message("[native-idle-support] normal_y="+std::to_string(floor->normal[1])+" height="+std::to_string(after[1]-floor->position[1])+" radius="+std::to_string(*radius)+" source="+std::to_string(last_segment_source));}
-    if(floor->normal[1]<.98f || std::abs(after[1]-floor->position[1]-*radius)>.03f)return;
-    // Contact+1C is the original brush-resource index (80084618). A
-    // registered geometry owner can carry the player even without input.
-    uint32_t owner=0;
-    if(last_segment_source!=~0u){if(last_segment_source>=512)return;owner=mem_read32(0x802D9E0Cu+last_segment_source*4);if(owner)return;}
-    for(unsigned i=0;i<3;++i)mem_write32(actor+0x20+i*4,f2u(before[i]));
-    if(getenv("SSNE_TEST_HIDDEN")){static unsigned corrections=0;if(++corrections%120==1)log_message("[native-idle-friction] slot="+std::to_string(slot)+" delta="+std::to_string(horizontal)+" normal_y="+std::to_string(floor->normal[1])+" source="+std::to_string(last_segment_source));}
 }
 std::optional<float> native_player_collision_radius(uint32_t actor) {
     // Original player getters: one sphere at actor+20; radius getter8009C404
@@ -406,7 +489,7 @@ bool native_party_replica_spawn_state(PPCContext& context,uint32_t actor,bool wa
     for(unsigned i=0;i<stack.size();++i)mem_write8(context.r[1]-0x3000+i,stack[i]);return !native_party_spawn_waiting(actor);
 }
 void native_party_configure(unsigned count){roster=std::clamp(count,1u,8u);configured=true;leaving_network=false;}
-void native_party_leave_network(){camera_update_gate={};camera_update_gate_owner=nullptr;configured=false;occupancy_enabled=false;profiles_prepared=false;leaving_network=true;pads={};owner=-1;if(!arena){roster=2;leaving_network=false;}}
+void native_party_leave_network(){driver_cameras={};camera_update_gate={};camera_update_gate_owner=nullptr;configured=false;occupancy_enabled=false;profiles_prepared=false;leaving_network=true;pads={};owner=-1;if(!arena){roster=2;leaving_network=false;}}
 uint32_t native_party_profile(unsigned slot){return slot<8?profiles[slot]:~0u;}
 bool native_party_joined(unsigned slot){return !configured || slot<roster;}
 void native_party_set_occupancy(uint8_t mask,uint8_t connected_mask){
@@ -583,9 +666,108 @@ void install_secondary_player_filter(){
     ssne_install_hook(secondary_player_query,secondary_player_predicate);
 }
 }
+namespace {
+PPCFunc vehicle_reference_table_original=nullptr;
+PPCFunc vehicle_config_read_original=nullptr;
+PPCFunc vehicle_model_view_original=nullptr;
+PPCFunc wheeled_enter_original=nullptr,wheeled_follow_original=nullptr,wheeled_view_original=nullptr;
+DriverCamera* driving_camera(uint32_t car){
+    if(!configured || !valid(car,0x164))return nullptr;
+    const auto driver=mem_read32(car+0x160);
+    const int slot=actor_slot(driver);
+    if(slot<0 || driver_cameras[slot].car!=car || mem_read32(driver+0x6C4)!=car)return nullptr;
+    return &driver_cameras[slot];
+}
+void enter_wheeled_vehicle(PPCContext& c){
+    const auto car=c.r[3];
+    const int slot=configured?actor_slot(c.r[4]):-1;
+    ssne_call_original(c,0x801728B4u,wheeled_enter_original);
+    // Enter seeds the native history at this vehicle's current position.
+    // An unsuccessful Use must keep the existing driver's saved history.
+    if(slot>=0 && c.r[3]){
+        auto& camera=driver_cameras[slot];
+        camera.car=car;
+        std::memcpy(camera.history.data(),host_ptr(wheeled_camera_history),camera.history.size());
+    }
+}
+void follow_wheeled_vehicle(PPCContext& c){
+    auto* camera=driving_camera(c.r[3]);
+    if(camera)std::memcpy(host_ptr(wheeled_camera_history),camera->history.data(),camera->history.size());
+    ssne_call_original(c,0x80173AD0u,wheeled_follow_original);
+    if(camera)std::memcpy(camera->history.data(),host_ptr(wheeled_camera_history),camera->history.size());
+}
+void read_wheeled_vehicle_view(PPCContext& c){
+    // The original getter ignores its vehicle and reads only the final
+    // matrix. Restore that driver's result before the player's camera reads it.
+    if(auto* camera=driving_camera(c.r[3]))
+        std::memcpy(host_ptr(wheeled_camera_history+0x60),camera->history.data()+0x60,0x30);
+    ssne_call_original(c,0x80173AA8u,wheeled_view_original);
+}
+std::map<uint32_t,std::vector<uint8_t>> vehicle_configs;
+void select_party_vehicle_model(PPCContext& c){
+    const auto model=c.r[3],view=c.r[4],car=model-0xCC;
+    const auto vt=configured && view && valid(car,0x1D8)?mem_read32(car+0x48):0;
+    if(vt==0x80224D30u || vt==0x80224320u || vt==0x80225568u){
+        const auto owner=mem_read32(car+0x1D4);
+        if(valid(owner,0x94) && mem_read32(owner+0x60)==car && valid(mem_read32(model+0x10),0xB0) &&
+           (view>=4 || !valid(mem_read32(model+0x10+view*4),0xB0)))c.r[4]=0;
+    }
+    ssne_call_original(c,0x80005850u,vehicle_model_view_original);
+}
+void read_party_vehicle_config(PPCContext& c){
+    const auto dest=c.r[3],len=c.r[4],car=c.r[31];
+    const auto type=c.lr==0x80172574u && valid(car,0x1F8)?mem_read32(car+0x48):0;
+    if(!configured || (type!=0x80224D30u && type!=0x80224320u && type!=0x80225568u) ||
+       !len || len>0x2800 || !valid(dest,len)){
+        ssne_call_original(c,0x8014E4F0u,vehicle_config_read_original);return;
+    }
+    // The vehicle parser opens an immutable level-disc file, reads it once
+    // and immediately closes it. A late join can instantiate a second car
+    // from the guest-frame callback, where waiting for another DVD interrupt
+    // would deadlock. Reuse the original bytes, then run the original parser.
+    auto& cache=vehicle_configs[type];
+    if(cache.size()==len){std::memcpy(host_ptr(dest),cache.data(),len);c.r[3]=len;return;}
+    ssne_call_original(c,0x8014E4F0u,vehicle_config_read_original);
+    if(c.r[3]==len){
+        const auto* data=host_ptr(dest);cache.assign(data,data+len);
+    }
+}
+void reserve_party_vehicle_references(PPCContext& c){
+    // The level loader sizes the script table before instantiating any actors.
+    if(configured && c.lr==0x8010C998u){
+        vehicle_configs.clear();
+        if(c.r[3] && c.r[3]<=32760)c.r[3]+=7;
+    }
+    ssne_call_original(c,0x80151400u,vehicle_reference_table_original);
+}
+}
 void native_party_install_occupancy_hooks(){
     install_secondary_player_filter();
     if(occupied_spheres_original)return;
+    const auto* enter=ssne_find_func(0x801728B4u);
+    const auto* follow=ssne_find_func(0x80173AD0u);
+    const auto* view=ssne_find_func(0x80173AA8u);
+    if(enter && follow && view && mem_read32(0x80172918u)==0x396BCD80u &&
+       mem_read32(0x80173AF0u)==0x3AA9CD80u && mem_read32(0x80173AB8u)==0x3863CDE0u){
+        wheeled_enter_original=enter->func;ssne_install_hook(enter->address,enter_wheeled_vehicle);
+        wheeled_follow_original=follow->func;ssne_install_hook(follow->address,follow_wheeled_vehicle);
+        wheeled_view_original=view->func;ssne_install_hook(view->address,read_wheeled_vehicle_view);
+    }
+    const auto* select_model=ssne_find_func(0x80005850u);
+    if(select_model && mem_read32(select_model->address)==0x90830050u){
+        vehicle_model_view_original=select_model->func;
+        ssne_install_hook(select_model->address,select_party_vehicle_model);
+    }
+    const auto* vehicle_read=ssne_find_func(0x8014E4F0u);
+    if(vehicle_read && mem_read32(vehicle_read->address)==0x9421FFE0u){
+        vehicle_config_read_original=vehicle_read->func;
+        ssne_install_hook(vehicle_read->address,read_party_vehicle_config);
+    }
+    const auto* reference_table=ssne_find_func(0x80151400u);
+    if(reference_table && mem_read32(reference_table->address)==0x9421FFF0u){
+        vehicle_reference_table_original=reference_table->func;
+        ssne_install_hook(reference_table->address,reserve_party_vehicle_references);
+    }
     const auto* spheres=ssne_find_func(0x8009C410);const auto* health=ssne_find_func(0x8009DBCC);const auto* render=ssne_find_func(0x800B2568);
     if(!spheres || !health || !render || mem_read32(spheres->address)!=0x38600001u || mem_read32(health->address)!=0xC02300CCu || mem_read32(render->address)!=0x9421FFF8u)fatal("Native player participation hooks unavailable for this revision.");
     const auto* contact=ssne_find_func(0x800A7AB0);
@@ -872,6 +1054,7 @@ void native_party_begin(PPCContext& context) {
     char line[160];std::snprintf(line,sizeof(line),"[native-party] roster=%u arena=%08X controllers=%08X,%08X registry=%08X views=%08X",roster,arena,original_bank,second_bank,registry,views);log_message(line);
 }
 void native_party_end(PPCContext& context) {
+    driver_cameras={};
     if(!arena)return;
     for(unsigned slot=0;slot<8;++slot)for(unsigned word=0;word<11;++word) {
         const auto value=mem_read32(native_party_loadouts()+slot*44+word*4);

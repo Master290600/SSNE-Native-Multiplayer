@@ -8,6 +8,7 @@ namespace port::coop {
 // a driver leaves through the original native action before roster removal.
 bool release_native_vehicle_driver(PPCContext&,uint32_t actor,std::string& error);
 bool capture_native_vehicles(Properties&,std::string& error);
+void update_native_coop_vehicles(PPCContext&,unsigned human_players);
 bool validate_native_vehicles(const Properties&,const std::map<EntityId,EntityState>&,std::string& error);
 bool prepare_native_vehicle_models(PPCContext&,const Properties&,std::string& error);
 bool apply_native_vehicle_drivers(PPCContext&,const Properties&,const std::map<EntityId,EntityState>&,std::string& error);

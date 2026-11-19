@@ -51,7 +51,7 @@ class VehiclePeers(Peers):
    args=[str(folder/'game.exe'),'--data',str(self.a.data),'--memcard',str(folder/'card.raw'),'--lan-port',str(self.a.port),'--lan-pin','123456','--player-name',role,'--mute','--fps',str(self.a.fps)]+(['--coop-host','--coop-capacity','8','--coop-level',self.a.level] if role=='host' else ['--coop-join','127.0.0.1'])
    startup=subprocess.STARTUPINFO();startup.dwFlags|=subprocess.STARTF_USESHOWWINDOW;startup.wShowWindow=0;stream=(folder/'console.log').open('wb');self.streams.append(stream)
    self.processes[role]=subprocess.Popen(args,cwd=folder,env=env,stdout=stream,stderr=stream,startupinfo=startup,creationflags=subprocess.BELOW_NORMAL_PRIORITY_CLASS)
-   self.delay(2 if role=='host' else .2)
+   if role=='host':self.wait_for_listener()
  def action(self,text):
   self.command(text);sequence=self.command_sequence;self.wait(lambda:'sequence='+str(sequence)+' action='+text.split()[0] in self.log('host'),20)
  def input_state(self,role):

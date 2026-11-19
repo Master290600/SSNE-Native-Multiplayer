@@ -1,3 +1,15 @@
+SSNE-RECOOP-Native 1.2.8.2 (Windows x64, multiplayer build 250, protocol 71)
+
+  - Clients can walk up to, enter, drive and exit the first Jeep in Via Aurelia while the host is still reading the opening NETRICSA briefing. The Jeep now has working collision for the client in that situation.
+  - Supported campaign areas spawn additional vehicles for additional human players where there is room. Rejoining reuses the vehicles that are already there.
+  - Fixed the vehicle camera when both players enter Jeeps. Each driver now sees their own vehicle, including when one player uses the additional Jeep. If both players try to enter the same Jeep, only one takes the driver's seat.
+  - Removed the stray blue glow left on the ground at the additional Jeep's spawn point.
+  - Fixed a high-frame-rate issue that could make Sirian Werebulls stop and restart their charge on a clear approach.
+  - Fixed a freeze or crash when a host ended a match through the Esc menu, returned to the main menu and opened Online again.
+  - Fixed the connected trouser legs on the Johnny Drive-In skin during running animations. The launcher applies the corrected skin when building a fresh install or updating an existing one.
+  - Fixed gradual sideways drift while standing still on walkable slopes for both hosts and clients. Walking, jumping and sliding down steep terrain still work.
+  - Known issues: Bots and Survival may still have bugs. The separate report of slipping through a wall remains open.
+
 SSNE-RECOOP-Native 1.2.8.1 (Windows x64, multiplayer build 245, protocol 70)
 
   - Pause and NETRICSA preserve the current aspect ratio, including the transitions.

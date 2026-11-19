@@ -143,6 +143,26 @@ def strips(c, descriptor, dma_field=8, allow_missing_uv=False):
     return result
 
 
+def split_drivethrough_cuffs(w, model, bones, points, bone_map):
+    # Both cuffs on the PAL mesh share these two bind-pose points at the ankles.
+    # Keep their right-hand copies and give the left cuff its own skinning indices.
+    c = w.source
+    names = [c.text(c.u(b + 4)) for b in bones]
+    copies = {}
+    left_bones = set()
+    for index, part in ((58, 'Lower_Leg'), (64, 'Foot')):
+        if index >= len(points) or names[bone_map[index]] != 'R_' + part:
+            raise ValueError('Unexpected Drivethrough ankle binding')
+        left = names.index('L_' + part)
+        copies[index] = len(points)
+        left_bones.add(left)
+        points.append(points[index])
+        bone_map.append(left)
+    w.pointer(model + 28, w.array(b''.join(points), len(points), 12))
+    w.pointer(model + 72, w.append(bone_map))
+    return copies, left_bones
+
+
 def convert(c):
     w = Writer(c)
     stats = []
@@ -179,15 +199,27 @@ def convert(c):
             raise ValueError('Unsupported PS2 skin position layout')
         positions = {c.image[p + i * 12:p + i * 12 + 12]: i for i in range(count)}
         bone_map_pointer = c.u(model + 72)
-        bone_map = c.image[bone_map_pointer:bone_map_pointer + count]
+        bone_map = bytearray(c.image[bone_map_pointer:bone_map_pointer + count])
         w.data[bone_map_pointer:bone_map_pointer + count] = bone_map
+        points = [w.data[q:q + 12] for q in range(p, p + count * 12, 12)]
+        cuff_copies, left_cuff_bones = {}, set()
+        if name.casefold() == 'drivethrough_legs_static1':
+            cuff_copies, left_cuff_bones = split_drivethrough_cuffs(w, model, bones, points, bone_map)
         up, un, us = c.array(model + 40)
         if us != 8:
             raise ValueError('Unsupported skin UV layout')
         uvs = {c.image[up + i * 8:up + i * 8 + 8]: i for i in range(un)}
         normal_ids = {}
-        normal_values = []
+        packed_normals = []
         normal_bones = []
+        def normal_index(raw, bone):
+            key = (raw, bone)
+            if key not in normal_ids:
+                normal_ids[key] = len(packed_normals)
+                packed_normals.append(raw)
+                normal_bones.append(bone)
+            return normal_ids[key]
+
         triangles = 0
         for mesh in c.chain(model + 8):
             w.word(mesh + 40, c.u(mesh + 40) | 1)
@@ -201,13 +233,7 @@ def convert(c):
                     bone = normal[3] & 127
                     if bone >= len(bones) or bone_map[pi] != bone:
                         raise ValueError('PS2 VIF bone differs from position bone map')
-                    key = (normal[:3], bone)
-                    if key not in normal_ids:
-                        normal_ids[key] = len(normal_values)
-                        vector = [v / 127 for v in struct.unpack('3b', normal[:3])]
-                        normal_values.append(vector)
-                        normal_bones.append(bone)
-                    vertices.append((pi, normal_ids[key], uvs[uv], normal[3] & 128))
+                    vertices.append((pi, normal_index(normal[:3], bone), uvs[uv], normal[3] & 128))
                 tri = []
                 for i in range(2, len(vertices)):
                     if vertices[i][3]:
@@ -217,7 +243,15 @@ def convert(c):
                         a, b = b, a
                     if len({a[0], b[0], d[0]}) < 3:
                         continue
-                    tri.extend((a, b, d))
+                    face = (a, b, d)
+                    if cuff_copies and any(bone_map[v[0]] in left_cuff_bones for v in face):
+                        for pi, ni, ui, flags in face:
+                            if pi in cuff_copies:
+                                pi = cuff_copies[pi]
+                                ni = normal_index(packed_normals[ni], bone_map[pi])
+                            tri.append((pi, ni, ui, flags))
+                    else:
+                        tri.extend(face)
                 if len(tri) > 65535:
                     raise ValueError('GX skin primitive count overflow')
                 if tri:
@@ -236,14 +270,14 @@ def convert(c):
             w.pointer(mesh + 12, rec)
             # Reversing the numeric word moves PS2 U/V at +0x30/+0x31
             # to GX V/U at +0x32/+0x33 without swapping the axes.
+        normal_values = [[v / 127 for v in struct.unpack('3b', raw)] for raw in packed_normals]
         normal_data = b''.join(struct.pack('>3f', *v) for v in normal_values)
         w.pointer(model + 32, w.array(normal_data, len(normal_values), 12))
         for bi, bone in enumerate(bones):
             ids = [i for i, b in enumerate(bone_map) if b == bi]
             norms = [i for i, b in enumerate(normal_bones) if b == bi]
             for offset, data, n in [
-                (16, b''.join(c.image[p + i * 12:p + i * 12 + 12][j:j + 4][::-1]
-                             for i in ids for j in (0, 4, 8)), len(ids)),
+                (16, b''.join(points[i] for i in ids), len(ids)),
                 (20, b''.join(struct.pack('>I', i) for i in ids), len(ids)),
                 (24, struct.pack('>' + str(len(ids)) + 'f', *([1.] * len(ids))), len(ids)),
                 (44, b''.join(struct.pack('>3f', *normal_values[i]) for i in norms), len(norms)),
@@ -255,7 +289,7 @@ def convert(c):
         color = c.u(model + 36)
         cp, cn, cs = c.array(model + 36)
         w.data[cp:cp + cn * cs] = c.image[cp:cp + cn * cs]
-        stats.append(dict(name=name, vertices=count, normals=len(normal_values),
+        stats.append(dict(name=name, vertices=len(points), normals=len(normal_values),
                           bones=len(bones), triangles=triangles))
     result = w.finish()
     check = Container(result, '>')

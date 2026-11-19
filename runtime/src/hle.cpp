@@ -986,30 +986,6 @@ void hle_authoritative_movement_mode(PPCContext& ctx) {
     }
     ssne_call_original(ctx,0x800B5A78,g_authoritative_movement_mode_original);
 }
-PPCFunc g_authoritative_player_collision_original=nullptr;
-void hle_authoritative_player_collision(PPCContext& ctx){
-    // 800A92A8 passes ground motion and an additional displacement separately.
-    // An exactly stationary sweep can make the original solver return an invalid
-    // distant position instead of this player's position (Rlevel1_4a reproduction).
-    // Retain the native solver/contact/material handling, but give a degenerate
-    // ground sweep a 1-mm probe along its existing gravity direction.
-    const auto actor=ctx.r[4],motion=ctx.r[8],extra=ctx.r[9],position=ctx.r[10],direction=ctx.r[6];
-    auto readable=[](uint32_t p,unsigned n){return p>=0x80000000u && p<=guest_ram_end()-n;};
-    bool stationary=ctx.lr==0x800A92A8u && readable(actor,0x790) && mem_read32(actor+0x48)==game_address(0x80212268u) &&
-        readable(motion,12) && readable(extra,12) && readable(position,12) && readable(direction,12);
-    std::array<uint32_t,3> saved{};std::array<float,3> step{},down{};double length2=0;
-    if(stationary)for(unsigned i=0;i<3;++i){
-        saved[i]=mem_read32(motion+4*i);step[i]=u2f(saved[i]);down[i]=u2f(mem_read32(direction+4*i));
-        const auto point=u2f(mem_read32(position+4*i)),offset=u2f(mem_read32(extra+4*i));
-        const float combined=step[i]+offset;
-        stationary &= std::isfinite(point) && std::isfinite(combined) && std::isfinite(down[i]) && float(point+combined)==point;
-        length2+=double(down[i])*down[i];
-    }
-    stationary &= length2>.5 && length2<1.5;
-    struct RestoreMotion {uint32_t pointer;std::array<uint32_t,3> words;bool active;~RestoreMotion(){if(active)for(unsigned i=0;i<3;++i)mem_write32(pointer+4*i,words[i]);}} restore{motion,saved,stationary};
-    if(stationary){const float distance=.001f/float(std::sqrt(length2));for(unsigned i=0;i<3;++i)mem_write32(motion+4*i,f2u(step[i]+down[i]*distance));}
-    ssne_call_original(ctx,0x800C04ACu,g_authoritative_player_collision_original);
-}
 PPCFunc g_authoritative_player_update_original=nullptr;
 void hle_authoritative_player_update(PPCContext& ctx) {
     const auto actor=ctx.r[3];
@@ -1020,11 +996,9 @@ void hle_authoritative_player_update(PPCContext& ctx) {
     if(!native_party_actor_occupied(actor)){static std::array<uint64_t,8> skipped{};const auto slot=mem_read32(actor+0x17C);if(slot<8 && ++skipped[slot]%120==0)log_message("[coop-reserved-player-update-skipped] slot="+std::to_string(slot)+" skips="+std::to_string(skipped[slot]));return;}
     if(native_party_retry_spawn(ctx,actor))return;auto slot=mem_read32(actor+0x17C);static std::array<uint64_t,8> updates{};
     if(slot<8 && ++updates[slot]%120==0)log_message("[coop-player-dispatch] slot="+std::to_string(slot)+" updates="+std::to_string(updates[slot])+" mode="+std::to_string(mem_read32(actor+0x370))+" flags="+std::to_string(mem_read32(actor+0x1C))+" frozen="+std::to_string(mem_read32(actor+0x144)));
-    std::array<float,3> idle_before;for(unsigned i=0;i<3;++i)idle_before[i]=u2f(mem_read32(actor+0x20+i*4));
     const auto jump=begin_native_jump(ctx,actor);
     try{ssne_call_original(ctx,0x800BEEC8,g_authoritative_player_update_original);}catch(...){restore_native_jump(jump);throw;}
     finish_native_jump(jump);
-    native_party_stabilize_idle(ctx,actor,idle_before);
     if(slot<8 && actor>=0x80000000u && actor<=guest_ram_end()-0x790){
         g_player_seen=true;
         const auto vehicle=mem_read32(actor+0x6C4);
@@ -1324,6 +1298,23 @@ void hle_authoritative_time_step(PPCContext& ctx) {
     // lockstep dt. Use the original bounded/smoothed wall-clock delta so slow
     // rendering cannot slow the entire world's clock.
     ssne_call_original(ctx,game_address(0x8015544Cu),g_original_tick);
+    // NETRICSA freezes the host's scene renderer. Its ordinary scene-prepare
+    // then skips 8013FCD4, leaving newly created vehicle colliders at the
+    // world origin and moving ones at their last displayed positions.
+    // Maintain the original collision tree on the shared simulation clock.
+    if(g_netplay_world_ready && !replica_simulation() && g_authoritative_information_open &&
+       ctx.ps0[1]>0 && mem_read32(0x802DB8CCu)==1){
+        const auto scene=mem_read32(0x802ABAA4u);
+        if(scene>=0x80000000u && scene<=guest_ram_end()-0x3Cu && mem_read32(scene)==0x8021EB70u &&
+           mem_read32(scene+0x20) && mem_read32(scene+0x38)){
+            auto collision=ctx;
+            collision.msr&=~0x8000u;
+            collision.r[1]-=0x100;
+            mem_write32(collision.r[1],ctx.r[1]);
+            collision.r[3]=scene;
+            ssne_call(collision,0x8013FCD4u);
+        }
+    }
     if(getenv("SSNE_COOP_PROFILE")){
         static auto began=std::chrono::steady_clock::now();static double simulated=0;static unsigned count=0;
         simulated+=ctx.ps0[1];if(++count>=120){const auto now=std::chrono::steady_clock::now();log_message("[coop-clock] simulated_seconds="+std::to_string(simulated)+" wall_seconds="+std::to_string(std::chrono::duration<double>(now-began).count()));began=now;simulated=0;count=0;}
@@ -2144,6 +2135,41 @@ void install_step_counter_fix() {
     g_step_threshold = ((lis & 0xFFFFu) << 16) + uint32_t(int32_t(int16_t(lfs & 0xFFFFu)));
     g_orig_step_counter = f->func;
     ssne_install_hook(kStepCounter, hle_step_counter);
+}
+
+constexpr uint32_t kProgressUpdate = 0x800A1A88u;
+constexpr uint32_t kWerebullProgressReturn = 0x8002D420u;
+constexpr uint32_t kProgressDistanceSquared = 0x8020F984u;
+PPCFunc g_original_progress_update = nullptr;
+
+void hle_werebull_progress(PPCContext& ctx) {
+    const float dt = u2f(mem_read32(ctx.r[13] + 0xFFFF85F8u));
+    if (ctx.lr != kWerebullProgressReturn || !(dt > 0.f && dt < 1.f / 60.f)) {
+        ssne_call_original(ctx, kProgressUpdate, g_original_progress_update);
+        return;
+    }
+    // The charge monitor expects 0.25 units of movement per console frame.
+    // At 240 Hz an unobstructed adult covers only 0.167 units. This squared
+    // distance constant is read only by this synchronous guest helper, whose
+    // only nested calls are vector subtraction and squared magnitude.
+    struct DistanceScope {
+        uint32_t saved = mem_read32(kProgressDistanceSquared);
+        explicit DistanceScope(float distance) {
+            mem_write32(kProgressDistanceSquared, f2u(distance * distance));
+        }
+        ~DistanceScope() { mem_write32(kProgressDistanceSquared, saved); }
+    } threshold(15.f * dt);
+    ssne_call_original(ctx, kProgressUpdate, g_original_progress_update);
+}
+
+void install_werebull_progress_fix() {
+    const auto* update = ssne_find_func(kProgressUpdate);
+    if (!update || mem_read32(kWerebullProgressReturn - 4) != 0x4807466Du ||
+        mem_read32(kProgressUpdate + 0x44) != 0x3D208021u ||
+        mem_read32(kProgressUpdate + 0x48) != 0xC009F984u ||
+        mem_read32(kProgressDistanceSquared) != f2u(.25f * .25f)) return;
+    g_original_progress_update = update->func;
+    ssne_install_hook(kProgressUpdate, hle_werebull_progress);
 }
 
 // ---- vehicle physics at frame rates other than 60. The update of the drivable vehicles (801709A0, GenericVehicle:
@@ -3057,6 +3083,9 @@ void install_network_sdk_hooks(){
             const auto* vehicle=ssne_find_func(0x80170948u);
             if(!vehicle || mem_read32(vehicle->address)!=0x9421FF08u)fatal("Unsupported native vehicle physics revision");
             g_original_vehicle_physics=vehicle->func;ssne_install_hook(vehicle->address,hle_authoritative_vehicle_physics);
+            if(!ssne_find_func(0x8013FCD4u) || mem_read32(0x8013FCD4u)!=0x9421FF90u ||
+               mem_read32(0x8013FCECu)!=0x83E30038u || mem_read32(0x8013F624u)!=0x480006B1u)
+                fatal("Unsupported native dynamic collider update revision");
             const auto* steering=ssne_find_func(0x80174D48u);
             if(!steering || mem_read32(steering->address)!=0x812301F4u || mem_read32(steering->address+4)!=0xD0290008u)fatal("Unsupported native vehicle steering revision");
             g_original_vehicle_steering=steering->func;ssne_install_hook(steering->address,hle_authoritative_vehicle_steering);
@@ -3143,9 +3172,7 @@ void install_authoritative_game_hooks(){
             const auto* update=ssne_find_func(0x800BEEC8);
             if(!update || mem_read32(update->address)!=0x9421FF18u)fatal("Unsupported native player update dispatch.");
             g_authoritative_player_update_original=update->func;ssne_install_hook(update->address,hle_authoritative_player_update);
-            const auto* collision=ssne_find_func(0x800C04ACu);
-            if(!collision || mem_read32(collision->address)!=0x9421FE98u)fatal("Unsupported native player collision routine");
-            g_authoritative_player_collision_original=collision->func;ssne_install_hook(collision->address,hle_authoritative_player_collision);
+            native_party_install_ground_collision();
             const auto* movement=ssne_find_func(0x800B5A78);
             if(!movement || mem_read32(movement->address)!=0x9421FFE8u)fatal("Unsupported native player movement mode.");
             g_authoritative_movement_mode_original=movement->func;ssne_install_hook(movement->address,hle_authoritative_movement_mode);
@@ -3264,6 +3291,7 @@ void install_sdk_hooks() {
             const auto* tick=ssne_find_func(game_address(0x8015544Cu));
             if(tick && mem_read32(tick->address)==0x9421FFD8u){g_original_tick=tick->func;ssne_install_hook(tick->address,hle_game_tick);}
         }
+        install_werebull_progress_fix();
         if(!g_netplay_active){
             install_step_counter_fix();install_vehicle_step_fix();install_landing_fix();
             install_split_choice();install_frame_time();

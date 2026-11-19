@@ -80,7 +80,13 @@ inline bool presentation_continuous(const EntityState& a,const EntityState& b,do
     if((health(a)>0)!=(health(b)>0))return false;
     const auto x=a.properties.find("position"),y=b.properties.find("position");if(x==a.properties.end() || y==b.properties.end())return false;
     const auto* p=std::get_if<std::array<float,3>>(&x->second);const auto* q=std::get_if<std::array<float,3>>(&y->second);if(!p || !q)return false;
-    const double limit=b.kind==EntityKind::Projectile || presentation_driving(b)?std::max(3.,160.*seconds):std::max(.75,40.*seconds);
+    double limit=std::max(.75,40.*seconds);
+    if(b.kind==EntityKind::Projectile || presentation_driving(b))limit=std::max(3.,160.*seconds);
+    else if(b.kind==EntityKind::Enemy && b.definition==5){
+        // The original adult Werebull charges at 40 units/s. Network timestamps
+        // can straddle one extra native movement tick (50 Hz PAL or 60 Hz).
+        limit=40.*(seconds+1./50.);
+    }
     double d=0;for(unsigned i=0;i<3;++i)d+=double((*p)[i]-(*q)[i])*((*p)[i]-(*q)[i]);return std::isfinite(d) && d<limit*limit;
 }
 inline bool presentation_field(const std::string& key){

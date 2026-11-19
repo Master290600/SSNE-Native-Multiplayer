@@ -12,7 +12,8 @@ bool replica=false,blocked=false,throw_full=false,omit_health=false,omit_death=f
 ssne::NativeEntityObserver observer;
 void require(bool ok,const char* why){++checks;if(!ok)throw std::runtime_error(why);}
 void full(PPCContext&);void start(PPCContext&);void segment(PPCContext&);void sphere(PPCContext&);void player_start(PPCContext&);void mask(PPCContext&);
-const SSNEFuncEntry entries[]={{0x800B2950u,full,"full-respawn"},{0x800B2E5Cu,start,"placement-only"},{0x8010B0ACu,player_start,"player-start"},{0x80140214u,segment,"segment"},{0x80140620u,sphere,"sphere"},{0x801527C0u,mask,"body-mask"}};
+namespace ground_cases { void ground_entry(PPCContext&); void sphere_entry(PPCContext&); }
+const SSNEFuncEntry entries[]={{0x800B2950u,full,"full-respawn"},{0x800B2E5Cu,start,"placement-only"},{0x800C04ACu,ground_cases::ground_entry,"actor-move-sphere"},{0x8010B0ACu,player_start,"player-start"},{0x80140214u,segment,"segment"},{0x80140620u,ground_cases::sphere_entry,"sphere"},{0x801527C0u,mask,"body-mask"}};
 PPCContext context(){PPCContext c;for(unsigned i=0;i<32;++i){c.r[i]=0xAA000000u+i;c.ps0[i]=i+.25;c.ps1[i]=-double(i)-.5;c.gqr[i%8]=i*27;}c.r[1]=0x817F0000u;c.r[2]=0x802F22A0u;c.r[13]=0x802E22A0u;c.msr=0x8032;c.lr=0x80405678;c.ctr=17;c.fpscr=1234;return c;}
 void put_code(uint32_t at,const char* s){auto digit=[](char ch){return ch<='9'?unsigned(ch-'0'):unsigned(ch-'a'+10);};for(unsigned i=0;s[i*2];++i)mem_write8(at+i,uint8_t(digit(s[i*2])*16+digit(s[i*2+1])));}
 void fixture(std::vector<uint8_t>& ram){
@@ -50,10 +51,15 @@ void mask(PPCContext& c){++mask_calls;require(c.r[3]==proxy,"Unexpected body-mas
 void expect_cpu_and_stack(const PPCContext& c,const PPCContext& before,const std::vector<uint8_t>& stack){require(!std::memcmp(&c,&before,sizeof c),"Full reset changed caller CPU registers");require(!std::memcmp(ssne::host_ptr(c.r[1]-0x4000),stack.data(),stack.size()),"Full reset leaked scratch stack writes");require(!ssne::force_safe_spawn,"Full reset leaked safe placement scope");}
 std::vector<uint8_t> scratch(const PPCContext& c){return {ssne::host_ptr(c.r[1]-0x4000),ssne::host_ptr(c.r[1])};}
 void checksum(std::vector<uint8_t>& v){const auto hash=ssne::party_state_hash(v.data(),v.size()-8);for(unsigned i=0;i<8;++i)v[v.size()-8+i]=uint8_t(hash>>(56-i*8));}
+#include "native_party_ground_cases.h"
 }
 const SSNEFuncEntry* ssne_find_func(uint32_t address){for(const auto& e:entries)if(e.address==address)return &e;return nullptr;}
-PPCFunc* ssne_hook_slot(uint32_t){throw std::runtime_error("Unexpected hook lookup");}
-void ssne_install_hook(uint32_t,PPCFunc){throw std::runtime_error("Unexpected hook installation");}
+PPCFunc* ssne_hook_slot(uint32_t address){
+ if(address==0x800C04ACu)return &ground_cases::ground_hook;
+ if(address==0x80140620u)return &ground_cases::sphere_hook;
+ throw std::runtime_error("Unexpected hook lookup");
+}
+void ssne_install_hook(uint32_t address,PPCFunc fn){*ssne_hook_slot(address)=fn;}
 void ssne_call(PPCContext& c,uint32_t address){const auto* entry=ssne_find_func(address);if(!entry)throw std::runtime_error("Unexpected original callback "+std::to_string(address));entry->func(c);}
 namespace ssne {
 uint8_t* g_ram=nullptr;uint8_t g_locked_cache[kLockedCacheSize]{};
@@ -110,5 +116,6 @@ int main(){try{
  require(ssne::native_party_save_state(state,error),error.c_str());state[7]=1;checksum(state);require(ssne::native_party_load_state(state,error),"Backward-compatible original v1 party state was rejected");
  fixture(ram);c=context();blocked=true;require(!ssne::native_party_request_respawn(c,actor,error),"Cancellation positive control did not defer");
  require(bool(observer),"Pending lifecycle has no entity lifetime observer");observer({ssne::NativeEntityNotice::Event::Removing,actor});require(!ssne::native_party_spawn_waiting(actor),"Removed actor retained a pending full reset");
- std::cout<<"Native full respawn passed "<<checks<<" assertions: no-input lifecycle, strict ownership, preserved CPU/stack, safe blocked retry, same-proxy visibility and checkpoint v1/v2.\n";
+ ground_cases::check(ram);
+ std::cout<<"Native party passed "<<checks<<" assertions covering full respawn, checkpoint v1/v2 and ground collision.\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

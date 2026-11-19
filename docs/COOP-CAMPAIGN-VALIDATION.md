@@ -19,9 +19,19 @@ native vulnerability phases and revisit remaining regions. The report preserves
 the actual native hit results and all client field comparison samples.
 
 `tools/test_coop_campaign_vehicles.py` checks the initially hidden Clevel5_1
-Jeep, Alevel10_4 Combine and Clevel6_1 vehicle: show/hide/show, host entry/exit,
+Jeep, the Alevel10_4 submarines and the Clevel6_1 combine: show/hide/show, host entry/exit,
 client rejoin and client entry/input/exit. It uses original native lifecycle and driving
 actions, then requires successful client reconciliation after each action.
+
+`tools/test_vehicle_host_netricsa.py` checks the first Jeep on Via Aurelia
+(`Rlevel1_3`). The host keeps the opening briefing on screen. The client tries
+Use from the level start, then from directly in front of the Jeep, and drives
+and exits using the normal keyboard bindings.
+
+`tools/test_coop_vehicle_roster.py` checks the same map while clients join,
+disconnect and rejoin. It counts the visible vehicles for one, two and three
+human players and checks that rejoining reuses the existing vehicles. Both
+scripts take `--exe`, `--data`, `--card` and a new `--output` directory.
 
 Both drivers explicitly shortcut exploration, triggers and aiming. A passing
 integration matrix does **not** establish a complete normal campaign playthrough,

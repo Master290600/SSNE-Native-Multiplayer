@@ -35,7 +35,7 @@ def main():
     if sha(source/'tools/patch_multiplayer.py')!=descriptor['patcher_sha256']:
         raise ValueError('Source patcher differs from reviewed runtime')
     files=descriptor['files']
-    if not 58<=len(files)<=128 or descriptor['protocol'] not in (63,64,65,66,67,68,69,70) or descriptor['build']<197:
+    if not 58<=len(files)<=128 or descriptor['protocol'] not in range(63,72) or descriptor['build']<197:
         raise ValueError('Unexpected native runtime scope')
     seen=set()
     for item in files:

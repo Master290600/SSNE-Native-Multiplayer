@@ -570,6 +570,7 @@ bool install_native_rocket_effect_capture(bool host,std::string& error) {
     if(!ssne_find_func(0x8010E7B0) || mem_read32(0x8010E7B0)!=0x9421FFE0u || !ssne_find_func(0x8010EAE0) || mem_read32(0x8010EAE0)!=0x9421FFE0u){error="Native weapon-shot audio lifecycle unavailable";return false;}
     for(const auto [address,signature]:{std::pair{0x8010E86Cu,0x9421FFE0u},std::pair{0x800DB980u,0x9421FFB8u},std::pair{0x800DB850u,0x9421FFE0u}})if(!ssne_find_func(address) || mem_read32(address)!=signature){error="Native feedback lifecycle unavailable";return false;}
     if(!ssne_find_func(0x800DC310) || mem_read32(0x800DC310)!=0x9421FFC0u || !ssne_find_func(0x800DC694) || mem_read32(0x800DC694)!=0x9421FFE8u){error="Native gib presentation lifecycle unavailable";return false;}
+    if(!ssne_find_func(0x800EA1C0u) || mem_read32(0x800EA1C0u)!=0x9421FFE8u){error="Native spawn flash updater unavailable";return false;}
     if(!ssne_find_func(0x800CBAC4u) || mem_read32(0x800CBAC4u)!=0x9421FFB8u){error="Native scenery fragment lifecycle unavailable";return false;}
     if(!original_prop_fragments){original_prop_fragments=ssne_find_func(0x800CBAC4u)->func;ssne_install_hook(0x800CBAC4u,prop_fragment_hook);}
     if(!original_gib){original_gib=ssne_find_func(0x800DC310)->func;ssne_install_hook(0x800DC310,gib_hook);}
@@ -943,7 +944,7 @@ bool update_native_replica_effects(PPCContext& context,float seconds,std::string
     // Validate this presentation list before invoking its original updater.
     std::set<uint32_t> nodes;auto node=mem_read32(context.r[13]-0x5FBC);
     while(node){if(!readable(node,12) || !nodes.insert(node).second || nodes.size()>20){error="Invalid native effect presentation list";return false;}const auto object=mem_read32(node);const auto table=readable(object,8)?mem_read32(object+4):0;const auto type=std::find_if(std::begin(explosion_classes),std::end(explosion_classes),[&](const auto& t){return t.table==table;});if(type==std::end(explosion_classes) || !readable(object,type->size) || !explosion_class_valid(*type)){error="Unverified replica effect presentation class";return false;}node=mem_read32(node+4);}
-    for(const auto offsets:{std::array<unsigned,4>{0x5F3C,0x18,0x10,0x5F38},std::array<unsigned,4>{0x5F34,0x48,0x40,0x5F30}}) {
+    for(const auto offsets:{std::array<unsigned,4>{0x5F3C,0x18,0x10,0x5F38},std::array<unsigned,4>{0x5F34,0x48,0x40,0x5F30},std::array<unsigned,4>{0x5F4C,0x1C,0x14,0x5F48}}) {
         std::set<uint32_t> particles;auto current=mem_read32(context.r[13]-offsets[0]);uint32_t previous=0;
         while(current){if(!readable(current,offsets[1]) || !particles.insert(current).second || particles.size()>32768 || mem_read32(current+offsets[2]+4)!=previous){error="Invalid native replica particle lifetime list";return false;}previous=current;current=mem_read32(current+offsets[2]);}
         if(particles.size()!=mem_read32(context.r[13]-offsets[3])){error="Native replica particle count differs from list";return false;}
@@ -959,6 +960,12 @@ bool update_native_replica_effects(PPCContext& context,float seconds,std::string
     call.ps0[1]=call.ps1[1]=seconds;ssne_call(call,0x800EEA90);
     // Original gib/blood-fragment physics/fade has no actor damage callback.
     call.ps0[1]=call.ps1[1]=seconds;ssne_call(call,0x800DC694);if(!validate_gib_list(context,error))return false;
+    // Showing a vehicle adds a timed sprite to this pool. The replica skips
+    // the world tick that normally fades the sprite and returns it to the pool.
+    if(mem_read32(context.r[13]-0x5F4C)){
+        call.ps0[1]=call.ps1[1]=seconds;
+        ssne_call(call,0x800EA1C0u);
+    }
     // Original presentation subsections of801507E0, not its gameplay update.
     for(auto address:{0x800CA44Cu,0x800E7264u,0x800CB894u,0x800CCF38u}){call.ps0[1]=call.ps1[1]=seconds;ssne_call(call,address);}if(!validate_bullet_lists(call,error))return false;
     if(getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_COOP_TRACE_LIFETIMES")){static std::array<uint32_t,3> previous={~0u,~0u,~0u};const auto counts=bullet_counts(call);if(counts!=previous){previous=counts;log_message("[coop-bullet-impact-pool] tracers="+std::to_string(counts[0])+" sparks="+std::to_string(counts[1])+" debris="+std::to_string(counts[2]));}}return true;

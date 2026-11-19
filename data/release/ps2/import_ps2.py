@@ -42,6 +42,9 @@ def local(root, relative):
         require(not dest.is_symlink() and not dest.is_junction(), f"Linked destination not supported: {relative}")
     return dest
 
+def replaceable(row, digest):
+    return digest in (row["base"], row["sha256"]) or (digest is not None and digest == row.get("previous_sha256"))
+
 def current(root, relative):
     path=local(root,relative)
     require(not path.exists() or path.is_file(),f"Expected a file at {relative}")
@@ -188,7 +191,7 @@ def main():
         changed=[]
         for name,row in rows.items():
             actual=current(root,name)
-            require(actual in (row["base"],row["sha256"]),"Existing content differs; no files were changed: "+name)
+            require(replaceable(row, actual),"Existing content differs; no files were changed: "+name)
             if actual!=row["sha256"]:changed.append(name)
         if not changed:
             retire_manual_launcher(root, scratch)
@@ -206,7 +209,7 @@ def main():
             dest=local(root,name)
             actual=current(root,name)
             if actual==rows[name]["sha256"]:continue
-            require(actual==rows[name]["base"],"Destination changed during import: "+name)
+            require(replaceable(rows[name], actual),"Destination changed during import: "+name)
             dest.parent.mkdir(parents=True,exist_ok=True)
             os.replace(local(stage,name),dest)
         require(all(current(root,n)==row["sha256"] for n,row in rows.items()),"Final verification failed; run the importer to resume.")

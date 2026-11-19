@@ -63,7 +63,7 @@ def audit(path):
     need(side["patch_recipe"]==base+"translation-recipe.json" and side["patch_recipe_sha256"]==digest(base+"translation-recipe.json"),"Recipe checksum differs")
     need(side["symbols_sha256"]==digest(side["symbols"]),"PAL symbol checksum differs")
     need(descriptor["recompiler_sha256"]==digest("build-kit/SSNE-RECOOP-Native.exe"),"Recompiler checksum differs")
-    need(58<=len(descriptor["files"])<=128 and descriptor["protocol"] in (63,64,65,66,67,68,69,70),"Unexpected native kit scope")
+    need(58<=len(descriptor["files"])<=128 and descriptor["protocol"] in range(63,72),"Unexpected native kit scope")
     for item in descriptor["files"]:need(digest(base+item["path"])==item["sha256"],"Native runtime checksum differs: "+item["path"])
     if descriptor["protocol"]>=70:
         need(OPTIONAL_ROOT_FILES<=contents.keys(),"Invitation instructions/settings example are missing")

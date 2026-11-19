@@ -32,13 +32,20 @@ bool vehicle_binding(int64_t reference,VehicleBinding& b,std::string& error){
 }
 const std::vector<int64_t>* vehicle_tags(const Properties& p){auto i=p.find("Session.Vehicles.Tags");return i==p.end()?nullptr:std::get_if<std::vector<int64_t>>(&i->second);}
 const std::vector<float>* vehicle_values(const Properties& p){auto i=p.find("Session.Vehicles.Values");return i==p.end()?nullptr:std::get_if<std::vector<float>>(&i->second);}
+#include "native_vehicle_fleet.inc"
 bool vehicle_payload(const Properties& p,std::string& error){
     const auto t=vehicle_tags(p);const auto v=vehicle_values(p);
     if(!t || !v || t->size()%vehicle_tag_count || t->size()>16*vehicle_tag_count){error="Incomplete vehicle snapshot";return false;}
+    std::vector<FleetVehicle> fleet;if(!read_fleet(p,fleet,error))return false;
     size_t floats=0;std::set<int64_t> references,drivers;
     for(size_t n=0;n<t->size();n+=vehicle_tag_count){
         const auto* a=t->data()+n;VehicleBinding b;
-        if(a[0]<=0 || a[0]>32767 || !references.insert(a[0]).second || !vehicle_binding(a[0],b,error))return false;
+        if(a[0]<=0 || a[0]>32767 || !references.insert(a[0]).second)return false;
+        const auto extra=std::find_if(fleet.begin(),fleet.end(),[&](const auto& v){return v.reference==a[0];});
+        // Preflight a new replica against the local authored vehicle. Its own
+        // native allocation is created only after the entire snapshot passes.
+        const auto model=extra!=fleet.end() && !native_script_reference_address(a[0])?int64_t(extra->parent):a[0];
+        if(!vehicle_binding(model,b,error))return false;
         for(unsigned i:{1u,2u,3u,5u})if(a[i]<0 || a[i]>1){error="Invalid vehicle state flag";return false;}
         if(a[4]<-1 || a[4]>=ssne::native_party_capacity() || (a[4]>=0 && !drivers.insert(a[4]).second) || bool(a[5])!=(a[4]>=0) || (a[7]!=154 && a[7]!=155 && a[7]!=158)){error="Invalid vehicle driver/type";return false;}
         if(!a[1]){if(a[2] || a[3] || a[4]!=-1 || a[5] || a[6] || std::any_of(a+8,a+20,[](int64_t x){return x!=0;})){error="Invalid absent vehicle state";return false;}continue;}
@@ -47,6 +54,7 @@ bool vehicle_payload(const Properties& p,std::string& error){
         for(unsigned i=0;i<6;++i)if(a[8+i]<0 || a[8+i]>1 || a[14+i]<0 || uint64_t(a[14+i])>UINT32_MAX){error="Invalid vehicle visibility";return false;}
         floats+=vehicle_base_values+size_t(a[6])*12;
     }
+    for(const auto& extra:fleet)if(!references.contains(extra.reference)){error="Cooperative vehicle is absent from snapshot";return false;}
     if(floats!=v->size()){error="Vehicle pose length differs";return false;}
     for(float x:*v)if(!std::isfinite(x) || std::abs(x)>1000000){error="Invalid vehicle pose value";return false;}
     size_t fuel_offset=0;
@@ -95,13 +103,73 @@ bool release_native_vehicle_driver(PPCContext& context,uint32_t actor,std::strin
     if(mem_read32(actor+0x6C4) || mem_read32(car+0x160) || mem_read32(actor+0x340)!=1){error="Original vehicle exit did not complete";return false;}
     return true;
 }
+void update_native_coop_vehicles(PPCContext& context,unsigned human_players){
+    if(!context_ok(context) || !vehicle_reference_space(0))return;
+    const auto table=mem_read32(0x802DB7C4),count=mem_read32(0x802DB7C8);
+    std::vector<uint32_t> sources,extras;std::vector<VehiclePoint> occupied;
+    unsigned visible=0,original_count=0;
+    for(unsigned i=0;i<count;++i){
+        const auto wrapper=mem_read32(table+i*8+4);
+        if(!readable(wrapper,0x94) || mem_read32(wrapper+0x48)!=0x80209BB8u)continue;
+        const bool extra=party_vehicle(wrapper);
+        if(extra)extras.push_back(wrapper);else ++original_count;
+        const auto car=mem_read32(wrapper+0x60);if(!readable(car,0x1D8))continue;
+        if(!mem_read32(wrapper+0x7C) && !mem_read32(car+0x160))continue;
+        ++visible;occupied.push_back(vehicle_point(car+0x20));
+        if(!extra)sources.push_back(wrapper);
+    }
+    if(!original_count)return;
+    if(getenv("SSNE_TEST_HIDDEN")){
+        static unsigned reports=0;
+        if(reports++<24)ssne::log_message("[coop-vehicle-quota] players="+std::to_string(human_players)+" sources="+std::to_string(sources.size())+" visible="+std::to_string(visible)+" extras="+std::to_string(extras.size()));
+    }
+    for(unsigned slot=0;slot<ssne::native_party_capacity();++slot){
+        const auto actor=mem_read32(ssne::native_party_registry()+slot*4);
+        if(readable(actor,0x790) && mem_read32(actor+0x48)==0x802121E8u && !mem_read32(actor+0x328))
+            occupied.push_back(vehicle_point(actor+0x20));
+    }
+    auto toggle=[&](uint32_t object,bool on){
+        StackScratch scratch(context);auto call=context;call.msr&=~0x8000u;
+        call.r[1]-=0x200;mem_write32(call.r[1],context.r[1]);call.r[3]=object;
+        ssne_call(call,on?0x80086064u:0x800860B8u);
+    };
+    // Leave an occupied vehicle under its driver even during a departure.
+    for(auto wrapper:extras){
+        const auto car=mem_read32(wrapper+0x60);
+        const auto source=native_script_reference_address(mem_read32(wrapper+0xA4));
+        if(!source || !readable(car,0x1D8) || mem_read32(car+0x160))continue;
+        const bool parent_visible=std::find(sources.begin(),sources.end(),*source)!=sources.end();
+        if(mem_read32(wrapper+0x7C) && (!parent_visible || visible>human_players)){
+            toggle(wrapper,false);--visible;
+        }else if(!mem_read32(wrapper+0x7C) && parent_visible && visible<human_players){
+            const auto parked=vehicle_point(car+0x20);
+            const bool blocked=std::any_of(occupied.begin(),occupied.end(),[&](const auto& v){return std::abs(v[1]-parked[1])<3 && std::hypot(v[0]-parked[0],v[2]-parked[2])<4;});
+            if(!blocked){toggle(wrapper,true);++visible;occupied.push_back(parked);}
+        }
+    }
+    if(visible>=human_players || sources.empty() || !vehicle_reference_space(1) || extras.size()>=7 || original_count+extras.size()>=16)return;
+    // Prefer an original with a currently free parking spot. Only one native
+    // allocation per roster update keeps large joins off a single frame.
+    for(auto source:sources)if(auto parking=parking_position(context,source,occupied)){
+        for(unsigned id=32767;id>=32761;--id)if(!vehicle_reference_taken(id)){
+            const auto parent=mem_read32(source+0x50);
+            const bool spawned=spawn_party_vehicle(context,{id,parent,*parking},source,true)!=0;
+            if(spawned && getenv("SSNE_TEST_HIDDEN"))ssne::log_message("[coop-vehicle-fleet] players="+std::to_string(human_players)+" visible="+std::to_string(visible+1)+" ref="+std::to_string(id)+" parent="+std::to_string(parent));
+            return;
+        }
+    }
+}
 bool capture_native_vehicles(Properties& p,std::string& error){
+    std::vector<int64_t> fleet;
     std::vector<int64_t> tags;std::vector<float> values,audio;std::vector<int64_t> extra_audio;
     const auto table=mem_read32(0x802DB7C4),count=mem_read32(0x802DB7C8);
     if(count>32768 || !readable(table,count*8)){error="Vehicle level map unavailable";return false;}
     for(unsigned n=0;n<count;++n){const auto wrapper=mem_read32(table+n*8+4);
         if(!readable(wrapper,0x8C) || mem_read32(wrapper+0x48)!=0x80209BB8u)continue;
         VehicleBinding b;const auto reference=mem_read16(table+n*8);if(!vehicle_binding(reference,b,error))return false;
+        if(party_vehicle(wrapper)){
+            fleet.insert(fleet.end(),{reference,mem_read32(wrapper+0xA4),mem_read32(wrapper+0x64),mem_read32(wrapper+0x68),mem_read32(wrapper+0x6C)});
+        }
         const auto at=tags.size();tags.resize(at+vehicle_tag_count);auto* a=tags.data()+at;a[0]=reference;a[4]=-1;a[7]=b.type;
         audio.insert(audio.end(),{0,1});extra_audio.push_back(b.car && b.type==155?unsigned(vehicle_voice(mem_read32(b.car+0x37C),468))|(unsigned(vehicle_voice(mem_read32(b.car+0x380),469))<<1):0);if(!b.car)continue;
         a[1]=1;a[2]=mem_read32(b.car+0x130);a[3]=mem_read32(wrapper+0x7C);a[5]=mem_read32(b.car+0x12C);a[6]=b.count;
@@ -119,6 +187,7 @@ bool capture_native_vehicles(Properties& p,std::string& error){
         for(unsigned i=0;i<6;++i){if(b.proxies[i]){a[8+i]=mem_read8(b.proxies[i]+0x2D);a[14+i]=mem_read32(b.proxies[i]+0x30);append(b.roots[i],12);}else values.insert(values.end(),12,0.f);}
         append(b.bones,b.count*12);
     }
+    if(!fleet.empty())p["Session.Vehicles.Fleet"]=std::move(fleet);
     p["Session.Vehicles.ExtraAudio"]=std::move(extra_audio);p["Session.Vehicles.Tags"]=std::move(tags);p["Session.Vehicles.Values"]=std::move(values);p["Session.Vehicles.Audio"]=std::move(audio);return vehicle_payload(p,error);
 }
 bool validate_native_vehicles(const Properties& p,const std::map<EntityId,EntityState>& entities,std::string& error){
@@ -139,6 +208,11 @@ bool validate_native_vehicles(const Properties& p,const std::map<EntityId,Entity
 }
 bool prepare_native_vehicle_models(PPCContext& context,const Properties& p,std::string& error){
     if(!context_ok(context) || !vehicle_payload(p,error))return false;
+    std::vector<FleetVehicle> fleet;if(!read_fleet(p,fleet,error))return false;
+    for(const auto& extra:fleet)if(!native_script_reference_address(extra.reference)){
+        const auto parent=native_script_reference_address(extra.parent);
+        if(!parent || !spawn_party_vehicle(context,extra,*parent,false)){error="Cannot create cooperative vehicle replica";return false;}
+    }
     StackScratch scratch(context);const auto& tags=*vehicle_tags(p);
     for(size_t n=0;n<tags.size();n+=vehicle_tag_count){
         VehicleBinding b;if(!vehicle_binding(tags[n],b,error))return false;

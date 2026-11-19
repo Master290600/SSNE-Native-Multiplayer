@@ -216,7 +216,7 @@ void NativeSession::clear_level_controls(PPCContext* context){
     afk_bots_={};game_bots_={};afk_inputs_={};afk_follow_slots_={};afk_native_active_={};afk_states_={};
     afk_respawn_wait_={};native_life_wait_={};afk_decisions_={};afk_epoch_=0;afk_next_decision_={};
     characters_={};join_placements_={};host_ready_=client_ready_=false;
-    ready_retry_next_={};ready_retry_epoch_=0;ready_retry_owner_={};
+    ready_retry_next_={};ready_retry_epoch_=0;ready_retry_owner_={};vehicle_roster_next_={};
     host_capture_clock_.reset();host_idle_publication_clock_.reset();host_capture_epoch_=0;host_capture_entities_=0;host_idle_reported_.reset();
     set_local_ui_pad({});
     for(unsigned slot=0;slot<max_players;++slot){
@@ -1664,6 +1664,16 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         const bool loading=sample.scene!=4 || std::none_of(sample.entities.begin(),sample.entities.end(),[](const auto& item){return item.second.kind==EntityKind::Player;});
         ssne::NativeBossHudState boss_hud;
         if(!loading && sample.mode==1 && !ssne::native_results_presenting()) {
+            const auto now=std::chrono::steady_clock::now();
+            if(!ssne::native_survival_enabled() && now>=vehicle_roster_next_){
+                vehicle_roster_next_=now+std::chrono::milliseconds(500);
+                const auto people=server_->participants();const auto bots=server_->bot_mask();
+                unsigned humans=0;
+                for(unsigned slot=0;slot<capacity_;++slot){
+                    if(people[slot].connected && people[slot].ready && !people[slot].spectator && !(bots&(1u<<slot)))++humans;
+                }
+                update_native_coop_vehicles(context,humans);
+            }
             std::string why;
             if(!ssne::capture_native_boss_hud(boss_hud,why)){report(why);return;}
         }

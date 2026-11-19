@@ -31,6 +31,14 @@ bool campaign_probe(PPCContext& context,const NativeWorldSample& sample,NativeWo
                 out<<",\"weakpoints\":[";const auto& values=std::get<std::vector<float>>(points->second);for(unsigned i=0;i<values.size();++i){if(i)out<<',';out<<values[i];}out<<']';
             }
             if(kind==unsigned(EntityKind::Enemy))out<<",\"health\":"<<u2f(mem_read32(object+0xCC));
+            if(kind==unsigned(EntityKind::Enemy) && (definition==5 || definition==15) && getenv("SSNE_TEST_WEREBULL_TRACK")){
+                out<<",\"target_actor\":"<<mem_read32(object+0x13C)<<",\"ai_state\":"<<mem_read32(object+0x150)<<",\"target_position\":[";
+                for(unsigned i=0;i<3;++i){if(i)out<<',';out<<u2f(mem_read32(object+0x140+4*i));}out<<']';
+                if(const auto model=native_render_binding(object,EntityKind::Enemy);model && model->matrix){
+                    out<<",\"model_position\":[";
+                    for(unsigned i=0;i<3;++i){if(i)out<<',';out<<u2f(mem_read32(model->matrix+i*16+12));}out<<']';
+                }
+            }
             if(kind==unsigned(EntityKind::Player)){
                 out<<",\"slot\":"<<mem_read32(object+0x17C)<<",\"health\":"<<u2f(mem_read32(object+0xCC))<<",\"dead\":"<<mem_read32(object+0x328)<<",\"weapon\":"<<mem_read32(object+0x5DC)<<",\"flag\":"<<bool(mem_read32(object+0x694))<<",\"bomb\":"<<bool(mem_read32(object+0x6A4));
                 if(auto found=sample.entities.find(id);found!=sample.entities.end())for(const auto* key:{"weapon_owned_counts","ammo","ammo_maximum"}){

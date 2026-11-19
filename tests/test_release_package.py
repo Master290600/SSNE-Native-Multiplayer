@@ -101,6 +101,9 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertFalse((self.output/'source/vendor/libjuice/fuzzer/input/message1.raw').exists())
         self.assertFalse((self.output/'game_data').exists())
         self.assertFalse((self.output/'Multiplayer').exists())
+    def test_campaign_vehicle_protocol(self):
+        self.fixture(protocol=71);self.assemble()
+        self.assertEqual(checker.audit(self.archive())["protocol"],71)
     def test_checker_requires_source_license_match(self):
         self.fixture();self.assemble()
         for name in ('licenses/libjuice-MPL-2.0.txt','source/vendor/libjuice/LICENSE','licenses/KCP-MIT.txt','source/vendor/kcp/ikcp.c','NATIVE-INVITATIONS.txt','SSNE-INTERNET.example'):
@@ -116,7 +119,7 @@ class ReleasePackageTests(unittest.TestCase):
         self.fixture();name='port/src/accidental-game.exe';self.put(self.source,name,b'INERT FORBIDDEN FIXTURE');self.git_files.append(name)
         with self.assertRaises(ValueError):self.assemble()
     def test_rejects_unknown_protocol(self):
-        self.fixture(protocol=71)
+        self.fixture(protocol=72)
         with self.assertRaises(ValueError):self.assemble()
 
 if __name__=='__main__':unittest.main()

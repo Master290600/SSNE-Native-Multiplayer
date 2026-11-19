@@ -1,6 +1,6 @@
 {
-  "build": 245,
-  "protocol": 70,
+  "build": 250,
+  "protocol": 71,
   "dol_sha256": "c0b8ba71e0dd99ca632a2a6931db0a8f610d69c00a423d34c96a579eaa3710ad",
   "donor_sha256": "63896cb433b75f0fc8145b4fcaf8259ef0950272cbfc96187df56762aa04e3c4",
   "old_menu_extents": [
@@ -65,8 +65,9 @@
     },
     "game_data/files/Multiplayer/skin_drivethrough.ssg": {
       "base": null,
-      "sha256": "ca955c8bac3616db68093016425ad796de9a449c89f5dd8a6be324956ff72a3e",
-      "bytes": 181471
+      "sha256": "117f4ff62b0f7691c8823bc8143863680c7021d243d3984d8266180dee4df313",
+      "bytes": 181707,
+      "previous_sha256": "ca955c8bac3616db68093016425ad796de9a449c89f5dd8a6be324956ff72a3e"
     },
     "game_data/files/Multiplayer/skin_fisherman.ssg": {
       "base": null,
@@ -75,8 +76,9 @@
     },
     "game_data/files/Multiplayer/skin_all.ssg": {
       "base": "054619f04a08d452fea264f6916d559f63b3e3e80ec43eebee854943ac08b6d1",
-      "sha256": "8fdc94108806289523df134ecc94ebf93e6389d01cec5db3f24f20110c74fd59",
-      "bytes": 2138216
+      "sha256": "4af810381772f655119fe070dc71ea3dd593b6f26dd7327cec3468ec033a0d0a",
+      "bytes": 2138467,
+      "previous_sha256": "8fdc94108806289523df134ecc94ebf93e6389d01cec5db3f24f20110c74fd59"
     },
     "game_data/files/base.cfg": {
       "base": "01d7038bd6bb9e8050a4e8407bd9817a2353d2b03d4f2fca715552cfa2393935",
@@ -105,8 +107,9 @@
     },
     "game_data/files/ps2-skin-content.txt": {
       "base": null,
-      "sha256": "ea609054d102d3e8b9bae1b41db23d4e9cb9fa7d779f184b5b4797d89ef1f1e1",
-      "bytes": 1070
+      "sha256": "4becbc2d5eff8c90a7ba24a192b6bdbec7475df07949a1438295fdbc044478ca",
+      "bytes": 1070,
+      "previous_sha256": "ea609054d102d3e8b9bae1b41db23d4e9cb9fa7d779f184b5b4797d89ef1f1e1"
     },
     "game_data/files/Levels/Schluchten-Level.ssw": {
       "base": null,
@@ -410,13 +413,15 @@
     },
     "game_data/sys/fst.bin": {
       "base": "07caa93af6b6e99ee86b65d2cecbf81d168318a590dc16d984a7c2e6d20e2ace",
-      "sha256": "32d06e66061cb26cc03bb5534d2281e6889ed641744e6c0d5e48b2083dbd1ad3",
-      "bytes": 4221
+      "sha256": "76675f956987c06f63769d42e3bde4aaf70b4de8be8604c793218b3b85efd76d",
+      "bytes": 4221,
+      "previous_sha256": "32d06e66061cb26cc03bb5534d2281e6889ed641744e6c0d5e48b2083dbd1ad3"
     },
     "game_data/sys/boot.bin": {
       "base": "1b6a7f9ac3889212b38c4af3aab0bf501ccc0c62ad555a93f26d9eca253d50fc",
-      "sha256": "848959da6ca9ed709ca85b352c9c5f07dc89c0bdcec574f4fab45a6be36fb327",
-      "bytes": 1088
+      "sha256": "680ddfa79852befdbe2e3ea6fb37b8e2a3fe896b62ef2381f089b2e1259296dc",
+      "bytes": 1088,
+      "previous_sha256": "848959da6ca9ed709ca85b352c9c5f07dc89c0bdcec574f4fab45a6be36fb327"
     },
     "Multiplayer/online-icon.png": {
       "base": null,
@@ -424,6 +429,7 @@
       "bytes": 4054
     }
   },
-  "kit_sha256": "12df61adffc37caf73decd1e65320f3881479aca9e1b19cf98a8bc1e839632da",
-  "content_sha256": "e71a875938228a2e3b90299a0d3db5e32eb57153c1fea3a859e7ad9cbd214157"
+  "kit_sha256": "0b7bd0b51ab703dc1e88e81d46afa7293a348aa85355f6480e4dbe0edf5d1fb4",
+  "content_sha256": "3335ea11d6f38344859dfabb21ce524d73c68c33ba3db6e923f0878e35876cbd",
+  "content_revision": 249
 }

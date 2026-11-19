@@ -26,6 +26,13 @@ class Peers:
   while time.monotonic()<until:self.inspect();time.sleep(.08)
  def log(self,role):
   p=self.folder/role/('ssne-coop-host.log' if role=='host' else 'ssne-coop-client.log');return p.read_text(encoding='utf8',errors='replace') if p.exists() else ''
+ def wait_for_listener(self):
+  deadline=time.monotonic()+60
+  while 'network=Host running; clients may join.' not in self.log('host'):
+   if self.processes['host'].poll() is not None or '[port] Stopped:' in self.log('host'):
+    raise RuntimeError('Host stopped before accepting clients')
+   if time.monotonic()>=deadline:raise TimeoutError('Host did not start listening')
+   self.delay(.1)
  def pulse(self,token,roles=('host','client'),seconds=.18):
   self.sequence+=1
   for role in roles:
@@ -77,7 +84,7 @@ class Peers:
    if role=='host':env.update(SSNE_COOP_CAMPAIGN_COMMAND=str(f/'command.txt'),SSNE_NETPLAY_MOD_FLAGS='0')
    args=[str(f/self.a.exe.name),'--data',str(self.a.data),'--memcard',str(f/'card.raw'),'--lan-port',str(self.a.port),'--lan-pin','123456','--player-name',role,'--mute']+(['--coop-host','--coop-capacity','8','--coop-level',self.level] if role=='host' else ['--coop-join','127.0.0.1'])
    si=subprocess.STARTUPINFO();si.dwFlags|=subprocess.STARTF_USESHOWWINDOW;si.wShowWindow=0;stream=(f/'console.log').open('wb');self.streams.append(stream);self.processes[role]=subprocess.Popen(args,cwd=f,env=env,stdout=stream,stderr=stream,startupinfo=si,creationflags=subprocess.BELOW_NORMAL_PRIORITY_CLASS)
-   self.delay(2 if role=='host' else .2)
+   if role=='host':self.wait_for_listener()
  def restart_client(self):
   old=self.processes['client'];self.pulse('QUIT',('client',));old.wait(timeout=8)
   self.streams[-1].close();previous=self.folder/'client-before-rejoin';(self.folder/'client').rename(previous)

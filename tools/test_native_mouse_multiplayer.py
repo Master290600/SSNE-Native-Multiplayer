@@ -23,6 +23,7 @@ class MultiplayerMenus(MouseMenus):
   # This fixture must prove genuine mouse votes, so bootstrap the same private
   # process/card without either automatic-vote environment key.
   folder=self.folder/role;folder.mkdir(parents=True);(folder/'steps').mkdir();shutil.copy2(self.a.exe,folder/'game.exe');shutil.copy2(self.a.card,folder/'card.raw')
+  if getattr(self.a,'online_icon',None):shutil.copy2(self.a.online_icon,folder/'online-icon.png')
   (folder/'input.txt').write_text('');(folder/'command.txt').write_text('');(folder/'settings.ini').write_text(self.a.private_settings)
   env={key:value for key,value in os.environ.items() if not key.startswith('SSNE_')}
   env.update(SSNE_TEST_HIDDEN='1',SSNE_DEV_NATIVE_MENU='1',SSNE_PAD_SCRIPT_FILE=str(folder/'input.txt'),SSNE_TEST_SCREENSHOT_DIR=str(folder/'steps'),SSNE_PERF_LOG=str(folder/'performance.jsonl'),SSNE_NATIVE_MENU_COMMAND=str(folder/'command.txt'),SSNE_NATIVE_MENU_PORT=str(self.a.port),SSNE_NATIVE_MENU_DISCOVERY_PORT=str(self.a.port+1),SSNE_NATIVE_TEST_LANGUAGE=str(language));env.update(self.a.test_env)
@@ -471,24 +472,174 @@ def leave_sessions(p):
   screenshot(p,role)
 
 
+def rehost_sessions(p):
+ """Beenden/Yes, Online/Back/Online and two playable sessions on one LAN port."""
+ m=p.m
+ roles=('host','client')
+ level='Rlevel1_2'
+ sessions=[]
+ setup_cache={}
+ browser_cache={}
+
+ def lobby_setup(role):
+  return m.copied_json(role,'native-lobby-setup-state.json',setup_cache)
+
+ def click(control,root,role='host'):
+  p.expect_root(root,role)
+  # The image rectangle animates after an original GUI transition. Reproject
+  # the widget until a complete native frame reports the intended hover.
+  def acquired():
+   try:widget=p.widget(control,role,root=root)
+   except AssertionError:return False
+   p.move(p.center(widget),role)
+   return p.observe(role).get('hover',{}).get('node')==widget['node']
+  m.wait(acquired,10)
+  widget=p.widget(control,role,root=root)
+  uv=p.center(widget)
+  p.button(True,uv,role);m.delay(.10);p.button(False,uv,role);m.delay(.3)
+  record(p,'native_widget_clicked',role=role,control=control,root=root)
+
+ def online(role,visit):
+  click(0x15c,0x3d,role)
+  page(p,1,role)
+  p.expect_root(0x148,role)
+  first=p.observe(role)['frame']
+  screenshot(p,role)
+  m.wait(lambda:p.observe(role).get('frame',0)>first+3,5)
+  record(p,'live_online_page',role=role,visit=visit,first_frame=first,later_frame=p.observe(role)['frame'])
+
+ def select_level():
+  if lobby_setup('host').get('map')==level:return
+  click(0x158,0x9a)
+  p.expect_root(0x4b)
+  m.wait(lambda:len(m.carousel().get('surfaces',[]))==1,15)
+  state=carousel_debug(p)
+  target=next(ident(e['index']) for e in state['entries'] if e.get('level')==level)
+  for _ in range(ident(state['count'])):
+   current=ident(carousel_debug(p)['selected'])
+   if current==target:break
+   step=1 if current<target else -1
+   p.wheel(p.center(p.widget('carousel.confirm',root=0x4b)),-step)
+   m.wait(lambda:ident(carousel_debug(p)['selected'])==current+step,10)
+  assert carousel_debug(p).get('selected_level')==level
+  m.delay(.8)
+  # The carousel discards Select during its original slide animation. Only
+  # retry when the same scene is still open with the same highlighted level.
+  for control in ('carousel.confirm','footer.confirm','carousel.confirm'):
+   if any(ident(surface['root'])==0x44 for surface in p.observe().get('surfaces',[])):break
+   assert carousel_debug(p).get('selected_level')==level
+   click(control,0x4b);m.delay(.6)
+  click(0x48,0x44)
+  wait_lobby(p)
+  m.wait(lambda:lobby_setup('host').get('map')==level,12)
+
+ def join(round_number):
+  if round_number==1:
+   m.start_role('client',m.a.client_language)
+  else:
+   m.wait(lambda:m.state('client').get('scene')==3 and not m.state('client').get('active') and not m.state('client').get('returning'),30)
+   for _ in range(6):
+    old=m.state('client').get('page')
+    if not old:break
+    p.expect_root(0x148,'client');p.back('client')
+    m.wait(lambda:m.state('client').get('page')!=old,10)
+  online('client',round_number)
+  click(0x14a,0x148,'client');page(p,3,'client')
+  click(0x14b,0x148,'client');page(p,8,'client')
+  def fresh_room():
+   state=m.copied_json('client','lan-browser-state.json',browser_cache)
+   rooms=state.get('rooms',[])
+   if len(rooms)!=1:return None
+   room=rooms[0]
+   if room.get('joinable') and room.get('port')==m.a.port and room.get('session_id') not in sessions:return room
+  m.wait(fresh_room,25);sessions.append(fresh_room()['session_id'])
+  click(0x14a,0x148,'client')
+  m.wait(lambda:m.state().get('players')==2,25);wait_lobby(p,'client')
+
+ def leave_play():
+  # Both players may receive the level briefing on entry. Use the regular
+  # NETRICSA Back key and give its closing animation time before opening Esc.
+  def in_game():
+   for role in roles:
+    if m.state(role).get('info'):
+     if m.information(role).get('surfaces'):m.press(role,'KEY_TAB')
+     return False
+    if p.ack(role).get('presentation'):
+     if not p.observe(role).get('has_surface'):p.click_uv([.98,.05],role)
+     return False
+   return True
+  m.wait(in_game,45);m.delay(.5)
+  open_pause(p,'host');click(0x12e,0x129);p.expect_root(0xffff)
+  def buttons():
+   return sorted((widget for surface in p.observe().get('surfaces',[]) if ident(surface['root'])==0xffff
+                  for widget in surface['widgets'] if ident(widget['type'])==1 and widget.get('selectable') and widget.get('allowed') and widget.get('event')==22),key=lambda w:p.center(w)[1])
+  m.wait(lambda:len(buttons())==2,10)
+  m.delay(.7)
+  for attempt in range(3):
+   if len(buttons())!=2:break
+   yes=buttons()[0]
+   def over_yes():
+    rows=buttons()
+    if len(rows)!=2:return False
+    p.move(p.center(rows[0]))
+    return p.observe().get('hover',{}).get('node')==rows[0]['node']
+   m.wait(over_yes,8);yes=buttons()[0]
+   if attempt==1 and m.state().get('native_focus')==yes['id']:m.press('host','KEY_ENTER')
+   else:
+    uv=p.center(yes);p.button(True,uv);m.delay(.1);p.button(False,uv)
+   m.delay(.6)
+  m.wait(lambda:m.state().get('scene')==3 and not m.state().get('active'),35)
+  p.expect_root(0x3d)
+  record(p,'native_pause_quit_confirmed',pid=m.processes['host'].pid)
+
+ for round_number in (1,2):
+  online('host',round_number)
+  if round_number==2:
+   p.back('host');p.expect_root(0x3d)
+   online('host','return-and-reopen')
+  click(0x14b,0x148);click(0xa9,0xa7);click(0x5d,0x59)
+  wait_lobby(p);select_level();join(round_number)
+  for role in roles:
+   if not lobby_setup(role).get('local_ready'):
+    click(0x159,0x9a,role);m.wait(lambda:lobby_setup(role).get('local_ready'),12)
+  m.wait(lambda:lobby_setup('host').get('can_start'),12)
+  click(0x152,0x9a)
+  m.wait(lambda:all(m.state(r).get('scene')==4 and m.performance(r).get('level')==level and
+                    m.performance(r).get('local_ready') and m.performance(r).get('ready_players')==2 for r in roles),95)
+  record(p,'campaign_running_after_online_selection',round=round_number,level=level,session_id=sessions[-1],
+         port=m.a.port,pids={role:m.processes[role].pid for role in roles})
+  if round_number==1:leave_play()
+
+
 def main():
  ap=argparse.ArgumentParser()
  for key in ('exe','data','card','output'):ap.add_argument('--'+key,type=Path,required=True)
- ap.add_argument('--case',choices=('lobby','gameplay','results','all'),default='all');ap.add_argument('--language',type=int,choices=(0,1,2),default=1);ap.add_argument('--client-language',type=int,choices=(0,1,2),default=2)
+ ap.add_argument('--case',choices=('lobby','gameplay','results','all','rehost'),default='all');ap.add_argument('--language',type=int,choices=(0,1,2),default=1);ap.add_argument('--client-language',type=int,choices=(0,1,2),default=2)
+ ap.add_argument('--online-icon',type=Path,help='Installed online-icon.png, copied beside each private game for the rehost regression.')
+ ap.add_argument('--scale',type=int,choices=range(1,9),default=1,help='Internal rendering scale of the private test processes.')
  ap.add_argument('--continue-method',choices=('mouse','keyboard'),default='mouse')
  ap.add_argument('--aspect',choices=('4x3','16x9','21x9'),default='16x9');ap.add_argument('--fps',type=int,default=60);ap.add_argument('--port',type=int,default=27940);ap.add_argument('--allow-start-key-fallback',action='store_true');a=ap.parse_args()
  for key in ('exe','data','card','output'):setattr(a,key,getattr(a,key).resolve())
+ if a.case=='rehost':
+  a.online_icon=a.online_icon or a.exe.parent/'online-icon.png'
+  if not a.online_icon.is_file():ap.error('rehost needs the installed online-icon.png beside the executable or supplied with --online-icon')
  a.output.mkdir(parents=True,exist_ok=False);original=sha(a.card);aspect,width={'4x3':(0,960),'16x9':(3,960),'21x9':(3,1260)}[a.aspect]
- a.private_settings='[graphics]\nrenderer=gpu\nscale=1\naspect='+str(aspect)+'\nhud_edges=1\nside_fill=1\nvsync=0\nwindow_w='+str(width)+'\nwindow_h=540\ntop_bar=0\nfullscreen=0\n[audio]\nmuted=1\n[general]\npause_unfocused=0\n'
+ a.private_settings='[graphics]\nrenderer=gpu\nscale='+str(a.scale)+'\naspect='+str(aspect)+'\nhud_edges=1\nside_fill=1\nvsync=0\nwindow_w='+str(width)+'\nwindow_h=540\ntop_bar=0\nfullscreen=0\n[audio]\nmuted=1\n[general]\npause_unfocused=0\n'
  a.test_env={'SSNE_TEST_DEVICE_INPUT':'1','SSNE_NATIVE_MOUSE_COMMAND':COMMAND_FILE,'SSNE_NATIVE_INFO_MOUSE_TRACE':'1'};m=MultiplayerMenus(a,'',a.output)
+ if a.case=='rehost':
+  a.private_settings+='skip_intros=1\n'
+  a.test_env.update(SSNE_DEV_CLIENT_UI='1',SSNE_MOUSE_DIAGNOSTICS_EAGER='1')
  report={'passed':False,'case':a.case,'continue_method':a.continue_method,'exe_sha256':sha(a.exe),'driver_sha256':sha(Path(__file__)),'language':a.language,'client_language':a.client_language,'aspect':a.aspect,'fps':a.fps,'steps':[],'scope':__doc__};p=Pointer(m,report)
  try:
-  m.start_role('host',a.language);m.wait(lambda:m.mouse().get('surfaces') and m.mouse_ack().get('image_rect'),20);p.command('host','cancel');host_create(p);client_join_and_roles(p)
-  if a.case!='lobby':
-   begin_campaign(p)
-   if a.case in ('gameplay','all'):gameplay_menus(p,keep_host_pause=a.case=='all')
-   if a.case in ('results','all'):results_menus(p)
-  leave_sessions(p)
+  m.start_role('host',a.language);m.wait(lambda:m.mouse().get('surfaces') and m.mouse_ack().get('image_rect'),20);p.command('host','cancel')
+  if a.case=='rehost':rehost_sessions(p)
+  else:
+   host_create(p);client_join_and_roles(p)
+   if a.case!='lobby':
+    begin_campaign(p)
+    if a.case in ('gameplay','all'):gameplay_menus(p,keep_host_pause=a.case=='all')
+    if a.case in ('results','all'):results_menus(p)
+   leave_sessions(p)
   report['passed']=not report.get('coverage_gaps')
  except Exception:
   report['error']=traceback.format_exc();print(report['error'],flush=True)

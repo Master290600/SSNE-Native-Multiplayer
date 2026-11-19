@@ -149,9 +149,12 @@ int main(){using namespace fixture;try{
     bind_extended(editor_descriptor);
     launcher::RuntimeKit editor_kit;
     check(launcher::load_runtime_kit(S(project),S(data),editor_kit,error) && editor_kit.protocol==70 && editor_kit.build==228,"Editor logic protocol70 kit rejected: "+error);
-    auto unknown_descriptor=qol_descriptor;unknown_descriptor.object()->at("protocol")=71;
+    auto vehicle_descriptor=editor_descriptor;vehicle_descriptor.object()->at("build")=246;vehicle_descriptor.object()->at("protocol")=71;
+    bind_extended(vehicle_descriptor);launcher::RuntimeKit vehicle_kit;
+    check(launcher::load_runtime_kit(S(project),S(data),vehicle_kit,error) && vehicle_kit.protocol==71 && vehicle_kit.build==246,"Campaign vehicle kit rejected: "+error);
+    auto unknown_descriptor=qol_descriptor;unknown_descriptor.object()->at("protocol")=72;
     bind_extended(unknown_descriptor);
-    check(!launcher::load_runtime_kit(S(project),S(data),survival_kit,error) && error.find("Unsupported native multiplayer runtime build/protocol")!=std::string::npos,"unknown future protocol71 not rejected by protocol validation");
+    check(!launcher::load_runtime_kit(S(project),S(data),survival_kit,error) && error.find("Unsupported native multiplayer runtime build/protocol")!=std::string::npos,"unknown future protocol not rejected by protocol validation");
     bind_extended(extended);launcher::RuntimeKit extended_kit;
     check(launcher::load_runtime_kit(S(project),S(data),extended_kit,error)&&extended_kit.files.size()==61,"extended renderer payload refused: "+error);
     put(native/"lib/optional-crosshair-2.obj","tampered optional renderer");

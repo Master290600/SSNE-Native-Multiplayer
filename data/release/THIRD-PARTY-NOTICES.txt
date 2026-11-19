@@ -18,7 +18,7 @@ texts are in the licenses folder.
 The fonts are embedded unmodified in SSNE-RECOOP-Native.exe. They are not sold on their own and keep their
 Reserved Font Names.
 
-The Windows 1.2.8.1 package includes LLVM-MinGW to compile the game locally. Its license is in
+The Windows 1.2.8.2 package includes LLVM-MinGW to compile the game locally. Its license is in
 build-kit/toolchain/LICENSE.TXT. Upstream releases are at https://github.com/mstorsjo/llvm-mingw.
 
 Internet invitation dependencies (compiled into the cooperative-session runtime):

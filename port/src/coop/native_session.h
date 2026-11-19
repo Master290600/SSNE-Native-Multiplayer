@@ -132,6 +132,7 @@ private:
     std::array<JoinPlacement,max_players> join_placements_{};
     bool queued_=false,host_ready_=false,client_ready_=false;
     std::chrono::steady_clock::time_point ready_retry_next_{};
+    std::chrono::steady_clock::time_point vehicle_roster_next_{};
     uint64_t ready_retry_epoch_=0;
     PlayerId ready_retry_owner_{};
     bool fixture_dumped_=false;

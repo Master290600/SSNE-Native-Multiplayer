@@ -159,7 +159,11 @@ inline uint32_t owned_icon_sprite(uint32_t gui,const Entry& e){
     const auto sprite=mem_read32(node+0xb4);
     // CcSprite retains its owner's animation parameters. Its pool address
     // alone may already identify a new widget while the old root fades out.
-    return readable(sprite,12) && mem_read32(sprite)==mem_read32(node+0x14)?sprite:0;
+    if(!readable(sprite,12) || mem_read32(sprite)!=mem_read32(node+0x14))return 0;
+    // Quad destruction installs a base vtable whose geometry setter aborts.
+    // RAM and animation parameters can still look valid during this interval.
+    const auto quad=mem_read32(sprite+8);
+    return readable(quad,4) && mem_read32(quad)==0x8021cb58u?sprite:0;
 }
 inline void after_update(PPCContext& c,uint32_t gui){
     const auto found=entries.find(gui);if(found==entries.end())return;auto& e=found->second;
@@ -173,17 +177,22 @@ inline void after_update(PPCContext& c,uint32_t gui){
     // Do not change its shared atlas alpha (the map/Ready images share it).
     if(!e.icon_shown){
         const auto sprite=owned_icon_sprite(gui,e),zero=e.scratch+3400;
-        if(sprite){const auto quad=mem_read32(sprite+8);if(readable(quad,4)){
-            const auto vt=mem_read32(quad);if(readable(vt,0x38)){mem_write32(zero,0);mem_write32(zero+4,0);invoke(c,mem_read32(vt+0x34),quad+int16_t(mem_read16(vt+0x30)),zero,zero);}
-        }}
+        if(sprite){
+            const auto quad=mem_read32(sprite+8),vt=mem_read32(quad);
+            mem_write32(zero,0);mem_write32(zero+4,0);
+            invoke(c,mem_read32(vt+0x34),quad+int16_t(mem_read16(vt+0x30)),zero,zero);
+        }
     }
 }
 inline void after_gui_update(PPCContext& c,uint32_t gui){
     const auto found=entries.find(gui);if(found==entries.end())return;
     // ClosePanel frees this widget tree while its CcGUI survives. Stop all
     // camera/quad updates the moment the original detaches the Online root.
+    uint32_t previous=0;
     for(auto root=mem_read32(gui+0x6c);readable(root,0x60);root=mem_read32(root+8)){
+        if(mem_read32(root+0xc)!=previous || mem_read32(root+0x20)!=gui || mem_read32(root+0x24))break;
         if(root==found->second.root){after_update(c,gui);return;}
+        previous=root;
     }
     entries.erase(found);
 }
@@ -191,7 +200,15 @@ inline Nodes prepare(PPCContext& c,uint32_t gui,uint32_t root,uint32_t scratch,
                      const std::array<std::string,3>& labels,const std::array<std::string,3>& values,
                      bool shown,uint32_t callback=0x800ff15c){
     auto* found=entry(gui,root,scratch);if(!found || found->busy)return {};auto& e=*found;Busy guard(e);e.shown=shown;
-    if(!shown){for(unsigned i=0;i<node_count-1;++i)visibility(c,e.nodes.all[i],false);after_update(c,gui);return e.nodes;}
+    if(!shown){
+        for(unsigned i=0;i<node_count-1;++i){
+            const auto node=e.nodes.all[i];
+            const auto id=first_id+i;
+            const unsigned type=id==character_id?3:id==preview_id?7:1;
+            if(owns(node,gui,root,id,type))visibility(c,node,false);
+        }
+        after_update(c,gui);return e.nodes;
+    }
     constexpr std::array<float,3> label_y{-110,-40,30};
     for(unsigned i=0;i<label_y.size();++i){const auto node=create(c,gui,e,i,0x6b,1,80,label_y[i],false,.5f);e.nodes.all[i]=node;
         visibility(c,node,true);position(node,80,label_y[i]);text_scale(c,node,.5f);set_text(c,node,labels[i],scratch+1152+i*128);}
@@ -240,6 +257,7 @@ inline bool hidden_icon_sprite(uint32_t sprite){
 inline uint32_t home_icon(PPCContext& c,uint32_t gui,uint32_t root,uint32_t scratch,bool shown){
     auto* found=entry(gui,root,scratch);if(!found || found->busy)return 0;auto& e=*found;e.icon_shown=shown;
     if(shown)e.nodes.icon=e.nodes.all[11]=create(c,gui,e,11,0xad,6,-260,-50,false);
+    if(!owns(e.nodes.icon,gui,root,home_icon_id,6))return 0;
     visibility(c,e.nodes.icon,shown);if(shown)position(e.nodes.icon,-260,-50);after_update(c,gui);return e.nodes.icon;
 }
 inline void forget(uint32_t gui){entries.erase(gui);}

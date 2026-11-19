@@ -56,6 +56,22 @@ std::shared_ptr<WorldState> world(float time,float x,float bias){
     enemy.properties["unused_network_inventory"]=std::vector<int64_t>{1,2,3,4};w->entities.emplace(2,enemy);return w;
 }
 void frame_regressions(){
+    {
+        // Successive PAL Werebull positions recorded during a charge in Rlevel1_3.
+        const std::array<float,3> first{-148.631f,3.30809f,1398.73f}, next{-149.959f,3.30809f,1394.94f};
+        auto start=world(0,0,0),end=world(.1f,0,0);
+        auto& from=start->entities.at(2);auto& to=end->entities.at(2);
+        from.definition=to.definition=5;from.resource=to.resource="Werebull";
+        from.properties["position"]=first;to.properties["position"]=next;
+        ClientPresentation charge;
+        charge.push(start,100.,{0,1});charge.push(end,100.1,{0,1});
+        std::map<EntityId,EntityState> frame;
+        charge.sample_into(100.02,frame);
+        const auto rendered=std::get<std::array<float,3>>(frame.at(2).properties.at("position"));
+        require(rendered[2]<first[2] && rendered[2]>next[2],"A normal Werebull charge snapped to the last snapshot");
+        auto teleported=to;teleported.properties["position"]=std::array<float,3>{0,0,0};
+        require(!presentation_continuous(from,teleported,.1),"A teleported Werebull retained its old charge path");
+    }
     auto a=world(0,0,-.2f),b=world(.05f,1,.8f);b->revision=2;
     const auto a_entities=a->entities,b_entities=b->entities;const auto a_mission=a->mission,b_mission=b->mission;
     ClientPresentation p;require(p.push(a,100,{0,1}),"First sample did not establish epoch");require(!p.push(b,100.05,{0,1}),"Continuous second sample reset interpolation");

@@ -190,6 +190,7 @@ bool prepare(PPCContext& c,bool with_root=true){
         // Native close removes the completed root from the active list, while
         // this GUI's text allocation and event registrations remain valid.
         if(with_root && !item(c,group)){
+            online_setup_native::forget(gui);
             call(c,0x800F5940,registry.memory,gui,0);
             if(in_pause)prepare_pause(c);
             for(unsigned i=0;i<4;++i){bind(c,first+i,22);bind(c,first+i,12);}bind(c,group,23);invalidate_labels();
@@ -375,8 +376,8 @@ void hide_online_widgets(PPCContext& c){
     if(const auto node=online_setup_native::home_icon(c,gui,root,found->second.extra+4096,false))
         if(main_exit_native::readable(node,0xb8))bind_native_menu_image(mem_read32(node+0xb4),{});
 }
-void show(PPCContext& c,Page next){
-    if(!prepare(c))return;
+void show(PPCContext& c,Page next,unsigned previous_panel=group){
+    if(!prepare(c) || !item(c,group))return;
     hide_online_widgets(c);
     ++mouse_epoch;
     // A result GUI already owns its local player's native open-mask bit.
@@ -384,13 +385,16 @@ void show(PPCContext& c,Page next){
     if(!result_overlay)call(c,0x800F56E0,gui,in_pause?unsigned(std::max(0,ssne::netplay_local_player())):0u);
     changing=true;
     if(result_overlay){if(result_group_definition)mem_write32(result_group_definition+0xc,(mem_read32(result_group_definition+0xc)&~0x30u)|0x40u);}
-    else call(c,0x800F6178,gui,group);
+    else call(c,0x800F6178,gui,previous_panel);
     page=next;setup_restore_skin=next==Page::OnlineSetup;pending_room.reset();invalidate_labels();visible=true;editing=Edit::None;
     focus=next==Page::Connecting?3:0;call(c,0x800F60A0,gui,group,0);call(c,0x800FA5BC,item(c,first+focus));changing=false;wait_release=true;
     ssne::log_message("[native-network-menu] page="+std::to_string(unsigned(page))+" language="+std::to_string(native_menu_language()));
 }
 void close(PPCContext& c,unsigned target){
     hide_online_widgets(c);
+    // ClosePanel may recycle this tree at exactly the same guest address
+    // on the next visit, while the enclosing CcGUI and its scratch survive.
+    online_setup_native::forget(gui);
     ++mouse_epoch;
     if(result_overlay && !target){retire_result_overlay(c,true);return;}
     if(!target && active() && (page==Page::Bots || page==Page::Connection || page==Page::SessionOptions))handoff_release=true;
@@ -403,7 +407,9 @@ void close(PPCContext& c,unsigned target){
 void open_online(PPCContext& c,uint32_t owner,Page next=Page::Home){
     if(active() || changing || return_main_requested)return;
     gui=owner;in_pause=false;local_mode=false;setup_seen=false;action=99;main_idle_frames=0;
-    call(c,0x800F6178,gui,0x3d);show(c,next);
+    // Prepare the destination while the main menu still owns focus. Closing
+    // the source and reopening the destination is one native panel transition.
+    show(c,next,0x3d);
 }
 bool setup_event(PPCContext& c,uint32_t owner,unsigned id,unsigned event){
     if(!visible || page!=Page::OnlineSetup || owner!=gui)return false;
