@@ -22,9 +22,48 @@ public:
         target_=state.target;previous_=state.previous;stalled_=state.stalled;escape_=state.escape;moving_=state.moving;trail_.swap(state.trail);return true;
     }
     uint32_t target() const { return target_; }
+
+    struct FollowGoal {
+        std::array<float,3> position;
+        bool directly_reachable;
+    };
+
+    FollowGoal follow_goal(const std::array<float,3>& follower, const std::array<float,3>& leader, bool grounded,
+                           const std::function<bool(const std::array<float,3>&)>& route_clear) {
+        auto horizontal = [](const auto& a, const auto& b) { return std::hypot(a[0]-b[0], a[2]-b[2]); };
+        auto reached = [&](const auto& point) {
+            return horizontal(follower,point)<.85f && std::abs(follower[1]-point[1])<.5f;
+        };
+        if(grounded) {
+            if(!trail_.empty() && (horizontal(trail_.back(),leader)>24.f || std::abs(trail_.back()[1]-leader[1])>12.f))
+                trail_.clear();
+            if(trail_.empty() || horizontal(trail_.back(),leader)>.9f || std::abs(trail_.back()[1]-leader[1])>.4f)
+                trail_.push_back(leader);
+            if(trail_.size()>128)trail_.pop_front();
+        }
+        if(trail_.empty())return {follower,true};
+
+        const auto latest = grounded ? leader : trail_.back();
+        if(reached(latest) || route_clear(latest)) {
+            // The current leader or last landing is reachable without a detour.
+            trail_.erase(trail_.begin(),std::prev(trail_.end()));
+            return {latest,true};
+        }
+        while(trail_.size()>1 && reached(trail_.front()))trail_.pop_front();
+
+        // A recent confirmed corner can skip obsolete breadcrumbs. Try at most
+        // one such shortcut before handing over to the bounded terrain search.
+        if(trail_.size()>2) {
+            auto shortcut=std::prev(trail_.end(),2);
+            while(shortcut!=trail_.begin() && horizontal(follower,*shortcut)>10.f)--shortcut;
+            if(shortcut!=trail_.begin() && route_clear(*shortcut))trail_.erase(trail_.begin(),shortcut);
+        }
+        return {trail_.size()>1 ? trail_.front() : latest,false};
+    }
+
     Input update(const ssne::BotWorld& world, unsigned decision_ticks=1,const std::array<float,3>* fire_origin=nullptr,
                  const std::function<bool(const std::array<float,3>&)>& route_clear={},bool budgeted_turn=false,bool autonomous=false,float target_range=-1.f,
-                 bool leader_grounded=true) {
+                 bool leader_grounded=true,const std::array<float,3>* navigation_waypoint=nullptr) {
         Input input;
         if (!world.host.id || !world.client.id || !std::isfinite(world.yaw) || !std::isfinite(world.pitch)) { *this={}; return input; }
         const auto& p=world.client.position;
@@ -39,10 +78,11 @@ public:
         // Native support evidence distinguishes a walkable leader sample from
         // a jump. A height-only breadcrumb can never be reached after landing.
         // Autonomous goals are already validated navigation waypoints.
-        if ((autonomous || leader_grounded) && (trail_.empty() || std::hypot(world.host.position[0]-trail_.back()[0],world.host.position[2]-trail_.back()[2])>1.5f || std::abs(world.host.position[1]-trail_.back()[1])>.6f))
+        if (!navigation_waypoint && (autonomous || leader_grounded) && (trail_.empty() || std::hypot(world.host.position[0]-trail_.back()[0],world.host.position[2]-trail_.back()[2])>1.5f || std::abs(world.host.position[1]-trail_.back()[1])>.6f))
             trail_.push_back(world.host.position);
         if (trail_.size()>128) trail_.pop_front();
-        const auto follow_position=!autonomous && !leader_grounded?(trail_.empty()?p:trail_.back()):world.host.position;
+        const auto follow_position=navigation_waypoint?*navigation_waypoint:
+            !autonomous && !leader_grounded?(trail_.empty()?p:trail_.back()):world.host.position;
         const float follow_distance=std::hypot(follow_position[0]-p[0],follow_position[2]-p[2]);
         // Rejoin the route after passing a waypoint or returning to the leader.
         // Height matters: a point on a floor above us has not been reached.
@@ -53,6 +93,7 @@ public:
             const float t=std::clamp(((point[0]-previous_[0])*x+(point[2]-previous_[2])*z)/length,0.f,1.f);
             return std::hypot(point[0]-previous_[0]-t*x,point[2]-previous_[2]-t*z)<.5f && std::abs(point[1]-previous_[1]-t*(p[1]-previous_[1]))<.6f;
         };
+        if(!navigation_waypoint){
         auto reached=trail_.begin();
         for(auto it=trail_.begin();it!=trail_.end();++it)if(reached_point(*it))reached=it;
         trail_.erase(trail_.begin(),reached);
@@ -68,6 +109,7 @@ public:
         }
         if(!trail_.empty() && follow_distance<2.f && std::abs(follow_position[1]-p[1])<.6f && !autonomous)
             trail_.erase(trail_.begin(),std::prev(trail_.end()));
+        }
         const ssne::BotActor* enemy=nullptr;
         const float range=std::isfinite(target_range)?(target_range<0.f?(autonomous?60.f:30.f):std::clamp(target_range,0.f,250.f)):0.f;
         float best=range+1.f;
@@ -105,13 +147,13 @@ public:
         else stalled_=0;
         if (stalled_>32) { escape_=60; stalled_=0; }
         previous_=p;
-        const bool detour=!autonomous && trail_.size()>1 && follow_distance>=2.f;
+        const bool detour=!navigation_waypoint && !autonomous && trail_.size()>1 && follow_distance>=2.f;
         // Navigation can return fine-grid points less than .3 m away.
         // Keep walking until its tighter arrival test can consume the point.
-        moving_=follow_distance>(autonomous?.1f:3.5f) || std::abs(follow_position[1]-p[1])>1.2f || detour;
+        moving_=follow_distance>(autonomous || navigation_waypoint ? .1f : 3.5f) || std::abs(follow_position[1]-p[1])>1.2f || detour;
         if(!moving_){stalled_=0;escape_=0;}
         if (moving_) {
-            auto destination=autonomous || trail_.empty()?follow_position:trail_.front();
+            auto destination=navigation_waypoint || autonomous || trail_.empty()?follow_position:trail_.front();
             float route_distance=std::hypot(destination[0]-p[0],destination[2]-p[2]);
             if (route_distance<.1f) { destination=follow_position; route_distance=follow_distance; }
             const float route_x=(destination[0]-p[0])/std::max(route_distance,.1f);

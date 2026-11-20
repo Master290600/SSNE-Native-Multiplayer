@@ -23,6 +23,9 @@ bool gpu_renderer_player_views_active();
 void gx_use_gpu(bool on);    // choose the renderer before boot (default: software)
 void gx_set_gpu_vertex(bool on);  // GPU renderer: texgen + lighting in the vertex shader (default on; before boot)
 bool gx_gpu_active();
+// Guest resource and loading hooks stage copies for the thread owning OpenGL.
+void gx_stage_weapon_effect_texture(uint32_t address, unsigned width, unsigned height, uint32_t format);
+void gx_allow_weapon_effect_uploads();
 
 // Render thread (GL context current):
 void gpu_renderer_set_shader_cache(const std::string& dir);  // before init: where compiled shaders are kept (empty: off)

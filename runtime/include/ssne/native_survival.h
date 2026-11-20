@@ -27,7 +27,7 @@ bool prepare_native_survival_player_start(PPCContext&,uint32_t actor,std::string
 // Guest thread only. No spawn selector, actor or random-generator mutation.
 bool capture_native_survival_anchors(std::vector<NativeSurvivalPoint>&,std::string& error);
 float native_survival_spawn_radius(unsigned definition);
-// Bounded, read-only native collision/floor queries around authored anchors.
+// Bounded native collision/floor queries around authored anchors and living players.
 // Return a supported clear sphere centre, separated from living players and
 // supplied occupied enemy positions. The ordinary factory owns all actor work.
 bool choose_native_survival_spawn(PPCContext&,unsigned definition,

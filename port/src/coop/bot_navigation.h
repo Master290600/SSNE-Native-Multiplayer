@@ -19,7 +19,7 @@ class BotNavigation {
     std::vector<Node> nodes_;
     std::map<std::array<int64_t,3>,unsigned> cells_;
     std::priority_queue<Entry> open_;
-    BotPoint target_{},last_{},path_goal_{};
+    BotPoint target_{},last_{},path_goal_{},advance_target_{};
     unsigned best_=0,cursor_=0,tip_=0,search_age_=0,stalled_=0,restarts_=0;
     bool solved_=false,advancing_=false;
     float cell_=1.25f;
@@ -64,7 +64,13 @@ public:
         const auto goal=goal_supported?requested_goal:target_;
         if(nodes_.empty() || bot_distance(start,last_)>12.f || (!path_.empty() && bot_distance(goal,path_goal_)>8.f))begin(start,goal);
         const auto previous=last_;last_=start;
-        if(advancing_ && std::hypot(start[0]-previous[0],start[2]-previous[2])<.08f)++stalled_;else stalled_=0;
+        // A bot can slide sideways along a wall without approaching its
+        // waypoint. Measure progress along the route, not speed alone.
+        const float remaining=bot_distance(start,advance_target_);
+        if(advancing_ && remaining>.18f && bot_distance(previous,advance_target_)-remaining<.055f)
+            ++stalled_;
+        else
+            stalled_=0;
         if(stalled_>=12){cell_=.625f;begin(start,goal);}
         if(bot_distance(goal,target_)>.5f){
             // Finish a validated route prefix instead of resetting it whenever
@@ -119,12 +125,12 @@ public:
         };
         while(cursor_<path_.size() && reached_point(path_[cursor_]))++cursor_;
         if(cursor_<path_.size()){
-            if(auto safe=probe(start,path_[cursor_]);safe && valid(*safe)){advancing_=true;return *safe;}
+            if(auto safe=probe(start,path_[cursor_]);safe && valid(*safe)){advance_target_=*safe;advancing_=true;return *safe;}
             begin(start,goal);return start; // a door/actor may have blocked the old edge
         }
         path_.clear();cursor_=0;
         if(bot_distance(start,goal)<cell_*2.5f){
-            if(auto safe=probe(start,goal);safe && valid(*safe)){advancing_=bot_distance(start,*safe)>.1f;return *safe;}
+            if(auto safe=probe(start,goal);safe && valid(*safe)){advance_target_=*safe;advancing_=bot_distance(start,*safe)>.1f;return *safe;}
         }
         if(solved_ || exhausted){
             if(!solved_ && cell_> .625f)cell_=.625f;

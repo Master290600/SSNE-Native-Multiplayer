@@ -1,6 +1,7 @@
 // Internal GX state shared by the command processor, vertex pipeline, texture unit and rasterizer.
 // Register layouts follow the hardware (YAGCD / libogc / Dolphin naming).
 #pragma once
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -79,6 +80,8 @@ struct Texture : std::enable_shared_from_this<Texture> {
     bool intensity = false;
     bool font = false;           // one of the game's two text font atlases (gx_prompts.cpp)
 };
+constexpr unsigned weapon_effect_preload_count = 2;
+std::array<std::shared_ptr<const Texture>, weapon_effect_preload_count> take_weapon_texture_preloads();
 const Texture* get_texture(int map);                // texture bound to map 0..7 (decoded, cached)
 // Button prompts (gx_prompts.cpp): cache-key variant for a texture with this source fingerprint (0 = none), and
 // repainting of a freshly decoded font atlas (returns the variant it was painted for).

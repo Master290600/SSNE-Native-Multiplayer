@@ -38,20 +38,25 @@ bool SurvivalController::playing(unsigned slot,uint64_t generation)const{
 SurvivalStep SurvivalController::advance(const SurvivalObservation& o){
     if(clock_set_ && o.now_ms<last_ms_)return {state_,{},false};
     clock_set_=true;last_ms_=o.now_ms;pending_.clear();state_.active_enemies=std::min(o.live_enemies,1000000u);
-    if(state_.phase==SurvivalPhase::Waiting){
-        state_.waiting_mask=o.connected;state_.playing_mask=0;state_.phase_remaining_ms=0;
-        if(eligible(o) && !(o.connected&uint8_t(~o.voluntary_spectators)&uint8_t(~o.ready))){state_.phase=SurvivalPhase::Countdown;phase_started_ms_=o.now_ms;}
-    }
-    if(state_.phase==SurvivalPhase::Countdown){
-        state_.waiting_mask=o.connected;state_.playing_mask=0;
-        if(!eligible(o)){state_.phase=SurvivalPhase::Waiting;state_.phase_remaining_ms=0;return {state_,{},false};}
-        // A connected prestart player may still be loading the same map.
-        // Hold a full countdown until everyone who intends to play is ready;
-        // late joiners during Running still wait for the following round.
-        if(o.connected&uint8_t(~o.voluntary_spectators)&uint8_t(~o.ready)){state_.phase=SurvivalPhase::Waiting;state_.phase_remaining_ms=0;return {state_,{},false};}
+    if(state_.phase==SurvivalPhase::Waiting || state_.phase==SurvivalPhase::Countdown){
+        state_.waiting_mask=o.connected;
+        state_.playing_mask=0;
+        const auto intended=uint8_t(o.connected&~o.voluntary_spectators);
+        const auto starters=eligible(o);
+        // A connected player can be network-ready while native placement is
+        // still pending. Give everyone a full countdown once they can play.
+        if(!intended || starters!=intended){
+            state_.phase=SurvivalPhase::Waiting;
+            state_.phase_remaining_ms=0;
+            return {state_,{},false};
+        }
+        if(state_.phase==SurvivalPhase::Waiting){
+            state_.phase=SurvivalPhase::Countdown;
+            phase_started_ms_=o.now_ms;
+        }
         state_.phase_remaining_ms=remaining(o.now_ms,phase_started_ms_,config_.countdown_ms);
         if(state_.phase_remaining_ms)return {state_,{},false};
-        state_.phase=SurvivalPhase::Running;state_.members=eligible(o);state_.member_generations=o.generations;
+        state_.phase=SurvivalPhase::Running;state_.members=starters;state_.member_generations=o.generations;
         state_.eliminated_mask=0;round_started_ms_=add(phase_started_ms_,config_.countdown_ms);next_spawn_ms_=round_started_ms_;spawned_wave_=0;
     }
     if(state_.phase==SurvivalPhase::Running){

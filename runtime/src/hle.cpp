@@ -2734,11 +2734,32 @@ void install_backdrop_scroll() {
     ssne_install_hook(address,hle_backdrop_scroll);
 }
 
+// The PAL resource loader gives GX the original encoded data during texture
+// construction. Copy the matched effect pixels before the guest can unload them.
+constexpr uint32_t kPalInitTexture = 0x801D7980u;
+PPCFunc g_init_effect_texture_original = nullptr;
+void hle_init_effect_texture(PPCContext& ctx) {
+    if (ctx.lr == 0x80131DECu)
+        gx_stage_weapon_effect_texture(ctx.r[4], ctx.r[5], ctx.r[6], ctx.r[7]);
+    ssne_call_original(ctx, kPalInitTexture, g_init_effect_texture_original);
+}
+
+void install_weapon_texture_preload() {
+    if (g_ver != &kVersions[1]) return;
+    const auto entry = ssne_find_func(kPalInitTexture);
+    constexpr uint32_t signature[]{0x7C0802A6u, 0x90010004u, 0x9421FFA0u, 0xBF010040u, 0x3B640000u, 0x3B850000u};
+    if (!entry || !code_matches(kPalInitTexture, signature)) return;
+    const auto prior = *ssne_hook_slot(kPalInitTexture);
+    g_init_effect_texture_original = prior ? prior : entry->func;
+    ssne_install_hook(kPalInitTexture, hle_init_effect_texture);
+}
+
 PPCFunc g_loading_bounds_original = nullptr;
 uint32_t g_loading_hold_offset = 0;
 uint32_t g_loading_bounds_address = 0, g_loading_bounds_return = 0;
 void hle_loading_bounds(PPCContext& ctx) {
     if(ctx.lr == g_loading_bounds_return && mem_read32(ctx.r[13] - g_loading_hold_offset) == 0) {
+        gx_allow_weapon_effect_uploads();
         const float wide = g_widescreen.load();
         if(wide > 1.001f) {
             gx_sync();
@@ -2811,6 +2832,7 @@ void install_savestates() {
     if (!ok) { fprintf(stdout, "[ssne] save states: frame flip not found (different game build?)\n"); return; }
     g_orig_flip = f->func;
     ssne_install_hook(g_ver->flip, hle_flip);
+    install_weapon_texture_preload();
     install_loading_aspect();
     install_boot_canvas_aspect();
     install_backdrop_scroll();

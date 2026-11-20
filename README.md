@@ -6,10 +6,10 @@ game locally from your own supported GameCube disc image.
 
 ## Download and play on Windows
 
-1. Download the Windows x64 launcher ZIP under **Assets** on the [1.2.8.2 release page](https://github.com/Master290600/SSNE-Native-Multiplayer/releases/tag/v1.2.8.2).
+1. Download the Windows x64 launcher ZIP under **Assets** on the [1.2.8.3 release page](https://github.com/Master290600/SSNE-Native-Multiplayer/releases/tag/v1.2.8.3).
 2. Extract the complete ZIP into a writable folder with a short ASCII path, such as `C:/Games/SSNE`.
 3. Run `SSNE-RECOOP-Native.exe`, select your own European GameCube disc image (G3BP9G, revision 0, English/French/German), and choose **Install Game** or **Build Game**. The package includes the compiler and recompiler.
-4. Choose **Play** or open `SSNE-Native-Game.exe` in the installation folder. Choose **Online** in the main menu to host or join. All participants should use version 1.2.8.2 (multiplayer build 250, protocol 71).
+4. Choose **Play** or open `SSNE-Native-Game.exe` in the installation folder. Choose **Online** in the main menu to host or join. All participants should use version 1.2.8.3 (multiplayer build 252, protocol 71).
 
 **Known issues:** Bots and the Survival game mode may still have bugs.
 
@@ -17,7 +17,9 @@ Build Game also installs the 15 official PS2 multiplayer maps, their previews, s
 
 The launcher includes **Map Editor (Alpha 0.13)**. Open **Map Editor** after building the game to edit a level, place enemies or create triggers. Press **F1** in the editor for a guided exercise in your game language. [Map Editor guide](docs/MAP-EDITOR.md)
 
-Upgrading from the public 1.2.8.1 release or earlier requires a manual update. Close the game and launcher, back up your saves and settings, and extract the complete 1.2.8.2 Windows ZIP into your installation folder. Open `SSNE-RECOOP-Native.exe` and choose **Update Game** or **Build Game**. The 1.2.8.1 updater only accepts multiplayer protocols up to 70. Version 1.2.8.2 uses protocol 71.
+From version 1.2.8.1 or 1.2.8.2, accept the GitHub update in the launcher. The launcher restarts and rebuilds an installed game automatically.
+
+For a manual update, close the game and launcher, back up your saves and settings, and extract the complete 1.2.8.3 Windows ZIP into your installation folder. Open `SSNE-RECOOP-Native.exe` and choose **Update Game** or **Build Game**. Version 1.2.8.3 uses multiplayer protocol 71.
 
 Open **F12 > Game and menu language** for English, German or French. F12 applies the choice immediately. Restart the game to apply the language to the original PAL menus.
 
@@ -72,7 +74,7 @@ size; **14** means 14/32 of that size, rather than 14 fixed screen pixels.
 - A GPU with **OpenGL 3.3** and an up-to-date driver, and about **3 GB** of free disk space.
 - **Linux:** a C++ compiler, which builds the game on your PC. `clang` is recommended (faster), `g++` works too:
   `sudo pacman -S clang` (Arch), `sudo apt install clang` (Debian/Ubuntu), `sudo dnf install clang` (Fedora).
-- **Windows:** the 1.2.8.2 launcher package includes the LLVM-MinGW compiler for the local game build.
+- **Windows:** the 1.2.8.3 launcher package includes the LLVM-MinGW compiler for the local game build.
 
 ## How to play
 

@@ -5,6 +5,12 @@ const bool cooperative=sample.mode==1;
 auto& brain=game_bots_[slot];
 if(brain.player!=controls[slot].id){brain={};brain.player=controls[slot].id;afk_bots_[slot]={};}
 const unsigned skill=automated?server_->bot_skill(slot):2;
+using FollowGoal=port::netplay::CompanionBot::FollowGoal;
+std::optional<FollowGoal> human_route;
+if(cooperative && leader!=actor && !swimming)
+    human_route=afk_bots_[slot].follow_goal(p,world.host.position,leader_grounded,route_clear);
+BotPoint goal=human_route ? human_route->position : world.host.position;
+EntityId pickup=0;
 if(automated){
     if(bot_distance(p,brain.goal)>2 && bot_distance(p,brain.previous)<.25f)++brain.goal_age;else brain.goal_age=0;
     if(brain.pickup && brain.goal_age>192){brain.deferred[brain.pickup]=afk_decisions_[slot]+240;brain.pickup=0;brain.goal_age=0;brain.navigation={};}
@@ -23,7 +29,7 @@ if(automated){
     // Regroup with a distant human before engaging remote enemies. Nearby
     // threats still permit self-defence while ordinary navigation continues.
     if(cooperative && leader!=actor && nearest>18.f)std::erase_if(world.enemies,[&](const auto& enemy){return bot_distance(p,enemy.position)>8.f;});
-    BotPoint goal=world.host.position;float best=0;EntityId pickup=0;
+    float best=0;
     const auto& owned=std::get<std::vector<int64_t>>(actor->properties.at("weapon_owned_counts"));
     const auto& ammo=std::get<std::vector<int64_t>>(actor->properties.at("ammo"));
     const auto& maximum=std::get<std::vector<int64_t>>(actor->properties.at("ammo_maximum"));
@@ -79,8 +85,14 @@ if(automated){
             pickup=0;
         }
     }
-    if(cooperative && !pickup && bot_distance(p,goal)<3.5f)goal=p;
-    brain.pickup=pickup;brain.goal=goal;
+    brain.pickup=pickup;
+}
+std::optional<BotPoint> movement_waypoint;
+if(automated || human_route){
+    const bool following=human_route.has_value() && !pickup;
+    const bool directly_reachable=following && human_route->directly_reachable;
+    if(following && directly_reachable && bot_distance(p,goal)<3.5f)goal=p;
+    brain.goal=goal;
     const auto radius=ssne::native_player_collision_radius(native_actor);
     bool goal_supported=swimming;
     if(radius && !swimming){
@@ -140,12 +152,22 @@ if(automated){
         }
         ++probe_stats[5];return current;
     };
-    if(goal_supported && (swimming || bot_distance(p,goal)<2.f || route_clear(goal)))world.host.position=goal;
-    else world.host.position=brain.navigation.step(p,goal,probe,48,goal_supported);
-    world.host.id=native_actor;world.host.health=health;
+    if(goal==p || (goal_supported && (swimming || directly_reachable || route_clear(goal)))){
+        movement_waypoint=goal;
+        if(brain.navigation.explored())brain.navigation={};
+    }else{
+        movement_waypoint=brain.navigation.step(p,goal,probe,automated ? 48 : 24,goal_supported);
+    }
+    // The AFK player keeps aiming relative to the actual human and sees the
+    // real separation for combat. Only its movement uses the checked waypoint.
+    if(automated){
+        world.host.position=*movement_waypoint;
+        world.host.id=native_actor;
+        world.host.health=world.client.health;
+    }
     if(log_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES") && afk_decisions_[slot]%8==0){
         const auto nav=brain.navigation.state();auto point=[](const BotPoint& v){return std::to_string(v[0])+","+std::to_string(v[1])+","+std::to_string(v[2]);};
-        log_("[game-bot-navigation] slot="+std::to_string(slot)+" position="+point(p)+" goal="+point(goal)+" waypoint="+point(world.host.position)+" nodes="+std::to_string(nav.nodes)+" open="+std::to_string(nav.open)+" path="+std::to_string(nav.path)+" cursor="+std::to_string(nav.cursor)+" best="+std::to_string(nav.best)+" tip="+std::to_string(nav.tip)+" age="+std::to_string(nav.age)+" restarts="+std::to_string(nav.restarts)+" solved="+std::to_string(nav.solved)+" root="+point(nav.root)+" next="+point(nav.next)+" frontier="+point(nav.frontier)+" probe_guard="+std::to_string(probe_stats[0])+" probe_floor="+std::to_string(probe_stats[1])+" probe_height="+std::to_string(probe_stats[2])+" probe_sweep="+std::to_string(probe_stats[3])+" probe_support="+std::to_string(probe_stats[4])+" probe_ok="+std::to_string(probe_stats[5])+" max_rise="+std::to_string(probe_rise));
+        log_("[game-bot-navigation] slot="+std::to_string(slot)+" position="+point(p)+" goal="+point(goal)+" waypoint="+point(*movement_waypoint)+" nodes="+std::to_string(nav.nodes)+" open="+std::to_string(nav.open)+" path="+std::to_string(nav.path)+" cursor="+std::to_string(nav.cursor)+" best="+std::to_string(nav.best)+" tip="+std::to_string(nav.tip)+" age="+std::to_string(nav.age)+" restarts="+std::to_string(nav.restarts)+" solved="+std::to_string(nav.solved)+" root="+point(nav.root)+" next="+point(nav.next)+" frontier="+point(nav.frontier)+" probe_guard="+std::to_string(probe_stats[0])+" probe_floor="+std::to_string(probe_stats[1])+" probe_height="+std::to_string(probe_stats[2])+" probe_sweep="+std::to_string(probe_stats[3])+" probe_support="+std::to_string(probe_stats[4])+" probe_ok="+std::to_string(probe_stats[5])+" max_rise="+std::to_string(probe_rise));
     }
-    if(log_ && afk_decisions_[slot]%16==0)log_("[game-bot-goal] slot="+std::to_string(slot)+" mode="+std::to_string(sample.mode)+" pickup="+std::to_string(pickup)+" goal="+std::to_string(goal[0])+","+std::to_string(goal[1])+","+std::to_string(goal[2])+" nodes="+std::to_string(brain.navigation.explored()));
+    if(automated && log_ && afk_decisions_[slot]%16==0)log_("[game-bot-goal] slot="+std::to_string(slot)+" mode="+std::to_string(sample.mode)+" pickup="+std::to_string(pickup)+" goal="+std::to_string(goal[0])+","+std::to_string(goal[1])+","+std::to_string(goal[2])+" nodes="+std::to_string(brain.navigation.explored()));
 }

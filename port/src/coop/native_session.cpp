@@ -890,7 +890,10 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
             const auto d=std::hypot(h[0]-p[0],h[2]-p[2]);
             if(d<=nearest+3.f){nearest=d;leader=actors[previous_follow];follow=previous_follow;}
         }
-        if(afk_follow_slots_[slot]!=follow)afk_bots_[slot]={};
+        if(afk_follow_slots_[slot]!=follow){
+            afk_bots_[slot]={};
+            game_bots_[slot].navigation={};
+        }
         afk_follow_slots_[slot]=follow;if(!leader)leader=actor; // defend self if all humans are dead/absent; never follow another AFK bot
         ssne::BotWorld world;world.host.id=native_.local_address(leader->id);world.host.position=std::get<std::array<float,3>>(leader->properties.at("position"));world.host.health=std::get<float>(leader->properties.at("health"));
         world.client.id=native_.local_address(actor->id);world.client.position=p;world.client.health=std::get<float>(actor->properties.at("health"));world.yaw=std::get<float>(actor->properties.at("yaw"));world.pitch=std::get<float>(actor->properties.at("pitch"));
@@ -971,7 +974,9 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
         };
         #include "native_game_bots.inc"
         const auto previous_target=afk_bots_[slot].target();
-        const auto decision=afk_bots_[slot].update(world,8,&eye,route_clear,true,automated,acquisition_range,automated || leader_grounded);ControlInput input;input.pad=decision.pad;input.yaw=decision.yaw;input.pitch=decision.pitch;
+        const auto decision=afk_bots_[slot].update(world,8,&eye,route_clear,true,automated,acquisition_range,
+            automated || leader_grounded,movement_waypoint ? &*movement_waypoint : nullptr);
+        ControlInput input;input.pad=decision.pad;input.yaw=decision.yaw;input.pitch=decision.pitch;
         if(automated){
             const auto target=afk_bots_[slot].target();if(target!=brain.target){brain.target=target;brain.reaction=skill==1?5:skill==2?3:1;}
             if(!target && bot_distance(world.host.position,p)<.7f && bot_distance(brain.goal,p)>2){const auto yaw=std::atan2(brain.goal[0]-p[0],brain.goal[2]-p[2]);input.yaw=int32_t(std::clamp(std::remainder(yaw-world.yaw,6.283185307f),-.5f,.5f)*1000000);}

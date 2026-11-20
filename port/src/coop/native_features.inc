@@ -43,12 +43,14 @@ bool NativeSession::update_survival_round(PPCContext& ctx,const NativeWorldSampl
         if(log_)log_("[survival-round-ready] level="+level_+" epoch="+std::to_string(sample.epoch)+" resources="+std::to_string(ssne::native_survival_resources_ready()));
     }
     const auto people=server_->participants();SurvivalObservation observation;observation.now_ms=uint64_t(survival_clock_ms_);observation.voluntary_spectators=server_->voluntary_spectator_mask();
-    std::vector<ssne::NativeSurvivalPoint> living,occupied;
+    std::array<ssne::NativeSurvivalPoint,max_players> positions{};
+    std::vector<ssne::NativeSurvivalPoint> occupied;
     for(unsigned slot=0;slot<capacity_;++slot){const auto& person=people[slot];if(!person.connected)continue;
         observation.connected|=uint8_t(1u<<slot);observation.generations[slot]=person.id.generation;if(person.ready)observation.ready|=uint8_t(1u<<slot);
         const auto actor=mem_read32(ssne::native_party_registry()+slot*4);
         if(ssne::native_player_collision_radius(actor) && u2f(mem_read32(actor+0xCC))>0.f && !mem_read32(actor+0x328) && !ssne::native_party_spawn_waiting(actor)){
-            observation.alive|=uint8_t(1u<<slot);if(!person.spectator)living.push_back({u2f(mem_read32(actor+0x20)),u2f(mem_read32(actor+0x24)),u2f(mem_read32(actor+0x28))});
+            observation.alive|=uint8_t(1u<<slot);
+            positions[slot]={u2f(mem_read32(actor+0x20)),u2f(mem_read32(actor+0x24)),u2f(mem_read32(actor+0x28))};
         }
     }
     unsigned new_kills=0;
@@ -73,20 +75,56 @@ bool NativeSession::update_survival_round(PPCContext& ctx,const NativeWorldSampl
         // closed; respawning here would invalidate its pending actions.
         if(feature_menu() || native_frontend_pending_actions())return changed;
         ssne::gx_sync();
-        for(const auto& [id,e]:sample.entities)if(e.kind==EntityKind::Enemy || e.kind==EntityKind::Projectile){std::string why;if(!remove_native_entity(ctx,native_.local_address(id),why)){report("Survival round cleanup: "+why);return changed;}changed=true;}
-        survival_monsters_.clear();survival_kills_=0;server_->set_spectator_lock(0);survival_.restart(observation.now_ms);
-        if(log_)log_("[survival-round-restart] round="+std::to_string(survival_.state().round));
-    }else for(const auto& request:step.spawns){
-        bool success=false;std::string why;ssne::NativeSurvivalPoint position{};
-        if(!living.empty() && ssne::choose_native_survival_spawn(ctx,request.definition,living,occupied,++survival_spawn_counter_,position,why)){
-            EntityState seed;seed.id=(uint64_t(1)<<62)|survival_spawn_counter_;seed.kind=EntityKind::Enemy;seed.definition=request.definition;seed.properties={{"position",position},{"spawn_position",position}};
-            if(const auto actor=create_native_enemy(ctx,seed,why)){
-                success=true;changed=true;occupied.push_back(position);const auto id=native_.local_entity_id(actor);if(id)survival_monsters_[id]=true;
-                if(log_)log_("[survival-spawn] round="+std::to_string(step.state.round)+" wave="+std::to_string(step.state.wave)+" type="+std::to_string(request.definition)+" entity="+std::to_string(id)+" actor="+std::to_string(actor));
+        std::vector<std::pair<uint32_t,EntityKind>> removals;
+        // Retire projectiles before the actors they can reference. Validate
+        // the full batch before changing the old round's world.
+        for(const auto kind:{EntityKind::Projectile,EntityKind::Enemy}){
+            for(const auto& [id,entity]:sample.entities){
+                if(entity.kind!=kind)continue;
+                const auto actor=native_.local_address(id);
+                std::string error;
+                if(!validate_native_removal(ctx,actor,error)){
+                    report("Survival round cleanup: "+error);
+                    return changed;
+                }
+                if(kind==EntityKind::Enemy && !native_render_binding(actor,kind)){
+                    report("Survival round cleanup: native enemy render binding unavailable");
+                    return changed;
+                }
+                removals.emplace_back(actor,kind);
             }
         }
-        survival_.finish_spawn(request.ticket,success);
-        if(!success && log_ && survival_spawn_counter_%8==1)log_("[survival-spawn-wait] "+why);
+        for(const auto& [actor,kind]:removals){
+            std::string error;
+            if(!remove_native_entity(ctx,actor,error,kind)){
+                report("Survival round cleanup: "+error);
+                return changed;
+            }
+            changed=true;
+        }
+        survival_monsters_.clear();survival_kills_=0;survival_.restart(observation.now_ms);
+        locked=0;
+        server_->set_spectator_lock(locked);
+        if(log_)log_("[survival-round-restart] round="+std::to_string(survival_.state().round));
+    }else if(!step.spawns.empty()){
+        // The controller's mask has already excluded same-tick late joins,
+        // newly eliminated players and any previous owner of a reused slot.
+        std::vector<ssne::NativeSurvivalPoint> living;
+        const auto targets=step.state.playing_mask&observation.ready;
+        for(unsigned slot=0;slot<capacity_;++slot)
+            if(targets&(1u<<slot))living.push_back(positions[slot]);
+        for(const auto& request:step.spawns){
+            bool success=false;std::string why;ssne::NativeSurvivalPoint position{};
+            if(!living.empty() && ssne::choose_native_survival_spawn(ctx,request.definition,living,occupied,++survival_spawn_counter_,position,why)){
+                EntityState seed;seed.id=(uint64_t(1)<<62)|survival_spawn_counter_;seed.kind=EntityKind::Enemy;seed.definition=request.definition;seed.properties={{"position",position},{"spawn_position",position}};
+                if(const auto actor=create_native_enemy(ctx,seed,why)){
+                    success=true;changed=true;occupied.push_back(position);const auto id=native_.local_entity_id(actor);if(id)survival_monsters_[id]=true;
+                    if(log_)log_("[survival-spawn] round="+std::to_string(step.state.round)+" wave="+std::to_string(step.state.wave)+" type="+std::to_string(request.definition)+" entity="+std::to_string(id)+" actor="+std::to_string(actor));
+                }
+            }
+            survival_.finish_spawn(request.ticket,success);
+            if(!success && log_ && !why.empty() && survival_spawn_counter_%8==1)log_("[survival-spawn-wait] "+why);
+        }
     }
     if(log_ && (before.phase!=survival_.state().phase || before.wave!=survival_.state().wave || before.eliminated_mask!=survival_.state().eliminated_mask))log_("[survival-state] round="+std::to_string(survival_.state().round)+" phase="+std::to_string(unsigned(survival_.state().phase))+" wave="+std::to_string(survival_.state().wave)+" playing="+std::to_string(survival_.state().playing_mask)+" locked="+std::to_string(locked)+" ms="+std::to_string(survival_.state().survival_ms));
     return changed;
@@ -153,7 +191,11 @@ void NativeSession::update_feature_hud(PPCContext& ctx){
     if(own.slot<max_players && state->players[own.slot].id==own && state->players[own.slot].spectator){
         const auto target=spectator_target_?spectator_target_->slot:max_players;const auto name=target<max_players?native_name_input(state->players[target].name):tr(FrontText::Waiting);
         if(title.empty()){title=tr(FrontText::Watching)+": "+name;detail=tr(FrontText::WatchHelp);}
-        else if(feature_integer(state->mission,"Session.Survival.Phase")!=unsigned(SurvivalPhase::Defeat))detail=tr(FrontText::Watching)+": "+name+" | "+tr(FrontText::WatchHelp);
+        else if(feature_integer(state->mission,"Session.Survival.Phase")!=unsigned(SurvivalPhase::Defeat)){
+            const bool locked=(feature_integer(state->mission,"Session.Spectators.LockMask")&(1u<<own.slot))!=0;
+            if(target<max_players)detail=tr(FrontText::Watching)+": "+name+" | "+tr(FrontText::WatchHelp);
+            else if(locked)detail=tr(FrontText::RoundWait);
+        }
     }
     ssne::update_native_session_hud(ctx,title.substr(0,100),detail.substr(0,120),!title.empty());
 }

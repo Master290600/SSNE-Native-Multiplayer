@@ -1,10 +1,14 @@
 // Texture unit: decodes GX texture formats (tiled, big-endian) into RGBA8, with TLUT support.
 #include <cstdio>
+#include <atomic>
+#include <chrono>
+#include <mutex>
 #include <cstdlib>
 #include <algorithm>
 #include <unordered_map>
 
 #include "gx_internal.h"
+#include "ssne/gx_gpu.h"
 #include "ssne/movie_presentation.h"
 #include "ssne/ppc_context.h"
 
@@ -171,7 +175,7 @@ std::unordered_map<CacheKey, std::shared_ptr<Texture>, KeyHash> g_cache;
 // Streaming pixels need to survive an in-flight GPU command or software tile
 // job, but have no reason to stay in the static texture cache after their frame.
 decltype(g_cache) g_movie_cache;
-uint64_t g_next_tex_id = 1;
+std::atomic<uint64_t> g_next_tex_id{1};
 const Texture* g_bound[8] = {};
 
 // Cheap content fingerprint: a strided sample of the texture data (and the TLUT for palette formats).
@@ -189,7 +193,117 @@ uint32_t fingerprint(const Source& src, uint32_t size, uint32_t fmt, uint32_t tl
     return hsh;
 }
 
+
+// Exactly the two immutable PAL Data.ssg textures used by the first Desert
+// Hawk shot. Match the entire encoded mip chain before reusing decoded pixels.
+struct WeaponEffectTexture {
+    int size;
+    uint32_t format;
+    int mip_levels;
+    uint32_t encoded_size;
+    uint32_t sampled_hash;
+    uint64_t full_hash;
+    const char* name;
+};
+constexpr WeaponEffectTexture weapon_effects[]{
+    {32, 4, 3, 2720, 0xb1b4c9bbu, 0x108cc672c4fb85acull, "deserthawk_bulletcasing"},
+    {128, 14, 4, 10912, 0x41b049a0u, 0x42fce4394b8f44feull, "muzzleflash"},
+};
+
+struct PreparedEffect {
+    std::shared_ptr<Texture> texture;
+    bool submitted = false;
+};
+std::array<PreparedEffect, weapon_effect_preload_count> prepared_effects{};
+static_assert(std::size(weapon_effects) == weapon_effect_preload_count);
+std::mutex prepared_texture_mutex;
+std::atomic<bool> loading_screen_seen{false};
+std::atomic<bool> upload_pending{false};
+
+uint64_t full_texture_hash(const Source& source, uint32_t size) {
+    uint64_t hash = 14695981039346656037ull;
+    for (uint32_t i = 0; i < size; ++i) hash = (hash ^ source.b(i)) * 1099511628211ull;
+    return hash;
+}
+
+void decode_texture(Texture& texture, const Source& source, uint32_t fmt, int w, int h,
+                    uint32_t tlut, int levels) {
+    texture.w = w;
+    texture.h = h;
+    decode(source, fmt, w, h, tlut, texture.rgba);
+    auto offset = data_size(fmt, w, h);
+    for (int level = 1; level <= levels; ++level) {
+        const int mip_w = std::max(1, w >> level), mip_h = std::max(1, h >> level);
+        Source mip = source;
+        mip.addr += offset;
+        texture.mips.emplace_back();
+        decode(mip, fmt, mip_w, mip_h, tlut, texture.mips.back());
+        offset += data_size(fmt, mip_w, mip_h);
+    }
+}
+
+std::shared_ptr<Texture> prepared_weapon_texture(const Source& source, const CacheKey& key) {
+    if (source.tmem || key.variant || key.w != key.h) return {};
+    for (unsigned index = 0; index < std::size(weapon_effects); ++index) {
+        const auto& effect = weapon_effects[index];
+        if (key.w != unsigned(effect.size) || key.fmt != (effect.format | unsigned(effect.mip_levels) << 8) ||
+            key.sample != effect.sampled_hash || full_texture_hash(source, effect.encoded_size) != effect.full_hash)
+            continue;
+        std::lock_guard lock(prepared_texture_mutex);
+        return prepared_effects[index].texture;
+    }
+    return {};
+}
+
+bool weapon_preload_trace() {
+    static const bool enabled = getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_FIRST_SHOT_TEXTURE_TRACE");
+    return enabled;
+}
+
+double texture_preload_timestamp() {
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+void stage_weapon_texture(uint32_t address, unsigned w, unsigned h, uint32_t fmt) {
+    if (!gpu_enabled() || w != h || (address & 31u) || address < 0x80000000u) return;
+    for (unsigned index = 0; index < std::size(weapon_effects); ++index) {
+        const auto& effect = weapon_effects[index];
+        if (w != unsigned(effect.size) || fmt != effect.format ||
+            uint64_t(address) + effect.encoded_size > guest_ram_end()) continue;
+        const Source source{nullptr, address};
+        if (fingerprint(source, effect.encoded_size, fmt, 0) != effect.sampled_hash ||
+            full_texture_hash(source, effect.encoded_size) != effect.full_hash) continue;
+        std::lock_guard lock(prepared_texture_mutex);
+        auto& entry = prepared_effects[index];
+        if (entry.texture) return;
+        auto texture = std::make_shared<Texture>();
+        texture->id = g_next_tex_id.fetch_add(1, std::memory_order_relaxed);
+        decode_texture(*texture, source, fmt, effect.size, effect.size, 0, effect.mip_levels);
+        if (weapon_preload_trace())
+            fprintf(stderr, "[weapon-preload] utc=%.6f stage=captured asset=%s id=%llu size=%dx%d\n",
+                    texture_preload_timestamp(), effect.name, (unsigned long long)texture->id, effect.size, effect.size);
+        entry.texture = std::move(texture);
+        upload_pending.store(true, std::memory_order_release);
+        return;
+    }
+}
+
 } // namespace
+
+std::array<std::shared_ptr<const Texture>, weapon_effect_preload_count> take_weapon_texture_preloads() {
+    std::array<std::shared_ptr<const Texture>, weapon_effect_preload_count> textures;
+    if (!loading_screen_seen.load(std::memory_order_acquire) ||
+        !upload_pending.exchange(false, std::memory_order_acq_rel)) return textures;
+    std::lock_guard lock(prepared_texture_mutex);
+    for (unsigned index = 0; index < textures.size(); ++index) {
+        auto& effect = prepared_effects[index];
+        if (effect.texture && !effect.submitted) {
+            textures[index] = effect.texture;
+            effect.submitted = true;
+        }
+    }
+    return textures;
+}
 
 std::shared_ptr<const Texture> texture_ref(const Texture* t) {
     return t ? t->shared_from_this() : nullptr;
@@ -286,20 +400,14 @@ const Texture* get_texture(int map) {
     if (prompt_candidate_size(w, h)) key.variant = prompt_variant(key.sample);
     auto it = cache.find(key);
     if (it == cache.end()) {
-        auto t = std::make_shared<Texture>();
-        t->w = w; t->h = h;
-        t->id = g_next_tex_id++ | (streaming ? movie_presentation::streaming_texture_bit : 0);
-        decode(src, fmt, w, h, tlut, t->rgba);
-        uint32_t off = size;
-        for (int k = 1; k <= levels; k++) {
-            int lw = std::max(1, w >> k), lh = std::max(1, h >> k);
-            Source ls = src;
-            ls.addr += off;
-            t->mips.emplace_back();
-            decode(ls, fmt, lw, lh, tlut, t->mips.back());
-            off += data_size(fmt, lw, lh);
+        auto t = streaming ? nullptr : prepared_weapon_texture(src, key);
+        if (!t) {
+            t = std::make_shared<Texture>();
+            t->id = g_next_tex_id.fetch_add(1, std::memory_order_relaxed) |
+                    (streaming ? movie_presentation::streaming_texture_bit : 0);
+            decode_texture(*t, src, fmt, w, h, tlut, levels);
+            counters.textures_decoded++;
         }
-        counters.textures_decoded++;
         if (prompt_candidate_size(w, h) && levels == 0) {
             key.variant = prompt_apply(*t, key.sample);
         }
@@ -310,3 +418,15 @@ const Texture* get_texture(int map) {
 }
 
 } // namespace ssne::gx
+
+namespace ssne {
+void gx_stage_weapon_effect_texture(uint32_t address, unsigned w, unsigned h, uint32_t fmt) {
+    gx::stage_weapon_texture(address, w, h, fmt);
+}
+
+void gx_allow_weapon_effect_uploads() {
+    if (gx::gpu_enabled() && !gx::loading_screen_seen.exchange(true, std::memory_order_acq_rel) &&
+        gx::weapon_preload_trace())
+        fprintf(stderr, "[weapon-preload] utc=%.6f stage=loading-screen\n", gx::texture_preload_timestamp());
+}
+} // namespace ssne

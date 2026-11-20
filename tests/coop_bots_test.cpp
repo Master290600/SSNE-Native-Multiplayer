@@ -102,6 +102,15 @@ int main(){
     };
     for(unsigned i=0;i<100 && bot_distance(stair_start,stair_goal)>.6f;++i){const auto next=stairs.step(stair_start,stair_goal,stair_probe,24);if(next!=stair_start){check(bool(stair_probe(stair_start,next)),"navigation bypassed native stair support");stair_start=next;}}
     check(bot_distance(stair_start,stair_goal)<=.6f,"supported native stairs were not followed");
+    // Sideways sliding may have plenty of displacement while making no
+    // progress down the route. The search must eventually restart at the bot.
+    BotNavigation sliding;
+    const BotPoint slide_goal{9,0,0};
+    check(sliding.step(origin,slide_goal,open,128)[0]>0,"slide recovery setup has no waypoint");
+    const auto initial_search=sliding.state().restarts;
+    for(unsigned i=0;i<14;++i)sliding.step(BotPoint{0,0,.2f*(i+1)},slide_goal,open,24);
+    check(sliding.state().restarts>initial_search,"sideways wall scrape suppressed route recovery");
+
     BotNavigation invalid;unsigned invalid_queries=0;const BotPoint invalid_goal{NAN,0,0};
     check(invalid.step(origin,invalid_goal,[&](auto&,auto&)->std::optional<BotPoint>{++invalid_queries;return {};})==origin && !invalid_queries,"invalid navigation coordinates reached native queries");
     check(bot_weapon_pickup(43)==8 && bot_weapon_pickup(55)==11,"weapon mapping");
@@ -156,6 +165,30 @@ int main(){
         check(corner_clear(next),"companion cut a blocked corner before reaching its breadcrumb");corner_world.client.position=next;
     }
     check(bot_distance(corner_world.client.position,corner_world.host.position)<=3.5f,"companion failed to follow the moving human around a corner");
+    // A nearby team member can still be around a corner. Use a confirmed
+    // turn and preserve it while the leader is airborne. Retire it after
+    // the follower rounds the same corner and sees the leader again.
+    port::netplay::CompanionBot follower_controller;
+    const BotPoint ground_leader{0,0,4}, airborne_leader{2,3,2}, landed_leader{2,0,2};
+    auto blocked_route=[](const BotPoint&){return false;};
+    check(follower_controller.follow_goal(origin,ground_leader,true,blocked_route).position==ground_leader,
+          "first grounded breadcrumb was not acquired");
+    check(follower_controller.follow_goal(origin,airborne_leader,false,blocked_route).position==ground_leader,
+          "airborne leader overwrote last grounded breadcrumb");
+    const auto near_but_blocked=follower_controller.follow_goal(origin,landed_leader,true,blocked_route);
+    check(!near_but_blocked.directly_reachable && near_but_blocked.position==ground_leader,
+          "nearby leader behind a wall displaced the corner");
+    ssne::BotWorld at_wall;
+    at_wall.client={1,origin,100,1.6f};at_wall.host={2,landed_leader,100,1.6f};
+    const BotPoint checked_waypoint{0,0,.625f};
+    const auto checked_pad=follower_controller.update(at_wall,8,nullptr,blocked_route,true,false,120.f,true,&checked_waypoint).pad;
+    check(checked_pad.stick_x==128 && checked_pad.stick_y>128,"AFK ignored a checked waypoint inside its normal following distance");
+    const auto around_wall=follower_controller.follow_goal(ground_leader,landed_leader,true,[](const BotPoint&){return true;});
+    check(around_wall.directly_reachable && around_wall.position==landed_leader,"reachable leader did not resume direct follow");
+    const BotPoint new_area{100,0,4};
+    check(follower_controller.follow_goal(origin,new_area,true,blocked_route).position==new_area &&
+          follower_controller.checkpoint().trail.size()==1,"obsolete breadcrumbs survived a leader teleport");
+
     // Scraping a wall by two centimetres per decision must not suppress stall
     // recovery. Recovery is a checked world-space sidestep, with a neutral pad
     // when neither candidate has collision/support clearance.

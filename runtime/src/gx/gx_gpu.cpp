@@ -473,7 +473,7 @@ void rt_release(const RT& r) {
 }
 
 // ------------------------------------------------------------------ textures
-struct GlTex { GLuint tex; int w, h; uint64_t last_used; };
+struct GlTex { GLuint tex; uint64_t last_used; bool retained; };
 std::unordered_map<uint64_t, GlTex> g_textures;     // decoded RAM textures by Texture::id
 struct PooledTex { RT rt; uint64_t last_used; RT conv{}; int conv_fmt = -1; };
 // EFB copies by copy id: raw RGBA8 at internal res, plus (conv) the copy already encoded/decoded as the texture
@@ -553,6 +553,40 @@ GLuint efb_color_for_read(int x0, int y0, int x1, int y1) {
     return g_resolve_tex;
 }
 
+GLuint upload_ram_texture(const Texture& texture, bool retained) {
+    const char* prev_phase = g_phase;
+    g_phase = "texture upload";
+    const auto tex = make_tex(texture.w, texture.h, RGBA8, RGBA, UNSIGNED_BYTE, texture.rgba.data());
+    g_phase = prev_phase;
+    if (!texture.mips.empty()) {
+        for (size_t k = 0; k < texture.mips.size(); ++k)
+            TexImage2D(TEXTURE_2D, GLint(k + 1), GLint(RGBA8), std::max(1, texture.w >> (k + 1)),
+                       std::max(1, texture.h >> (k + 1)), 0, RGBA, UNSIGNED_BYTE, texture.mips[k].data());
+        TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, GLint(texture.mips.size()));
+    }
+    g_textures[texture.id] = {tex, g_frame_no, retained};
+    ++g_stats.uploads;
+    return tex;
+}
+
+bool trace_weapon_effects() {
+    static const bool trace = getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_FIRST_SHOT_TEXTURE_TRACE");
+    return trace;
+}
+
+void preload_weapon_effects() {
+    for (const auto& texture : gx::take_weapon_texture_preloads()) {
+        if (!texture) continue;
+        const auto found = g_textures.find(texture->id);
+        if (found == g_textures.end()) upload_ram_texture(*texture, true);
+        else found->second.retained = true;
+        if (trace_weapon_effects())
+            fprintf(stderr, "[weapon-preload] utc=%.6f stage=resident id=%llu size=%dx%d mips=%zu\n",
+                std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(),
+                (unsigned long long)texture->id, texture->w, texture->h, texture->mips.size());
+    }
+}
+
 GLuint texture_for(const Texture* t) {
     if (!t || t->w == 0) return g_white;
     if (t->efb_copy >= 0) {
@@ -621,29 +655,22 @@ GLuint texture_for(const Texture* t) {
     }
     auto it = g_textures.find(t->id);
     if (it != g_textures.end()) { it->second.last_used = g_frame_no; return it->second.tex; }
-    const char* prev_phase = g_phase;
-    g_phase = "texture upload";
-    GLuint tex = make_tex(t->w, t->h, RGBA8, RGBA, UNSIGNED_BYTE, t->rgba.data());
-    g_phase = prev_phase;
-    if (!t->mips.empty()) {
-        for (size_t k = 0; k < t->mips.size(); k++)
-            TexImage2D(TEXTURE_2D, GLint(k + 1), GLint(RGBA8), std::max(1, t->w >> (k + 1)), std::max(1, t->h >> (k + 1)), 0,
-                       RGBA, UNSIGNED_BYTE, t->mips[k].data());
-        TexParameteri(TEXTURE_2D, TEXTURE_MAX_LEVEL, GLint(t->mips.size()));
-    }
-    g_textures[t->id] = {tex, t->w, t->h, g_frame_no};
-    g_stats.uploads++;
+
+    const auto tex = upload_ram_texture(*t, false);
+    if (trace_weapon_effects() && t->w == t->h && (t->w == 32 || t->w == 128))
+        fprintf(stderr, "[weapon-preload] utc=%.6f stage=draw-upload id=%llu size=%dx%d mips=%zu\n",
+                std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(),
+                (unsigned long long)t->id, t->w, t->h, t->mips.size());
     return tex;
 }
 
 void evict() {
-    auto sweep = [](auto& m, uint64_t age) {
-        for (auto it = m.begin(); it != m.end();) {
-            if (g_frame_no - it->second.last_used > age) { sc_delete_texture(it->second.tex); it = m.erase(it); }
-            else ++it;
-        }
-    };
-    sweep(g_textures, 600);
+    for (auto it = g_textures.begin(); it != g_textures.end();) {
+        if (!it->second.retained && g_frame_no - it->second.last_used > 600) {
+            sc_delete_texture(it->second.tex);
+            it = g_textures.erase(it);
+        } else ++it;
+    }
     auto sweep_rt = [](auto& m, uint64_t age) {
         for (auto it = m.begin(); it != m.end();) {
             if (g_frame_no - it->second.last_used > age) {
@@ -2312,6 +2339,7 @@ bool gpu_renderer_run(int max_frames) {
     if (!g_ready) return false;
     perf::detail::Frame presentation_frame(perf::detail::Presentation);
     poll_pending();
+    preload_weapon_effects();
     prewarm(g_parallel ? 2.0 : 4.0);
     uint64_t before = g_out_seq;
     for (int i = 0; i < max_frames; i++) {

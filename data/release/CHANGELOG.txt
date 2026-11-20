@@ -1,3 +1,11 @@
+SSNE-RECOOP-Native 1.2.8.3 (Windows x64, multiplayer build 252, protocol 71)
+
+  - Preloads the opening pistol's muzzle-flash and casing textures during level loading to reduce the first-shot hitch.
+  - Co-op bots and players using AFK assist follow teammates more reliably over jumps and around obstacles, with better recovery when blocked.
+  - Survival waits for players to spawn before starting waves and adapts enemy spawn positions when arena spawn points are blocked or too far from the team.
+  - Survival handles player death, re-entry and round transitions more reliably.
+  - Known issues: Bots and Survival can still have bugs.
+
 SSNE-RECOOP-Native 1.2.8.2 (Windows x64, multiplayer build 250, protocol 71)
 
   - Clients can walk up to, enter, drive and exit the first Jeep in Via Aurelia while the host is still reading the opening NETRICSA briefing. The Jeep now has working collision for the client in that situation.

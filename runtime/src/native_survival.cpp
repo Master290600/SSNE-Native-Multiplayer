@@ -250,34 +250,80 @@ bool choose_native_survival_spawn(PPCContext& c,unsigned definition,const std::v
     for(const auto& p:players)if(!point_valid(p)){error="Invalid Survival player position";return false;}
     for(const auto& p:occupied)if(!point_valid(p)){error="Invalid Survival occupied position";return false;}
     std::vector<NativeSurvivalPoint> anchors;if(!capture_native_survival_anchors(anchors,error))return false;
-    // Eight samples per authored anchor, capped independently of map size.
-    const unsigned attempts=std::min(48u,unsigned(anchors.size())*8u);
-    for(unsigned attempt=0;attempt<attempts;++attempt){
-        auto p=anchors[(selection+attempt)%anchors.size()];const unsigned ring=attempt/unsigned(anchors.size());const float angle=6.28318530718f*float((selection+attempt*5u+ring*3u)%16u)/16.f;
-        // The first local ring must clear the12m+radius minimum. Distinct
-        // ring angles avoid sampling only the same two compass directions.
-        const float spread=ring?16.f+8.f*float((ring-1)/2):0.f;p[0]+=std::sin(angle)*spread;p[2]+=std::cos(angle)*spread;
-        auto above=p,below=p;above[1]+=8.f;below[1]-=16.f;std::optional<NativeSegmentHit> floor;
-        if(!native_world_segment(c,above,below,floor,error))return false;
-        if(!floor || floor->normal[1]<.725f)continue;
-        p[1]=floor->position[1]+radius/floor->normal[1]+.05f;
-        float nearest=std::numeric_limits<float>::max();unsigned near_player=0;
-        for(unsigned i=0;i<players.size();++i){const auto d=distance(p,players[i]);if(d<nearest){nearest=d;near_player=i;}}
-        // Use the nearest actual target's floor, rather than spawning under a
-        // distant raised platform. A ground enemy needs a reachable height and
-        // a direct unobstructed attack route; blocked fallbacks caused idle AI.
-        if(std::abs(floor->position[1]-players[near_player][1])>4.f)continue;
-        if(nearest<12.f+radius || nearest>100.f)continue;
-        if(std::any_of(occupied.begin(),occupied.end(),[&](const auto& q){return distance(p,q)<2*radius+1.f;}))continue;
-        // A nonzero native sweep detects an embedded sphere, unlike a zero
-        // length query. The native correction must leave this location intact.
-        auto down=p;down[1]-=.05f;NativeSphereResult volume;
-        if(!native_world_sphere(c,p,down,radius,volume,error))return false;
-        if(distance(volume.position,p)>.15f)continue;
-        auto target=players[near_player];target[1]+=.5f;std::optional<NativeSegmentHit> sight;
-        if(!native_world_segment(c,p,target,sight,error))return false;
-        if(!sight){chosen=p;return true;}
+    const auto candidate_is_valid = [&](NativeSurvivalPoint p) {
+        constexpr float max_distance = 100.f;
+        if (std::none_of(players.begin(), players.end(), [&](const auto& player) {
+                return std::hypot(p[0] - player[0], p[2] - player[2]) <= max_distance;
+            })) return false;
+
+        auto above = p, below = p;
+        above[1] += 8.f;
+        below[1] -= 16.f;
+        std::optional<NativeSegmentHit> floor;
+        if (!native_world_segment(c, above, below, floor, error)) return false;
+        if (!floor || floor->normal[1] < .725f) return false;
+        p[1] = floor->position[1] + radius / floor->normal[1] + .05f;
+
+        const auto* nearest = &players.front();
+        float target_distance = distance(p, *nearest);
+        for (const auto& player : players) {
+            const float player_distance = distance(p, player);
+            if (player_distance < target_distance) {
+                nearest = &player;
+                target_distance = player_distance;
+            }
+        }
+        if (std::abs(floor->position[1] - (*nearest)[1]) > 4.f ||
+            target_distance < 12.f + radius || target_distance > max_distance) return false;
+        if (std::any_of(occupied.begin(), occupied.end(), [&](const auto& other) {
+                return distance(p, other) < 2 * radius + 1.f;
+            })) return false;
+
+        // A nonzero native sweep detects an embedded sphere.
+        auto down = p;
+        down[1] -= .05f;
+        NativeSphereResult volume;
+        if (!native_world_sphere(c, p, down, radius, volume, error) ||
+            distance(volume.position, p) > .15f) return false;
+
+        // A ground enemy needs a visible target on the same floor.
+        auto target = *nearest;
+        target[1] += .5f;
+        std::optional<NativeSegmentHit> sight;
+        if (!native_world_segment(c, p, target, sight, error) || sight) return false;
+        chosen = p;
+        return true;
+    };
+    const auto offset = [](NativeSurvivalPoint p, unsigned direction, float spread) {
+        const float angle = 6.28318530718f * float(direction % 16u) / 16.f;
+        p[0] += std::sin(angle) * spread;
+        p[2] += std::cos(angle) * spread;
+        return p;
+    };
+
+    // Prefer level-authored spawn points and their immediate surroundings.
+    const auto anchor_count = unsigned(anchors.size());
+    const unsigned attempts = std::min(48u, anchor_count * 8u);
+    for (unsigned attempt = 0; attempt < attempts; ++attempt) {
+        const unsigned ring = attempt / anchor_count;
+        const float spread = ring ? 16.f + 8.f * float((ring - 1) / 2) : 0.f;
+        const auto p = offset(anchors[(selection + attempt) % anchor_count],
+                              selection + attempt * 5u + ring * 3u, spread);
+        if (candidate_is_valid(p)) return true;
+        if (!error.empty()) return false;
     }
-    error="No visible same-floor Survival spawn point away from living players";return false;
+
+    // A team can move beyond the arena starts or behind geometry that hides
+    // all authored sites. Sample around current survivors with the same checks.
+    const auto player_count = unsigned(players.size());
+    for (unsigned attempt = 0; attempt < 16; ++attempt) {
+        const unsigned ring = attempt / player_count;
+        const auto p = offset(players[(selection + attempt) % player_count],
+                              selection * 3u + attempt * 5u, ring % 2 == 0 ? 20.f : 32.f);
+        if (candidate_is_valid(p)) return true;
+        if (!error.empty()) return false;
+    }
+    error = "No visible same-floor Survival spawn point near living players";
+    return false;
 }
 }
