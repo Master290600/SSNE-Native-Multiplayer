@@ -49,6 +49,9 @@ int pad_motor(int port);
 // Called by the disc reader with the name of every file the game reads (drives "skip intros").
 void intro_skip_file_read(const char* name);
 
+// Native sensitivity multiplier used by mouse look, including the scope zoom.
+double mouse_look_scale(uint32_t player);
+
 // SI hardware (0xCC006400)
 uint16_t si_read16(uint32_t off);
 void si_write16(uint32_t off, uint16_t v);

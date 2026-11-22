@@ -8,7 +8,7 @@
 #include <functional>
 namespace ssne {
 void native_party_install_ground_collision();
-struct NativeSegmentHit {std::array<float,3> position{},normal{};uint32_t flags=0;};
+struct NativeSegmentHit {std::array<float,3> position{},normal{};uint32_t flags=0,source_kind=0;};
 // Executes the native PAL geometry query at a guest-thread safe point. No hit
 // is distinct from unavailable/invalid context; callers must check both.
 bool native_world_segment(PPCContext&,const std::array<float,3>& from,const std::array<float,3>& to,std::optional<NativeSegmentHit>& hit,std::string& error);

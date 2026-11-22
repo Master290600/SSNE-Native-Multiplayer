@@ -1,6 +1,8 @@
 #include "invite_code.h"
+#include "invite_transport.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <iostream>
 #include <set>
 #include <stdexcept>
@@ -103,8 +105,74 @@ void independent_random_checks(){
     }
     check(legacy_codes.size()==128 && compact_codes.size()==128 && compact_topics.size()==128,"Independent generated rooms collided");
 }
+struct StopGate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    unsigned entered=0,completed=0;
+    bool released=false;
+    bool timed_out=false;
+    void release(){
+        std::lock_guard lock(mutex);released=true;changed.notify_all();
+    }
+};
+class StalledStopSignalling final : public Signalling {
+    std::shared_ptr<StopGate> gate_;
+public:
+    explicit StalledStopSignalling(std::shared_ptr<StopGate> gate):gate_(std::move(gate)){}
+    bool start(const std::string&,const std::string&,Callback,std::string&) override{return true;}
+    bool publish(const Signal&,std::string&) override{return true;}
+    bool connected() const override{return true;}
+    void stop() override{
+        std::unique_lock lock(gate_->mutex);
+        ++gate_->entered;
+        gate_->changed.notify_all();
+        if(!gate_->changed.wait_for(lock,std::chrono::seconds(4),[&]{return gate_->released;}))
+            gate_->timed_out=true;
+        ++gate_->completed;
+    }
+};
+void retirement_checks(){
+    using namespace std::chrono_literals;
+    const auto gate=std::make_shared<StopGate>();
+    InvitationRetirement retirement;
+    struct ReleaseOnFailure {
+        std::shared_ptr<StopGate> gate;
+        ~ReleaseOnFailure(){gate->release();}
+    } release{gate};
+    Config config;
+    config.testing_loopback_candidates=true;
+    config.signalling_factory=[gate]{return std::make_unique<StalledStopSignalling>(gate);};
+    auto start_host=[&]{
+        check(retirement.prepare(),"Retirement queue refused a new host with room available");
+        auto host=std::make_unique<InviteTransport>();
+        std::string error;
+        check(host->host(27341,"246810",7,config,error),"Could not create the private invitation host");
+        const auto end=std::chrono::steady_clock::now()+2s;
+        while(host->status().phase==Phase::Preparing && std::chrono::steady_clock::now()<end)
+            std::this_thread::sleep_for(1ms);
+        check(host->status().phase==Phase::Ready,"Private host never completed signalling startup");
+        return host;
+    };
+    retirement.retire(start_host());
+    {
+        std::unique_lock lock(gate->mutex);
+        check(gate->changed.wait_for(lock,2s,[&]{return gate->entered!=0;}),
+              "Retired host did not begin cleanup");
+        check(gate->completed==0,"Retiring an invitation waited for the blocked signalling request");
+    }
+    auto new_host=start_host();
+    check(new_host->status().phase==Phase::Ready,"Old invitation teardown changed the replacement host");
+    retirement.retire(std::move(new_host));
+    retirement.retire(start_host());
+    retirement.retire(start_host());
+    check(!retirement.prepare(),"Retirement queue allowed unbounded pending invitations");
+    gate->release();
+    retirement.drain();
+    check(gate->completed==4 && !gate->timed_out,"Process shutdown did not drain all retired invitations");
+    check(!retirement.prepare(),"Invitation worker reopened after shutdown");
+}
 }
 int main(){try{
-    legacy_checks();compact_vectors();canonical_and_topic_checks();independent_random_checks();
-    std::cout<<"PASS compact/legacy invitation codec checks="<<checks<<"; legacy CRC/topic unchanged; compact12, canonical room40, all-bit topics and independent RNG passed\n";return 0;
+    legacy_checks();compact_vectors();canonical_and_topic_checks();independent_random_checks();retirement_checks();
+    std::cout<<"PASS invitation checks="<<checks<<"; codecs, topics, independent RNG and bounded nonblocking retirement passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<"FAIL after "<<checks<<": "<<e.what()<<'\n';return 1;}}

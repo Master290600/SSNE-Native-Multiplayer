@@ -405,7 +405,10 @@ bool native_contained(const fs::path& root,const fs::path& path){
 void native_remove_tree(const fs::path& root,const fs::path& path){native_need(native_contained(root,path),"refusing to remove a cache path outside "+S(root));std::error_code ec;fs::remove_all(path,ec);native_need(!ec,"cannot clear cache stage "+S(path)+": "+ec.message());}
 void native_replace(const fs::path& from,const fs::path& to){
 #ifdef _WIN32
-    native_need(MoveFileExW(from.c_str(),to.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0,"cannot replace "+S(to)+" (Windows error "+std::to_string(GetLastError())+")");
+    if (!MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const auto error = GetLastError();
+        throw std::runtime_error("cannot replace " + S(to) + " (Windows error " + std::to_string(error) + ")");
+    }
 #else
     std::error_code ec;fs::rename(from,to,ec);native_need(!ec,"cannot replace "+S(to)+": "+ec.message());
 #endif
@@ -559,7 +562,8 @@ bool GameBuilder::build_native(const BuildKit& kit,const std::string& data,const
         for(const auto& f:native.files)if(f.path.starts_with("include/")||f.path.starts_with("include\\"))common+='\n'+f.path+":"+f.sha256;
         for(const auto& path:all)if(path.extension()==".h")common+='\n'+S(path.filename())+":"+native_hash(path);
         const auto cache_key=launcher::runtime_text_sha256(common);const auto cache=work/"objects"/P(cache_key.substr(0,16));fs::create_directories(cache);
-        NativeJSON::Object index;try{auto old=native_read_json(cache/"compiled.json");if(old.object())index=*old.object();}catch(...){}
+        const auto index_path = cache / "compiled.json";
+        NativeJSON::Object index;try{auto old=native_read_json(index_path);if(old.object())index=*old.object();}catch(...){}
         std::vector<std::string> objects(sources.size()),keys(sources.size());std::vector<size_t> pending;
         for(size_t i=0;i<sources.size();++i){native_need(!cancel,"cancelled");objects[i]=S(cache/(sources[i].stem().string()+".obj"));keys[i]=launcher::runtime_text_sha256(common+"\n"+S(sources[i].filename())+"\n"+native_hash(sources[i]));
             auto found=index.find(S(sources[i].filename()));bool reuse=false;if(found!=index.end()&&fs::is_regular_file(P(objects[i]))){auto key=native_string(found->second,"key"),hash=native_string(found->second,"sha256");reuse=key&&hash&&*key==keys[i]&&*hash==native_hash(P(objects[i]));}if(!reuse)pending.push_back(i);}
@@ -572,11 +576,23 @@ bool GameBuilder::build_native(const BuildKit& kit,const std::string& data,const
                 while(next<pending.size()&&running.size()<jobs){const auto i=pending[next++];auto obj=P(objects[i]);obj+=".pending";std::error_code ec;fs::remove(obj,ec);std::vector<std::string> args{native.compiler};args.insert(args.end(),native.compile_flags.begin(),native.compile_flags.end());args.insert(args.end(),{"-I"+S(P(native.kit_dir)/"include"),"-I"+S(generated),"-c",S(sources[i]),"-o",S(obj)});
                     auto process=platform::spawn(args,S(generated),S(work/"logs"/(sources[i].stem().string()+".log")),failure);if(!process){failed=true;break;}running.push_back({process,i,obj});}
                 for(size_t j=0;j<running.size()&&!failed;){int code=0;if(!platform::poll(running[j].process,code)){++j;continue;}auto job=running[j];platform::release(job.process);running.erase(running.begin()+j);if(code){failed=true;failure="compiling "+S(sources[job.index].filename())+" failed; see "+S(work/"logs"/(sources[job.index].stem().string()+".log"));break;}
-                    native_need(!cancel,"cancelled");native_replace(job.pending,P(objects[job.index]));index[S(sources[job.index].filename())]=NativeJSON::Object{{"key",keys[job.index]},{"sha256",native_hash(P(objects[job.index]))}};native_write_json(cache/"compiled.json",index);++done;}
+                    native_need(!cancel,"cancelled");native_replace(job.pending,P(objects[job.index]));index[S(sources[job.index].filename())]=NativeJSON::Object{{"key",keys[job.index]},{"sha256",native_hash(P(objects[job.index]))}};++done;}
                 report("Compiling the native game ("+std::to_string(done)+" of "+std::to_string(sources.size())+")",double(done)/sources.size());if(!failed&&!running.empty())std::this_thread::sleep_for(std::chrono::milliseconds(25));
             }
         }catch(...){stop();throw;}
         native_need(!failed,failure);native_need(!cancel,"cancelled");
+        if (!pending.empty()) {
+            // The index is only used to verify reusable objects on later builds.
+            try {
+                native_write_json(index_path, index);
+            } catch (const std::runtime_error& e) {
+                log("Could not save the native object cache index: " + std::string(e.what()));
+                auto pending_index_path = index_path;
+                pending_index_path += ".pending";
+                std::error_code cleanup_error;
+                fs::remove(pending_index_path, cleanup_error);
+            }
+        }
         report("Linking the native game",.5);std::vector<std::string> link;for(const auto& token:native.link_args){if(token=="{game_objects}")link.insert(link.end(),objects.begin(),objects.end());else if(token.starts_with("file:"))link.push_back(S(P(native.kit_dir)/P(token.substr(5))));else link.push_back(token);}
         std::string response;for(const auto& arg:link)response+=native_rsp(arg);native_write(work/"link.rsp",response);const auto candidate=work/"game.pending.exe";std::error_code ec;fs::remove(candidate,ec);
         if(!run({native.compiler,"@"+S(work/"link.rsp"),"-o",S(candidate)},S(work),S(work/"logs/link.log"),cancel,error))throw std::runtime_error("linking the native game failed: "+error);

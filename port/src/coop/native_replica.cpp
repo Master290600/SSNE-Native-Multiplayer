@@ -8,12 +8,15 @@
 #include "native_configuration.h"
 #include "native_presentation.h"
 #include "client_presentation.h"
+#include "native_sirian_presentation.h"
+#include "ssne/native_effect.h"
 #include "ssne/runtime.h"
 #include "ssne/recomp_hooks.h"
 #include "ssne/replica_simulation.h"
 #include "ssne/native_party.h"
 #include "ssne/game_addresses.h"
 #include <cmath>
+#include <chrono>
 #include <algorithm>
 #include <cstdlib>
 #include <set>
@@ -21,6 +24,7 @@
 #include <cstring>
 namespace port::coop {
 namespace {
+double replica_render_time(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 bool readable(uint32_t p,unsigned n){return p>=0x80000000u && n<=ssne::guest_ram_size() && p<=ssne::guest_ram_end()-n;}
 bool coordinates(const std::array<float,3>& p){for(auto f:p)if(!std::isfinite(f) || std::abs(f)>1000000.f)return false;return true;}
 bool same_spawn(const EntityState& a,const EntityState& b) {
@@ -622,7 +626,13 @@ bool build_writes(const EntityState& e,uint32_t object,std::vector<Write>& write
             if(!rocket || !v || offsets.empty() || v->size()!=offsets.size())return fail("Invalid monster projectile visual layout");
             for(unsigned i=0;i<v->size();++i){if(!std::isfinite((*v)[i]) || std::abs((*v)[i])>1000000.f)return fail("Invalid monster projectile visual coefficient");add(object+offsets[i],f2u((*v)[i]));}continue;
         }
-        case PlanField::EnergyVisual: {const auto* v=std::get_if<std::vector<float>>(&value);if(!rocket || e.definition!=6 || !v || v->size()!=native_energy_visual_offsets.size())return fail("Invalid energy projectile presentation layout");for(unsigned i=0;i<v->size();++i)add(object+native_energy_visual_offsets[i],f2u((*v)[i]));continue;
+        case PlanField::EnergyVisual: {
+            const auto* v=std::get_if<std::vector<float>>(&value);
+            if(!rocket || e.definition!=6 || !v || v->size()!=native_energy_visual_offsets.size())return fail("Invalid energy projectile presentation layout");
+            const auto phase=std::get<int64_t>(e.properties.at("projectile_energy_phase"));
+            for(unsigned i=0;i<v->size();++i)
+                add(object+native_energy_visual_offsets[i],f2u(phase==0 && i==native_energy_charge_view_index?0.f:(*v)[i]));
+            continue;
         }
         case PlanField::ProjectileScale: {const auto* v=std::get_if<std::array<float,3>>(&value);if(!rocket || e.definition==0 || !v)return fail("Invalid native grenade scale");for(unsigned i=0;i<3;++i){if(!std::isfinite((*v)[i]) || (*v)[i]<0 || (*v)[i]>100)return fail("Invalid native grenade scale coefficient");add(object+0x68+i*4,f2u((*v)[i]));}continue;
         }
@@ -763,7 +773,7 @@ bool commit_scalar_writes(std::vector<Write>& writes,std::string& error) {
     return true;
 }
 }
-void NativeReplica::reset(){end_presentation();presentation_scratch_={};presentation_reference_={};presentation_plan_.clear();bindings_.clear();particle_ids_.clear();combo_presented_.clear();combo_timers_.clear();epoch_=0;projectile_visuals_.clear();seen_projectiles_.clear();projectile_visual_sequence_=0;ssne::replica_clear_enemy_poses();}
+void NativeReplica::reset(){end_presentation();muzzle_flash_bases_={};presentation_scratch_={};presentation_reference_={};presentation_plan_.clear();bindings_.clear();door_clocks_.clear();arrow_clocks_.clear();particle_ids_.clear();combo_presented_.clear();combo_timers_.clear();epoch_=0;projectile_visuals_.clear();seen_projectiles_.clear();projectile_visual_sequence_=0;ssne::replica_clear_enemy_poses();}
 bool NativeReplica::advance_particles(PPCContext& context,float seconds,std::string& error){
     if(particle_ids_.empty())return true;
     std::vector<uint32_t> objects;objects.reserve(particle_ids_.size());
@@ -799,6 +809,135 @@ bool visual_plan_reuse_enabled(){
     static const bool enabled=[] {const auto* mode=std::getenv("SSNE_VISUAL_PLAN_REUSE");return !mode || std::strcmp(mode,"0")!=0;}();
     return enabled;
 }
+PresentationMatrix guest_visual_matrix(uint32_t address){
+    PresentationMatrix result;
+    for(unsigned i=0;i<12;++i)result[i]=u2f(mem_read32(address+i*4));
+    return result;
+}
+// PAL emits its cone by rotating the whole authored gun matrix about
+// the barrel axis. A reflected left-hand rig must reflect the mesh too.
+std::optional<PresentationMatrix> muzzle_mesh_basis(const PresentationMatrix& root){
+    auto basis=rigid_weapon_basis(root);
+    if(!basis)return {};
+    const float handedness=root[0]*(*basis)[0]+root[4]*(*basis)[4]+root[8]*(*basis)[8];
+    if(handedness<0.f)for(unsigned row=0;row<3;++row)(*basis)[4*row]=-(*basis)[4*row];
+    return basis;
+}
+// 800044BC evaluates a named marker under the weapon's current palette.
+std::optional<PresentationMatrix> presented_weapon_marker(
+    uint32_t instance,unsigned weapon,int32_t marker_index,const PresentationMatrix& root,
+    const std::optional<NativeEnemyPoseBinding>& binding,
+    const std::vector<float>* visual_bones){
+    if(!readable(instance,0x210))return {};
+    const auto table=mem_read32(instance+0xC);
+    if(!readable(table,0x160))return {};
+        if(marker_index<0 || marker_index>=256 || !binding || !binding->model ||
+           mem_read32(table+0x74)!=0x800044BCu || mem_read16(table+0x70))return {};
+        const auto resource=mem_read32(binding->model+0xC);
+        const auto data=readable(resource,0x10)?mem_read32(resource+0xC):0;
+        if(!readable(data,0x44))return {};
+        auto marker=mem_read32(data+0x40);
+        for(int32_t i=0;i<marker_index && readable(marker,0x10);++i)marker=mem_read32(marker);
+        if(!readable(marker,0x10))return {};
+        // PAL 80128444 loads the marker's matrix pointer at +0x0C.
+        // The list node itself does not contain the affine coefficients.
+        const auto matrix=mem_read32(marker+0xC);
+        if(!readable(matrix,48))return {};
+        const auto parent=int32_t(mem_read32(marker+8));
+        auto muzzle=guest_visual_matrix(matrix);
+        // The replica samples first-person Uzi clips on a detached animator.
+        // Its visible palette is valid even when the dormant guest animator
+        // still carries the no-animation sentinel for the second hand.
+        const bool has_palette=visual_bones && visual_bones->size()==binding->count*12;
+        if(parent!=-1 && (((weapon==2 || weapon==11) && has_palette) || mem_read32(binding->model+0x40)!=UINT32_MAX)){
+            if(parent<0 || unsigned(parent)>=binding->count)return {};
+            PresentationMatrix bone;
+            if(has_palette)
+                std::copy_n(visual_bones->begin()+parent*12,12,bone.begin());
+            else bone=guest_visual_matrix(binding->matrices+parent*48);
+            muzzle=matrix_product(bone,muzzle);
+        }
+    return matrix_product(root,muzzle);
+}
+std::optional<std::array<float,3>> presented_muzzle_position(
+    uint32_t instance,unsigned weapon,const PresentationMatrix& root,
+    const std::optional<NativeEnemyPoseBinding>& binding,const std::vector<float>* visual_bones){
+    if(!readable(instance,0x210))return {};
+    const auto marker=int32_t(mem_read32(instance+0x20C));
+    std::optional<PresentationMatrix> world;
+    if(marker>=0)world=presented_weapon_marker(instance,weapon,marker,root,binding,visual_bones);
+    else{
+        const auto table=mem_read32(instance+0xC);
+        if(!readable(table,0x160))return {};
+        const auto getter=mem_read32(table+0x15C),offset=0x8028ADB4u+weapon*12;
+        if(!readable(getter,8) || mem_read32(getter)!=(0x38600000u|weapon) ||
+           mem_read32(getter+4)!=0x4E800020u || !readable(offset,12))return {};
+        auto muzzle=matrix_identity();
+        for(unsigned axis=0;axis<3;++axis)muzzle[axis*4+3]=u2f(mem_read32(offset+axis*4));
+        world=matrix_product(root,muzzle);
+    }
+    if(!world)return {};
+    const std::array<float,3> position{(*world)[3],(*world)[7],(*world)[11]};
+    if(!coordinates(position))return {};
+    return position;
+}
+
+unsigned presented_sirian_charge_view(uint32_t object,const EntityState& projectile,uint32_t source){
+    const auto phase=projectile.properties.find("projectile_energy_phase");
+    const auto* energy_phase=phase==projectile.properties.end()?nullptr:std::get_if<int64_t>(&phase->second);
+    const auto visual=projectile.properties.find("projectile_energy_visual");
+    const auto* values=visual==projectile.properties.end()?nullptr:std::get_if<std::vector<float>>(&visual->second);
+    if(!energy_phase || *energy_phase!=0 || !values || values->size()!=native_energy_visual_offsets.size() ||
+       !readable(source,0x790) || mem_read32(object+0xC8)!=source || mem_read32(source+0x48)!=0x802121E8u)return 0;
+    const auto view=(*values)[native_energy_charge_view_index];
+    if(!(view>=native_energy_charge_first_view && view<=native_energy_charge_owner_view+1) || view!=std::floor(view))return 0;
+    return unsigned(view);
+}
+
+std::optional<uint32_t> presented_sirian_charge_mask(unsigned view,uint32_t source){
+    if(view<native_energy_charge_world_view)return {};
+    // PAL 8005A158 partitions the paired charge proxies using the source
+    // actor's own masks. 8005A6C0 restores all-view visibility on launch.
+    const auto owner=mem_read32(source+0x16C),world=mem_read32(source+0x170);
+    if(!owner || (owner&(owner-1u)) || (owner&0x80000000u) || world!=~(owner|0x80000000u))return {};
+    return view>=native_energy_charge_owner_view?owner:world;
+}
+
+std::optional<std::array<float,3>> presented_sirian_charge_anchor(
+    uint32_t object,unsigned hand,uint32_t source,const EntityState& player){
+    if(mem_read32(source+0x17C)!=unsigned(ssne::netplay_local_player()) ||
+       mem_read32(source+0x5DC)!=9 || u2f(mem_read32(source+0xCC))<=0.f)return {};
+    const auto mode=player.properties.find("camera_mode"),slot=player.properties.find("weapon_model_slot");
+    const auto* camera_mode=mode==player.properties.end()?nullptr:std::get_if<int64_t>(&mode->second);
+    const auto* weapon=slot==player.properties.end()?nullptr:std::get_if<int64_t>(&slot->second);
+    if(!camera_mode || *camera_mode!=0 || !weapon || *weapon!=9)return {};
+    const auto prefix="weapon_model"+std::to_string(hand);
+    PresentationMatrix gun;
+    if(!presentation_matrix(player.properties,prefix+"_row",gun))return {};
+    const auto found=player.properties.find(prefix+"_bone_matrices");
+    const auto* bones=found==player.properties.end()?nullptr:std::get_if<std::vector<float>>(&found->second);
+    const auto instance=mem_read32(source+0x4BC+9*24+hand*4);
+    if(!readable(instance,0x340) || mem_read32(instance+0xC)!=0x801FB908u ||
+       mem_read32(instance+0x1D4)!=source)return {};
+    const auto muzzle=presented_muzzle_position(instance,9,gun,native_weapon_pose_binding(source,9,hand),bones);
+    if(muzzle)return muzzle;
+    // The phase-zero projectile base is the native muzzle set by 8005A4F8.
+    // Use the owner charge's recorded weapon root when its marker cannot
+    // be evaluated against the current replica model resource.
+    const auto view=ssne::replica_sirian_weapon_view(hand,true);
+    const auto proxy=mem_read32(instance);
+    const auto table=readable(proxy,0x38)?mem_read32(proxy):0;
+    const auto root=table?mem_read32(proxy+4):0;
+    if(!view && (!readable(table,0x30) || mem_read32(table+0x2C)!=0x8013E954u || !readable(root,48)))return {};
+    const auto motion=rigid_attachment_motion(view?view->weapon:guest_visual_matrix(root),gun);
+    if(!motion)return {};
+    auto base=matrix_identity();
+    for(unsigned axis=0;axis<3;++axis)base[axis*4+3]=u2f(mem_read32(object+0x20+axis*4));
+    const auto posed=matrix_product(*motion,base);
+    const std::array<float,3> result{posed[3],posed[7],posed[11]};
+    if(!coordinates(result))return {};
+    return result;
+}
 }
 void NativeReplica::PresentationBuffers::clear_frame(){
     // Keep owned capacities, but never carry a previous lease's pointers/values.
@@ -814,6 +953,47 @@ size_t NativeReplica::PresentationBuffers::retained_bytes() const{
     for(const auto& packed:packed_spans)bytes+=packed.capacity();
     return bytes;
 }
+const NativeReplica::MuzzleFlashBasis* NativeReplica::capture_muzzle_flash_basis(
+        unsigned hand,unsigned effect,uint32_t instance,uint32_t root,
+        const PresentationMatrix& gun,const PresentationMatrix& flash,bool emitted){
+    auto& saved=muzzle_flash_bases_[hand][effect];
+    if(!emitted && saved.instance==instance && saved.root==root && saved.emitted==flash)return &saved;
+    const auto basis=muzzle_mesh_basis(gun);
+    if(!basis){saved={};return nullptr;}
+    const auto relative=matrix_product(matrix_rigid_inverse(*basis),flash);
+    // The PAL cone is rotated about the barrel axis and scaled at emission.
+    // Recover only this roll and the authored scale, even if a snapshot
+    // already contains a newer gun orientation than the flash it carries.
+    const float roll=std::atan2(relative[4]-relative[1],relative[0]+relative[5]);
+    const float cosine=std::cos(roll),sine=std::sin(roll);
+    const float x=std::hypot(flash[0],flash[4],flash[8]);
+    const float y=std::hypot(flash[1],flash[5],flash[9]);
+    const float z=std::hypot(flash[2],flash[6],flash[10]);
+    if(!std::isfinite(roll) || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)){
+        saved={};
+        return nullptr;
+    }
+    saved={instance,root,flash,{cosine*x,-sine*y,0,0,sine*x,cosine*y,0,0,0,0,z,0}};
+    return &saved;
+}
+
+bool NativeReplica::play_local_weapon_flash(PPCContext& context,uint32_t actor,unsigned weapon,unsigned hand){
+    if(!play_native_local_weapon_flash(context,actor,weapon,hand))return false;
+    const auto instance=mem_read32(actor+0x4BC+weapon*24+hand*4);
+    const auto proxy=readable(instance,4)?mem_read32(instance):0;
+    const auto gun=readable(proxy,8)?mem_read32(proxy+4):0;
+    if(!readable(gun,48))return true;
+    for(unsigned effect=0;effect<3;++effect){
+        const auto offset=native_weapon_flash_offset(weapon,effect);
+        if(!offset || native_weapon_flash_radial(weapon,effect) || !readable(instance+offset,16))continue;
+        const auto owner=instance+offset,flash_proxy=mem_read32(owner+4);
+        const auto root=readable(flash_proxy,8)?mem_read32(flash_proxy+4):0;
+        if(readable(root,48) && mem_read32(owner+12))
+            capture_muzzle_flash_basis(hand,effect,instance,root,guest_visual_matrix(gun),guest_visual_matrix(root),true);
+    }
+    return true;
+}
+
 bool NativeReplica::begin_presentation(const std::map<EntityId,EntityState>& entities,std::string& error){
     return begin_presentation_native(entities,nullptr,error);
 }
@@ -864,6 +1044,49 @@ bool NativeReplica::begin_presentation_native(const std::map<EntityId,EntityStat
         // lease too, and must not leak into a subsequent authority capture.
         if(!append(binding->model+0x84,mem_read32(binding->model+0x84),false))return false;++pose_count;return true;
     };
+    const double brush_now=replica_render_time();
+    for(const auto& [id,clock]:door_clocks_){
+        const auto pose=clock.pose(brush_now);
+        if(pose==clock.authority())continue;
+        const auto object=local_address(id);
+        if(!object || object!=clock.object())continue;
+        const auto segment=pose.segment;const auto progress=pose.progress;
+        const auto cfg=mem_read32(object+0x5C);
+        if(!readable(cfg,0x38) || mem_read32(object+0x48)!=0x80206868u)continue;
+        const auto resource=mem_read32(cfg+0xC);
+        if(!validate_native_brush_geometry(object,resource,segment,progress,error))return false;
+        const auto manager=mem_read32(mem_read32(0x802DACC0)+0x298);
+        const auto entry=mem_read32(manager+0x10)+resource*80;
+        const auto path=mem_read32(entry+8),model=mem_read32(entry);
+        // PAL 8013A5A4 / 80139130 select this segment and compute the native
+        // rotation and translation every draw. Their caches include the
+        // evaluated model pose (80138D08) and keyframe-list cursor. Borrow
+        // all those words until render_end; physics keeps the latest host pose.
+        auto preserve=[&](uint32_t address,unsigned words){
+            for(unsigned i=0;i<words;++i)if(!append(address+i*4,mem_read32(address+i*4),false))return false;
+            return true;
+        };
+        if(!append(entry+0xC,uint32_t(segment),true) || !stage(entry+0x10,progress) ||
+           !append(entry+0x48,1,true) || !append(entry+0x4C,0,true) ||
+           !preserve(entry+0x18,12) || !preserve(path+0x20,1) ||
+           !preserve(model+0x28,2) || !preserve(model+0x34,12)){
+            error="Client moving-brush render lease is too large";return false;
+        }
+    }
+    if(!arrow_clocks_.empty()){
+        const double now=replica_render_time();
+        for(const auto& [id,clock]:arrow_clocks_){
+            const auto object=local_address(id);
+            if(!readable(object,0xB8) || mem_read32(object+0x48)!=0x802027C8u || !mem_read32(object+0xB4))continue;
+            const auto proxy=mem_read32(object+0x8C),root=readable(proxy,8)?mem_read32(proxy+4):0;
+            if(!readable(root,48))continue;
+            // Keep the host's latest parent, size and position. Borrow only the
+            // root matrix during this draw; the normal lease restores it.
+            const auto pose=clock.pose(now,u2f(mem_read32(object+0x90)),u2f(mem_read32(object+0x94)),
+                                       u2f(mem_read32(object+0xA4)),guest_visual_matrix(root));
+            for(unsigned i=0;i<12;++i)if(!stage(root+i*4,pose[i])){error="Invalid arrow presentation matrix";return false;}
+        }
+    }
     if(vehicles){
         NativeVehiclePresentation vehicle;
         if(!prepare_native_vehicle_presentation(*vehicles,vehicle,error))return false;
@@ -904,23 +1127,13 @@ bool NativeReplica::begin_presentation_native(const std::map<EntityId,EntityStat
             }
         }
         if(e.kind==EntityKind::Player && mem_read32(object+0x17C)==unsigned(ssne::netplay_local_player()) && u2f(mem_read32(object+0xCC))>0){
-            if(mem_read32(object+0x5DC)==4){
-                PresentationMatrix from,to;
-                const auto camera=mem_read32(object+0x368);
-                for(unsigned i=0;i<12;++i)from[i]=u2f(mem_read32(camera+0x24+i*4));
-                if(presentation_matrix(e.properties,"camera_row",to))for(unsigned hand=0;hand<2;++hand){
-                    const auto barrel=native_minigun_barrel(object,hand);if(!barrel || !barrel->model)continue;
-                    PresentationMatrix pose;for(unsigned i=0;i<12;++i)pose[i]=u2f(mem_read32(barrel->matrix+i*4));
-                    pose=matrix_product(matrix_product(to,matrix_rigid_inverse(from)),pose);
-                    for(unsigned i=0;i<12;++i)if(!stage(barrel->matrix+i*4,pose[i])){error="Invalid interpolated minigun barrel";return false;}
-                }
-            }
             const auto weapon=mem_read32(object+0x5DC);if(weapon>=12)continue;
             const auto selected=e.properties.find("weapon_model_slot");if(selected==e.properties.end() || uint32_t(std::get<int64_t>(selected->second))!=weapon)continue;
             PresentationMatrix from,to;
             const auto camera=mem_read32(object+0x368);
             for(unsigned i=0;i<12;++i)from[i]=u2f(mem_read32(camera+0x24+i*4));
             const bool camera_changed=presentation_matrix(e.properties,"camera_row",to);
+            const auto camera_delta=camera_changed?matrix_product(to,matrix_rigid_inverse(from)):matrix_identity();
             // The original uses a separate owner-view streak, generated from
             // the first-person muzzle. Rebase only that one-frame visual from
             // its exact firing camera. World streaks and ballistic objects keep
@@ -935,28 +1148,175 @@ bool NativeReplica::begin_presentation_native(const std::map<EntityId,EntityStat
             for(unsigned hand=0;hand<2;++hand){
                 const auto instance=mem_read32(object+0x4BC+weapon*24+hand*4);
                 const auto proxy=readable(instance,0x228)?mem_read32(instance):0,vt=readable(proxy,0x38)?mem_read32(proxy):0;
+                const auto prefix="weapon_model"+std::to_string(hand);
+                const auto root=readable(proxy,8)?mem_read32(proxy+4):0;
+                PresentationMatrix visual_root;
+                bool has_root=false;
+                std::optional<NativeEnemyPoseBinding> binding;
                 // Both native flag values0/1 are valid model bindings. Most
                 // ordinary visible weapon proxies use0; testing for1 silently
                 // left their roots authoritative while the camera was predicted.
                 // Borrowing a selected hidden model does not change its flag.
                 if(readable(vt,0x30) && mem_read32(vt+0x2C)==0x8013E954u && mem_read8(proxy+0x2D)<=1){
-                    if(!matrix(mem_read32(proxy+4),e.properties,"weapon_model"+std::to_string(hand)+"_row") || !bone(object,native_weapon_pose_binding(object,weapon,hand),e.properties,"weapon_model"+std::to_string(hand)+"_bone_",int(weapon),hand)){error="Client first-person weapon presentation changed";return false;}
+                    binding=native_weapon_pose_binding(object,weapon,hand);
+                    if(!matrix(root,e.properties,prefix+"_row") || !bone(object,binding,e.properties,prefix+"_bone_",int(weapon),hand)){error="Client first-person weapon presentation changed";return false;}
+                    has_root=readable(root,48) && presentation_matrix(e.properties,prefix+"_row",visual_root);
                 }
-                // Only first-person flash owners follow this view. Body flashes
-                // and ballistic projectiles retain their world-space positions.
-                for(unsigned effect=0;camera_changed && effect<3;++effect){
-                    const auto off=native_weapon_flash_offset(weapon,effect);if(!off || !readable(instance+off,16) || !mem_read32(instance+off+12))continue;
+                if(weapon==11 && has_root && readable(instance,0x250)){
+                    const auto mode=e.properties.find("camera_mode");
+                    const auto* first_person=mode==e.properties.end()?nullptr:std::get_if<int64_t>(&mode->second);
+                    if(first_person && *first_person==0){
+                        const auto pose=e.properties.find(prefix+"_bone_matrices");
+                        const auto* bones=pose==e.properties.end()?nullptr:std::get_if<std::vector<float>>(&pose->second);
+                        const auto controller=mem_read32(instance+0x238);
+                        // 8005DD3C positions the fuse sparks and the lighter flame
+                        // on different named markers. Their proxies disappear
+                        // before the separate world detonation.
+                        for(bool spark:{true,false}){
+                            uint32_t attachment=mem_read32(instance+0x240);
+                            if(spark){
+                                if(!readable(controller,0x30) || mem_read32(controller+0x1C)!=0x802171B0u)continue;
+                                attachment=mem_read32(controller+0x20);
+                            }
+                            const auto vtable=readable(attachment,0x38)?mem_read32(attachment):0;
+                            if(!readable(vtable,0x30) || mem_read32(vtable+0x2C)!=0x8013E954u)continue;
+                            const auto matrix_address=mem_read32(attachment+4);
+                            if(!readable(matrix_address,48))continue;
+                            const auto marker_index=int32_t(mem_read32(instance+(spark?0x22C:0x230)));
+                            const auto marker=presented_weapon_marker(instance,weapon,marker_index,visual_root,binding,bones);
+                            if(!marker)continue;
+                            // 800E9E98 only translates the spark proxy. In contrast,
+                            // 8005DDC0 cycles the flame marker's columns (Z,X,Y).
+                            for(unsigned row=0;row<3;++row){
+                                if(!spark)for(unsigned col=0;col<3;++col)
+                                    if(!stage(matrix_address+row*16+col*4,(*marker)[row*4+(col+2)%3])){
+                                        error="Invalid first-person bomb flame";return false;
+                                    }
+                                if(!stage(matrix_address+row*16+12,(*marker)[row*4+3])){
+                                    error="Invalid first-person bomb attachment";return false;
+                                }
+                            }
+                        }
+                    }
+                }
+                if(weapon==4 && camera_changed){
+                    const auto barrel=native_minigun_barrel(object,hand);
+                    if(barrel && barrel->model){
+                        // PAL 8005758C gives the barrel its own spin about the
+                        // gun mount. Carry that pose with the rendered gun root,
+                        // including the client's local stride.
+                        const auto adjustment=has_root?rigid_attachment_motion(guest_visual_matrix(root),visual_root):std::nullopt;
+                        const auto pose=matrix_product(adjustment.value_or(camera_delta),guest_visual_matrix(barrel->matrix));
+                        for(unsigned i=0;i<12;++i)if(!stage(barrel->matrix+i*4,pose[i])){
+                            error="Invalid interpolated minigun barrel";return false;
+                        }
+                    }
+                }
+                if(weapon==9 && has_root){
+                    const auto mode=e.properties.find("camera_mode");
+                    const auto* camera_mode=mode==e.properties.end()?nullptr:std::get_if<int64_t>(&mode->second);
+                    if(camera_mode && *camera_mode==0)for(bool charge:{false,true}){
+                        const auto view=ssne::replica_sirian_weapon_view(hand,charge);
+                        if(!view)continue;
+                        const auto adjustment=rigid_attachment_motion(view->weapon,visual_root);
+                        if(!adjustment)continue;
+                        const auto found=e.properties.find(prefix+"_bone_matrices");
+                        const auto* bones=found==e.properties.end()?nullptr:std::get_if<std::vector<float>>(&found->second);
+                        const auto muzzle=presented_muzzle_position(instance,weapon,visual_root,binding,bones);
+                        for(unsigned i=0;i<view->matrices.size();++i){
+                            const auto attachment=view->matrices[i];
+                            if(!attachment)continue;
+                            const auto original=guest_visual_matrix(attachment);
+                            auto pose=matrix_product(*adjustment,original);
+                            if(!charge && muzzle && camera_changed){
+                                if(i<2){
+                                    const auto beam=sirian_owner_beam(original,to,*muzzle);
+                                    if(beam)pose=*beam;
+                                }else{
+                                    for(unsigned axis=0;axis<3;++axis)pose[axis*4+3]=(*muzzle)[axis];
+                                }
+                            }
+                            for(unsigned i=0;i<12;++i)if(!stage(attachment+i*4,pose[i])){
+                                error="Invalid first-person Sirian attachment";
+                                return false;
+                            }
+                        }
+                    }
+                }
+                // Use the shot's weapon-relative flash basis, since the
+                // authoritative gun may already have moved since emission.
+                std::optional<std::array<float,3>> muzzle;
+                std::optional<PresentationMatrix> gun_basis;
+                auto flash_delta=camera_delta;
+                bool muzzle_resolved=false;
+                for(unsigned effect=0;camera_changed && native_weapon_flash_timed(weapon) && effect<3;++effect){
+                    const auto off=native_weapon_flash_offset(weapon,effect);
+                    if(!off || !readable(instance+off,16) || !mem_read32(instance+off+12)){
+                        muzzle_flash_bases_[hand][effect]={};
+                        continue;
+                    }
                     const auto flash_proxy=mem_read32(instance+off+4),flash_root=readable(flash_proxy,8)?mem_read32(flash_proxy+4):0;
                     if(!readable(flash_root,48))continue;
-                    PresentationMatrix pose;for(unsigned i=0;i<12;++i)pose[i]=u2f(mem_read32(flash_root+i*4));
-                    pose=matrix_product(matrix_product(to,matrix_rigid_inverse(from)),pose);
-                    for(unsigned i=0;i<12;++i)if(!stage(flash_root+i*4,pose[i])){error="Invalid first-person flash camera adjustment";return false;}
+                    if(!muzzle_resolved && has_root){
+                        const auto found=e.properties.find(prefix+"_bone_matrices");
+                        const auto* bones=found==e.properties.end()?nullptr:std::get_if<std::vector<float>>(&found->second);
+                        muzzle=presented_muzzle_position(instance,weapon,visual_root,binding,bones);
+                        gun_basis=muzzle_mesh_basis(visual_root);
+                        flash_delta=matrix_product(visual_root,matrix_rigid_inverse(guest_visual_matrix(root)));
+                        muzzle_resolved=true;
+                    }
+                    const auto original=guest_visual_matrix(flash_root);
+                    auto pose=matrix_product(flash_delta,original);
+                    if(gun_basis && !native_weapon_flash_radial(weapon,effect)){
+                        const auto saved=capture_muzzle_flash_basis(hand,effect,instance,flash_root,guest_visual_matrix(root),original);
+                        if(saved){
+                            const auto attachment=matrix_product(*gun_basis,saved->relative);
+                            for(unsigned row=0;row<3;++row)
+                                for(unsigned col=0;col<3;++col)pose[row*4+col]=attachment[row*4+col];
+                        }
+                    }
+                    if(muzzle)for(unsigned axis=0;axis<3;++axis)pose[axis*4+3]=(*muzzle)[axis];
+                    for(unsigned i=0;i<12;++i)if(!stage(flash_root+i*4,pose[i])){error="Invalid first-person flash presentation";return false;}
                 }
             }
         }
         if(e.kind==EntityKind::Projectile){
             const auto* type=native_projectile_class(e.definition);const auto position=e.properties.find("position");
             if(!type || position==e.properties.end() || !readable(object,type->size) || mem_read32(object+0x48)!=type->vtable)continue;
+            if(e.definition==6 && mem_read32(object+0x148)==0){
+                const auto owner=e.properties.find("projectile_source");
+                const auto* source=owner==e.properties.end()?nullptr:std::get_if<EntityReference>(&owner->second);
+                const auto player=source?entities.find(source->id):entities.end();
+                if(player!=entities.end() && player->second.kind==EntityKind::Player){
+                    const auto actor=local_address(player->first);
+                    const auto view=presented_sirian_charge_view(object,e,actor);
+                    const auto mask=presented_sirian_charge_mask(view,actor);
+                    std::optional<std::array<float,3>> anchor;
+                    if(view && (view<native_energy_charge_world_view || view>=native_energy_charge_owner_view))
+                        anchor=presented_sirian_charge_anchor(object,(view-1)%2,actor,player->second);
+                    // 8007277C places +CC at the phase-zero muzzle plus
+                    // native jitter and +134 at the muzzle itself. Shift
+                    // only their translations and keep +144 in world space.
+                    if(mask || anchor)for(unsigned offset:{0xCCu,0x134u}){
+                        const auto proxy=mem_read32(object+offset);
+                        const auto table=readable(proxy,0x38)?mem_read32(proxy):0;
+                        const auto root=table?mem_read32(proxy+4):0;
+                        if(!readable(table,0x30) || mem_read32(table+0x2C)!=0x8013E954u || !readable(root,48))continue;
+                        if(mask && !append(proxy+0x30,*mask,true)){error="Invalid Sirian charge sphere view mask";return false;}
+                        if(anchor){
+                            for(unsigned axis=0;axis<3;++axis){
+                                const auto address=root+12+axis*16;
+                                const auto offset_from_muzzle=offset==0xCCu?u2f(mem_read32(object+0x124+axis*4)):0.f;
+                                if(!stage(address,(*anchor)[axis]+offset_from_muzzle)){
+                                    error="Invalid first-person Sirian charge sphere pose";
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    if(anchor)continue;
+                }
+            }
             const auto& p=std::get<std::array<float,3>>(position->second);
             if(type->trail){
                 const auto trail=mem_read32(object+type->trail),proxy=readable(trail,4)?mem_read32(trail):0;
@@ -1024,6 +1384,33 @@ void NativeReplica::end_presentation(){
     presentation_reference_active_=false;presentation_active_=false;
 }
 uint32_t NativeReplica::local_address(EntityId id)const{auto it=bindings_.find(id);return it==bindings_.end()?0:local_.local_address(it->second);}
+namespace {
+struct ProjectileReplayPath {float duration=0,arc=0;};
+
+ProjectileReplayPath projectile_replay_path(const NativeProjectileVisual& event){
+    const auto definition=event.tags[1];
+    if(definition>5)return {};
+    const auto& p=event.values;
+    const float distance=std::hypot(p[3]-p[0],p[4]-p[1],p[5]-p[2]);
+    if(distance<.01f)return {};
+    float speed=std::hypot(p[6],p[7],p[8]);
+    if(definition<3){
+        // Rockets register velocity in units per second, then write the
+        // tick displacement into +104 during their native update.
+        if(speed>=.05f && speed<4.f)speed*=60.f;
+        if(speed<4.f)speed=50.f;
+        return {std::clamp(distance/speed,.08f,.55f),0.f};
+    }
+    // A retired grenade may be stationary. Replay the received path over a
+    // short bounded window using the last velocity when still in flight.
+    const float duration=std::clamp(distance/std::max(speed,20.f),.09f,.6f);
+    // For a descending end point, use its vertical tangent to shape the
+    // trail while leaving both received positions untouched. No world tick,
+    // collision or follow-up bounce is synthesized.
+    const float arc=p[7]<0.f?std::clamp((p[4]-p[1]-p[7]*duration)*.25f,0.f,std::min(2.f,.1f*distance)):0.f;
+    return {duration,arc};
+}
+}
 bool NativeReplica::play_projectile_visual(PPCContext& context,uint64_t epoch,const NativeProjectileVisual& event,uint64_t frame,std::string& error){
     if(!validate_native_projectile_visual(event,error))return false;
     if(!epoch || epoch!=epoch_ || !ssne::replica_simulation()){error="Projectile visual requires current replica epoch";return false;}
@@ -1041,25 +1428,39 @@ bool NativeReplica::play_projectile_visual(PPCContext& context,uint64_t epoch,co
     const auto object=create_native_projectile(context,entity,source,error);if(!object)return false;
     if(!present_native_projectile(context,object,error)){std::string cleanup;remove_native_entity(context,object,cleanup);return false;}
     const auto local_id=local_.local_entity_id(object);if(!local_id){error="Native projectile visual registration missing";std::string cleanup;remove_native_entity(context,object,cleanup);return false;}
-    projectile_visuals_.emplace(id,ProjectileVisual{event,local_id,mem_read32(context.r[13]-0x6D80),event.tags[1]==6});projectile_visual_sequence_=event.sequence;
+    const auto path=projectile_replay_path(event);
+    projectile_visuals_.emplace(id,ProjectileVisual{event,local_id,mem_read32(context.r[13]-0x6D80),
+                                                     path.duration,path.arc,0.f,event.tags[1]==6});
+    projectile_visual_sequence_=event.sequence;
     ssne::log_message("[coop-projectile-visual-replay] sequence="+std::to_string(event.sequence)+" id="+std::to_string(id)+" definition="+std::to_string(event.tags[1])+" native="+std::to_string(object));return true;
 }
-bool NativeReplica::advance_projectile_visuals(PPCContext& context,uint64_t frame,std::string& error){
-    if(context.r[13]!=0x802E22A0u){error="Invalid projectile visual draw context";return false;}
+bool NativeReplica::advance_projectile_visuals(PPCContext& context,float seconds,std::string& error){
+    if(context.r[13]!=0x802E22A0u || !std::isfinite(seconds) || seconds<0.f){error="Invalid projectile visual draw context";return false;}
     const auto draw_frame=mem_read32(context.r[13]-0x6D80);
     for(auto it=projectile_visuals_.begin();it!=projectile_visuals_.end();){
         auto& visual=it->second;const auto object=local_.local_address(visual.local);
         if(!object){it=projectile_visuals_.erase(it);continue;}
         if(draw_frame==visual.frame){++it;continue;}
         if(!visual.final_pose){
-            const auto entity=native_projectile_visual_state(visual.event,true);std::vector<Write> writes;
-            if(!build_writes(entity,object,writes,error))return false;
-            for(const auto& write:writes)mem_write32(write.address,write.value);
+            const auto* type=native_projectile_class(unsigned(visual.event.tags[1]));
+            if(!type || !readable(object,type->size) || mem_read32(object+0x48)!=type->vtable){
+                error="Invalid retired native projectile binding";
+                return false;
+            }
+            // Step only after a new guest display frame, with a bounded
+            // wall-clock delta so a skipped frame cannot jump to the impact.
+            visual.elapsed+=std::min(seconds,1.f/30.f);
+            const float portion=visual.duration>0.f?std::min(1.f,visual.elapsed/visual.duration):1.f;
+            for(unsigned axis=0;axis<3;++axis){
+                const auto p=std::lerp(visual.event.values[axis],visual.event.values[3+axis],portion)
+                    +(axis==1?visual.arc*4.f*portion*(1.f-portion):0.f);
+                mem_write32(object+0x20+axis*4,f2u(p));
+            }
             if(!present_native_projectile(context,object,error))return false;
-            visual.final_pose=true;visual.frame=draw_frame;++it;continue;
+            visual.final_pose=portion>=1.f;visual.frame=draw_frame;++it;continue;
         }
-        // Two actual presentation frames establish the original trail between
-        // the host's recorded endpoints; retirement uses its native fade path.
+        // The endpoint gets its own display frame before native retirement
+        // lets the generated trail fade.
         if(!remove_native_entity(context,object,error))return false;
         ssne::log_message("[coop-projectile-visual-retired] id="+std::to_string(it->first)+" native="+std::to_string(object));it=projectile_visuals_.erase(it);
     }
@@ -1068,10 +1469,12 @@ bool NativeReplica::advance_projectile_visuals(PPCContext& context,uint64_t fram
 NativeReplicaResult NativeReplica::apply(PPCContext& context,uint64_t epoch,const std::map<EntityId,EntityState>& source) {
     return apply_native(context,epoch,source,nullptr);
 }
-NativeReplicaResult NativeReplica::apply_with_vehicles(PPCContext& context,uint64_t epoch,const std::map<EntityId,EntityState>& source,const Properties& mission) {
-    return apply_native(context,epoch,source,&mission);
+NativeReplicaResult NativeReplica::apply_with_vehicles(PPCContext& context,uint64_t epoch,const std::map<EntityId,EntityState>& source,const Properties& mission,
+                                                         LocalWeaponFlashLease flash) {
+    return apply_native(context,epoch,source,&mission,flash);
 }
-NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epoch,const std::map<EntityId,EntityState>& source,const Properties* vehicles) {
+NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epoch,const std::map<EntityId,EntityState>& source,const Properties* vehicles,
+                                                  LocalWeaponFlashLease flash) {
     ssne::perf::detail::Frame perf_frame(ssne::perf::detail::ReplicaApply);
     ssne::perf::detail::count(ssne::perf::detail::Entities,source.size());
     ssne::perf::detail::Scope perf_phase(ssne::perf::detail::CaptureBindings);
@@ -1136,13 +1539,23 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
         removals.emplace_back(object,kind);it=staged.erase(it);
     }
     std::vector<Write> prepared_writes;prepared_writes.reserve(source.size()*32);
+    std::vector<EntityId> promoted_projectile_replays;
     {
     NativePoseReadScope pose_reads;
     for(const auto& [id,e]:source) {
         if(!id || id!=e.id){result.error="Invalid server entity identity";return result;}
         EntityId match=0;
         if(auto found=staged.find(id);found!=staged.end())match=found->second;
-        else for(const auto& [candidate_id,candidate]:local.entities) {
+        if(!match && !fresh_epoch && e.kind==EntityKind::Projectile){
+            if(auto visual=projectile_visuals_.find(id);visual!=projectile_visuals_.end()){
+                const auto candidate=local.entities.find(visual->second.local);
+                if(candidate!=local.entities.end() && candidate->second.kind==e.kind && candidate->second.definition==e.definition){
+                    match=candidate->first;
+                    promoted_projectile_replays.push_back(id);
+                }
+            }
+        }
+        if(!match)for(const auto& [candidate_id,candidate]:local.entities) {
             ssne::perf::detail::count(ssne::perf::detail::BindingCandidates);
             if(used.contains(candidate_id) || visual_only.contains(candidate_id) || candidate.kind!=e.kind || candidate.definition!=e.definition)continue;
             if(!(e.kind==EntityKind::Player?same_player(e,candidate):same_spawn(e,candidate)))continue;
@@ -1200,7 +1613,7 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
         removals.emplace_back(object,e.kind);
     }
     std::stable_sort(creates.begin(),creates.end(),[&](auto a,auto b){return source.at(a).kind!=EntityKind::Projectile && source.at(b).kind==EntityKind::Projectile;});
-    struct MarkerState{uint32_t object;bool active;std::vector<float> animation;};
+    struct MarkerState{EntityId id;uint32_t object;bool active;std::vector<float> animation;};
     std::vector<MarkerState> markers;
     for(const auto& [id,e]:source)if(e.kind==EntityKind::Physics && (e.definition==1 || e.definition==2)){
         auto a=e.properties.find("marker_active"),i=e.properties.find("marker_index");
@@ -1214,16 +1627,16 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
             if(!values || !validate_native_arrow_animation(object,*values,result.error)){if(result.error.empty())result.error="Arrow animation is missing";return result;}
             animation=*values;
         }
-        markers.push_back({object,bool(std::get<int64_t>(a->second)),std::move(animation)});
+        markers.push_back({id,object,bool(std::get<int64_t>(a->second)),std::move(animation)});
     }
-    struct BrushState {uint32_t object;int64_t resource,segment;float progress;};
+    struct BrushState {EntityId id;uint32_t object;int64_t resource,segment;float progress;};
     std::vector<BrushState> brushes;
     for(const auto& [id,e]:source)if(e.kind==EntityKind::Door) {
         auto r=e.properties.find("brush_resource"),s=e.properties.find("brush_segment"),p=e.properties.find("brush_progress");
         if(!staged.contains(id) || r==e.properties.end() || s==e.properties.end() || p==e.properties.end() || !std::holds_alternative<int64_t>(r->second) || !std::holds_alternative<int64_t>(s->second) || !std::holds_alternative<float>(p->second)){result.error="Incomplete native moving-brush command";return result;}
         auto object=local_.local_address(staged.at(id));auto resource=std::get<int64_t>(r->second),segment=std::get<int64_t>(s->second);auto progress=std::get<float>(p->second);
         if(!validate_native_brush_geometry(object,resource,segment,progress,result.error))return result;
-        brushes.push_back({object,resource,segment,progress});
+        brushes.push_back({id,object,resource,segment,progress});
     }
     std::vector<std::pair<uint32_t,unsigned>> movement;
     for(const auto& [id,e]:source)if(auto value=e.properties.find("movement_mode");value!=e.properties.end()) {
@@ -1317,7 +1730,8 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
     }
     if(!result.applied){rollback();return result;}
     timings.mark("scalars");perf_phase.next(ssne::perf::detail::Destructibles);
-    if(fresh_epoch){projectile_visuals_.clear();seen_projectiles_.clear();projectile_visual_sequence_=0;}
+    if(fresh_epoch){muzzle_flash_bases_={};projectile_visuals_.clear();seen_projectiles_.clear();projectile_visual_sequence_=0;}
+    for(auto id:promoted_projectile_replays)projectile_visuals_.erase(id);
     for(const auto& [id,e]:source)if(e.kind==EntityKind::Destructible)if(!apply_native_destructible(context,local_address(id),e,result.error))ssne::fatal(result.error.c_str());
     for(const auto& [id,e]:source)if(e.properties.contains("hint_active"))if(!apply_native_interaction_hint(context,local_address(id),e,result.error))ssne::fatal(result.error.c_str());
     for(const auto& [id,e]:source)if(e.properties.contains("pickup_notice_sequence"))if(!apply_native_player_notices(context,epoch,local_address(id),e,result.error))ssne::fatal(result.error.c_str());
@@ -1358,9 +1772,36 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
     for(const auto& [id,e]:source)if(e.properties.contains("powerups"))if(!apply_native_powerups(context,local_address(id),std::get<std::vector<float>>(e.properties.at("powerups")),result.error))ssne::fatal(result.error.c_str());
     timings.mark("hud");perf_phase.next(ssne::perf::detail::Markers);
     for(const auto&[object,e]:particle_changes)if(!apply_native_particles(context,object,*e,result.error))ssne::fatal(result.error.c_str());
+    if(fresh_epoch)door_clocks_.clear();
+    else std::erase_if(door_clocks_,[&](const auto& item){return !source.contains(item.first);});
+    const double brush_now=replica_render_time();
+    for(const auto& brush:brushes){
+        const auto cfg=mem_read32(brush.object+0x5C);
+        const NativeDoorPose confirmed{unsigned(brush.segment),brush.progress};
+        auto& clock=door_clocks_[brush.id];
+        if(clock.object()==brush.object && clock.authority()==confirmed)continue;
+        // PAL MovingBrush::Update (8007F39C) advances by elapsed / C4.
+        // A positive keyframe duration replaces the configured base at +4.
+        // At the transition, finish the old segment with its own timing.
+        const auto previous=clock.object()==brush.object?clock.authority().segment:confirmed.segment;
+        double seconds=u2f(mem_read32(cfg+4));
+        auto node=mem_read32(cfg+0x14);
+        for(unsigned i=0;node && i<=previous;++i){
+            const auto override_seconds=u2f(mem_read32(node));
+            if(override_seconds>0)seconds=override_seconds;
+            node=mem_read32(node+0xC);
+        }
+        clock.confirm(brush.object,mem_read32(cfg+0x10),confirmed,seconds,brush_now);
+    }
+    if(fresh_epoch)arrow_clocks_.clear();
+    else std::erase_if(arrow_clocks_,[&](const auto& item){return !source.contains(item.first);});
     for(const auto& marker:markers){
         if(!apply_native_marker(context,marker.object,marker.active,result.error))ssne::fatal(result.error.c_str());
-        if(!marker.animation.empty() && !apply_native_arrow_animation(context,marker.object,marker.animation,result.error))ssne::fatal(result.error.c_str());
+        if(!marker.animation.empty()){
+            if(!apply_native_arrow_animation(context,marker.object,marker.animation,result.error))ssne::fatal(result.error.c_str());
+            if(!marker.active)arrow_clocks_.erase(marker.id);
+            else if(!arrow_clocks_.contains(marker.id))arrow_clocks_.emplace(marker.id,NativeArrowClock{replica_render_time(),marker.animation[0],marker.animation[1]});
+        }
     }
     for(auto brush:brushes)if(!apply_native_brush_geometry(context,brush.object,brush.resource,brush.segment,brush.progress,result.error))ssne::fatal(result.error.c_str());
     timings.mark("markers_brushes");perf_phase.next(ssne::perf::detail::PlayerResources);
@@ -1393,7 +1834,14 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
             (key.starts_with("weapon_model") && !key.starts_with("weapon_model0_flash") && !key.starts_with("weapon_model1_flash"));});
         std::vector<Write> plan;if(!build_writes(pose_fields,local_address(id),plan,result.error))ssne::fatal(result.error.c_str());
         for(const auto& write:plan)if(write.presentation){if(write.size==1)mem_write8(write.address,uint8_t(write.value));else mem_write32(write.address,write.value);}
-        for(unsigned hand=0;hand<2;++hand)for(unsigned effect=0;effect<3;++effect){const auto prefix=native_weapon_flash_key(hand,effect);if(e.properties.contains(prefix))if(!apply_native_weapon_flash(context,local_address(id),weapon,hand,std::get<std::vector<float>>(e.properties.at(prefix)),uint32_t(std::get<int64_t>(e.properties.at(prefix+"_mask"))),result.error,effect))ssne::fatal(result.error.c_str());}
+        for(unsigned hand=0;hand<2;++hand)for(unsigned effect=0;effect<3;++effect){
+            if(id==flash.owner && weapon==flash.weapon && (flash.hands&(1u<<hand)) &&
+               (!effect || (weapon==4 && effect==1)))continue;
+            const auto prefix=native_weapon_flash_key(hand,effect);
+            if(e.properties.contains(prefix) && !apply_native_weapon_flash(context,local_address(id),weapon,hand,
+               std::get<std::vector<float>>(e.properties.at(prefix)),uint32_t(std::get<int64_t>(e.properties.at(prefix+"_mask"))),result.error,effect))
+                ssne::fatal(result.error.c_str());
+        }
         for(unsigned hand=0;hand<2;++hand){const auto prefix="body_flash"+std::to_string(hand);if(e.properties.contains(prefix))if(!apply_native_body_flash(context,local_address(id),hand,std::get<std::vector<float>>(e.properties.at(prefix)),uint32_t(std::get<int64_t>(e.properties.at(prefix+"_mask"))),result.error))ssne::fatal(result.error.c_str());}
         for(unsigned hand=0;hand<2;++hand){const auto key="weapon_bomb"+std::to_string(hand);
             if(weapon==11 && e.properties.contains(key)){const auto& masks=std::get<std::vector<int64_t>>(e.properties.at(key+"_masks"));if(!ssne::apply_native_bomb_visual(context,local_address(id),hand,std::get<std::vector<float>>(e.properties.at(key)),{uint32_t(masks[0]),uint32_t(masks[1])},result.error))ssne::fatal(result.error.c_str());}

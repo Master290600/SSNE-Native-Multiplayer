@@ -176,4 +176,7 @@ public:
 };
 }
 std::unique_ptr<Signalling> make_signalling(){return std::make_unique<NtfySignalling>();}
+bool fits_invitation_signal(const Signal& signal){
+    return signal_valid(signal) && encode_signal(signal).size()<=max_publish;
+}
 }

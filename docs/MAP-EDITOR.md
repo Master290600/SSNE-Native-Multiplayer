@@ -275,4 +275,4 @@ packages, memory cards and original maps are preserved. The manifest is checked
 on each join, while identical verified packages reuse their cache without a
 payload download. Changed names or previews refresh even if the map bytes stay
 the same. Invalid or interrupted transfers cannot become active maps. Use
-version 1.2.8.3 (multiplayer build 252, protocol 71) on the host and clients.
+version 1.2.8.4-beta.1 (multiplayer build 267 R15s, protocol 71) on the host and clients.

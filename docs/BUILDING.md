@@ -88,12 +88,12 @@ results (bl/blr, bdnz, rlwinm incl. wrap masks, CR logic, floats, bctrl, switch 
 
 ## Integrated Windows native-multiplayer package
 
-Build `ssne-launcher` with CMake as above. The Windows 1.2.8.3 package pairs the launcher with the multiplayer runtime for build 252 / protocol 71, the sparse PAL translation recipe, the C++ toolchain and the PS2 content pack. The content installer uses the Python runtime included in the Windows ZIP.
+Build `ssne-launcher` with CMake as above. The Windows 1.2.8.4-beta.1 package pairs the launcher with the multiplayer runtime for build 267 R15s / protocol 71, the sparse PAL translation recipe, the C++ toolchain and the PS2 content pack. The content installer uses the Python runtime included in the Windows ZIP.
 
-For a complete distribution base, use the Windows x64 asset from the [1.2.8.3 release](https://github.com/Master290600/SSNE-Native-Multiplayer/releases/tag/v1.2.8.3). Its `Extras/PS2/` directory contains the content payload. The matching installer source and checksums are in `data/release/ps2/` in this checkout. The game is compiled from the player's European GameCube disc. Build Game also restores the shared GameCube resources used by the additional maps from that disc.
+For a complete distribution base, use the Windows x64 asset from the [1.2.8.4-beta.1 release](https://github.com/Master290600/SSNE-Native-Multiplayer/releases/tag/v1.2.8.4-beta.1). Its `Extras/PS2/` directory contains the content payload. The matching installer source and checksums are in `data/release/ps2/` in this checkout. The game is compiled from the player's European GameCube disc. Build Game also restores the shared GameCube resources used by the additional maps from that disc.
 
-`tools/package_native_launcher.py` assembles historical multiplayer kits up to build 229. `tools/make_public_release.sh` assembles the standard build kit. The Windows 1.2.8.3 release asset includes the multiplayer kit and content pack needed for a fresh install.
+`tools/package_native_launcher.py` assembles historical multiplayer kits up to build 229. `tools/make_public_release.sh` assembles the standard build kit. The Windows 1.2.8.4-beta.1 release asset includes the multiplayer kit and content pack needed for a fresh install.
 
 ## Public fork release identity
 
-The Windows launcher uses version 1.2.8.3 and the update feed for Master290600/SSNE-Native-Multiplayer. A developer fork can set `-DSSNE_UPDATE_REPOSITORY=owner/repository` at configuration time. The public CI exercises synthetic discs and component tests. A full local game build uses the supported PAL disc image.
+The Windows launcher uses version 1.2.8.4-beta.1 and the update feed for Master290600/SSNE-Native-Multiplayer. A developer fork can set `-DSSNE_UPDATE_REPOSITORY=owner/repository` at configuration time. The public CI exercises synthetic discs and component tests. A full local game build uses the supported PAL disc image.

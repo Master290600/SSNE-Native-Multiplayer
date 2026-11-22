@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "ssne/hw.h"
+#include "ssne/exi.h"
 #include "ssne/recomp_hooks.h"
 #include "ssne/runtime.h"
 #include "ssne/thread_util.h"
@@ -597,6 +598,8 @@ SchedulerStats scheduler_stats() {
 }
 
 bool sched_state_check(std::string& why) {
+    // A checkpoint cannot resume the filesystem half of a staged card save.
+    if(exi_result_save_pending()){why="the game is saving to the memory card";return false;}
     std::lock_guard<std::mutex> lk(M);
     int alive = 0;
     for (auto& t : g_threads) alive += t->st != TState::Dead;

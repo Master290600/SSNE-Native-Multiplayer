@@ -95,6 +95,16 @@ namespace gc::zip {
 bool extract(const std::string&,const std::string& destination,const std::function<std::string(const std::string&)>& map,const std::function<bool(uint64_t,uint64_t)>& progress,std::string& error){try{if(progress&&!progress(1,1)){error="cancelled";return false;}extract_fixture(fs::u8path(destination),map);error.clear();return true;}catch(const std::exception& e){error=e.what();return false;}}
 }
 int main(int argc,char** argv){try{
+    using updater::is_newer_version;
+    check(is_newer_version("v1.2.8.4", "1.2.8.4-beta.1"), "stable must replace its beta");
+    check(!is_newer_version("1.2.8.4-beta.10", "1.2.8.4"), "beta must not replace its stable");
+    check(is_newer_version("1.2.8.4-beta.10", "1.2.8.4-beta.2"), "beta numbers must compare numerically");
+    check(!is_newer_version("1.2.8.4-beta.1", "v1.2.8.4-beta.1"), "identical beta");
+    check(is_newer_version("1.2.8.4-beta.1", "1.2.8.3"), "newer core outranks release stage");
+    check(!is_newer_version("1.2.8.3", "1.2.8.4-beta.1"), "previous stable must not replace beta");
+    check(!is_newer_version("v1.2.8", "1.2.8.0"), "legacy three-component version");
+    check(!is_newer_version("1.2.8.5-beta.", "1.2.8.4"), "missing beta number");
+    check(!is_newer_version("", "1.2.8.4"), "missing candidate version");
     if(argc==3){std::string error;const bool ok=updater::validate_package(argv[1],argv[2],error);if(!ok)std::cerr<<error<<'\n';return ok?0:2;}
     check(std::string(updater::release_feed_url())=="https://api.github.com/repos/" SSNE_UPDATE_REPOSITORY "/releases/latest","Launcher release feed differs from configured repository");
 #ifdef _WIN32

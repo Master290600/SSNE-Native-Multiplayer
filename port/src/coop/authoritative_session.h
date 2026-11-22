@@ -20,12 +20,19 @@ struct ControlInput {
     uint8_t weapon=255;
     std::array<uint8_t,8> preferences{255,255,255,255,255,255,255,255};
 };
+// Latest local controls and retained edges, read by presentation only.
+struct LocalControlSample {
+    uint64_t epoch=0,sequence=0,jump_pressed=0,fire_pressed=0,fire_released=0;
+    ControlInput input;
+    double sampled_at=0.;
+};
 struct PlayerControl {
     PlayerId id;
     bool ready=false,afk=false;
     uint64_t sequence=0;
     ControlInput input;
     bool spectator=false; // effective voluntary or server-forced round lock
+    uint64_t fire_pressed=0;
 };
 struct ConnectionEvent { enum class Kind { Joined,Left }; Kind kind; PlayerId player; };
 struct LobbySkinChoice {PlayerId player{};uint8_t model=255;};
@@ -56,7 +63,7 @@ public:
     public:
         void commit(){auto action=std::move(commit_);if(action)action();}
     };
-    explicit AuthoritativeServer(unsigned capacity=8);
+    explicit AuthoritativeServer(unsigned capacity=8,std::function<void(const std::string&)> disconnect_log={});
     ~AuthoritativeServer();
     bool start(uint16_t port,const std::string& pin,uint64_t fingerprint,const std::string& host_name="Host",unsigned skin=255);
     std::string lan_session_id() const;
@@ -156,11 +163,13 @@ public:
     std::array<PlayerLatency,max_players> player_latencies() const;
     WorldSample world_sample() const;
     std::vector<WorldSample> motion_samples(uint64_t after,uint64_t through) const;
-    PredictedLook predicted_look(uint64_t epoch,uint64_t confirmed_input);
+    PredictedLook predicted_look(uint64_t epoch,uint64_t confirmed_input,double now,
+                                 const std::array<float,3>& host_angles,float pitch_low,float pitch_high,double scale);
     void clear_predicted_look();
     void ready(uint64_t epoch);
     void lobby_ready(bool);
     void submit_input(ControlInput);
+    LocalControlSample local_control() const;
     void set_afk(bool);
     void set_spectator(bool);
     void vote_skip(uint64_t cutscene);

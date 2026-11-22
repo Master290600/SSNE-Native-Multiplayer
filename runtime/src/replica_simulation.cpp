@@ -77,6 +77,7 @@ void ensure_pose_observer() {
     });
 }
 bool readable(uint32_t p,unsigned n){return p>=0x80000000u && n<=guest_ram_size() && p<=guest_ram_end()-n;}
+#include "native_local_weapon_animation.inc"
 void camera_getter_hook(PPCContext& context){
     const auto instance=preparing_weapon,output=context.r[4],caller=context.lr;
     ssne_call_original(context,0x800A6A8Cu,original_camera_getter);
@@ -327,13 +328,32 @@ void skinning_hook(PPCContext& context){
 #include "native_movie.inc"
 uint32_t game_update=0,world_update=0;
 bool suppress(){return replica && mem_read32(game_address(0x802DB0E0))==4 && (mem_read32(game_address(0x802DB1BC))>=1 && mem_read32(game_address(0x802DB1BC))<=4);}
-void game_hook(PPCContext& context){movie_scene=context.r[3];if(suppress()){++game_skips;return;}ssne_call_original(context,game_update,original_game);}
+void game_hook(PPCContext& context){
+    movie_scene=context.r[3];
+    // An active PAL movie takes a separate scene-update branch. It creates and
+    // animates the native localized skip hint. The movie stop hook still holds
+    // the replica's resource open until the host ends the presentation.
+    const bool update_movie=game_update==0x80166724u && movie_state.active && native_movie_presenting();
+    if(suppress() && !update_movie){
+        ++game_skips;
+        return;
+    }
+    ssne_call_original(context,game_update,original_game);
+}
 void world_hook(PPCContext& context){if(suppress()){++world_skips;return;}ssne_call_original(context,world_update,original_world);}
 void camera_hook(PPCContext& context){if(suppress())return;ssne_call_original(context,0x800A5EDC,original_camera);}
 void level_request_hook(PPCContext& context){if(replica && (mem_read32(game_address(0x802DB1BC))>=1 && mem_read32(game_address(0x802DB1BC))<=4)){log_message("[coop-replica-authority] local level request suppressed");return;}ssne_call_original(context,0x80167B40,original_level_request);}
 void game_end_hook(PPCContext& context){if(replica && (mem_read32(game_address(0x802DB1BC))>=1 && mem_read32(game_address(0x802DB1BC))<=4)){log_message("[coop-replica-authority] local campaign-end request suppressed");return;}ssne_call_original(context,0x80167D10,original_game_end);}
 }
 uint32_t native_game_scene(){return movie_scene;}
+std::optional<NativeLocalWeaponClip> native_local_weapon_clip(uint32_t actor,unsigned weapon,unsigned hand,unsigned logical){
+    return local_weapon_animation::resolve(actor,weapon,hand,logical);
+}
+bool sample_native_local_weapon_clip(PPCContext& context,uint32_t actor,unsigned weapon,unsigned hand,
+                                     const NativeLocalWeaponClip& clip,float seconds,std::vector<float>& pose,
+                                     uint32_t* sampled_frame){
+    return local_weapon_animation::sample(context,actor,weapon,hand,clip,seconds,pose,sampled_frame);
+}
 void install_replica_simulation_hooks() {
     const bool pal=mem_read32(0x80000000u)==0x47334250u;
     game_update=pal?0x80166724:0x8016677C;world_update=pal?0x801508B4:0x801508FC;

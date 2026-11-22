@@ -35,4 +35,5 @@ public:
     virtual void stop()=0;
 };
 std::unique_ptr<Signalling> make_signalling();
+bool fits_invitation_signal(const Signal& signal);
 }

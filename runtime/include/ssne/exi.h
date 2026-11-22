@@ -15,6 +15,12 @@ std::vector<uint8_t> exi_memcard_snapshot();
 bool exi_configure_memcard_snapshot(const std::vector<uint8_t>& data);
 std::string exi_memcard_path();   // image in use ("" if none)
 uint64_t exi_memcard_writes();    // number of write-throughs to the image
+// The guest replaces its old save by deleting and then renaming. Publish all
+// those flash changes together for the host's background result-screen save.
+bool exi_begin_result_save();
+bool exi_result_save_pending();
+bool exi_commit_result_save();
+void exi_cancel_result_save();
 // Guest safe point only: isolate an in-process client and restore its local card.
 bool exi_begin_client_session();
 void exi_end_client_session();

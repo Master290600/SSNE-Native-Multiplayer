@@ -6,6 +6,8 @@ namespace port::settings_text {
 // names remain outside the catalog. Native language order: EN=0, DE=1, FR=2.
 struct Row { std::string_view en, de, fr; };
 inline constexpr Row rows[] = {
+    {"Progress could not be saved to the memory card. The session will continue.", "Der Fortschritt konnte nicht auf der Speicherkarte gespeichert werden. Die Sitzung geht weiter.", "Impossible de sauvegarder la progression sur la carte mémoire. La partie continue."},
+    {"Skip votes %u / %u", "Stimmen zum Überspringen %u / %u", "Votes pour passer %u / %u"},
     {"press a pad button...", "Controller-Taste drücken...", "Appuyez sur un bouton de la manette..."},
     {"press a key, mouse button or wheel...", "Taste, Maustaste oder Mausrad betätigen...", "Appuyez sur une touche, un bouton de souris ou la molette..."},
     {"Crosshair", "Fadenkreuz", "Viseur"},

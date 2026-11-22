@@ -79,7 +79,9 @@ uint64_t native_frontend_mouse_epoch();
 bool native_frontend_mouse_allowed(uint32_t gui,uint32_t node,uint16_t root,uint16_t id,unsigned event);
 bool native_frontend_mouse_event(PPCContext&,uint32_t gui,uint32_t node,uint16_t root,uint16_t id,unsigned event);
 unsigned native_menu_language();
-void native_frontend_disconnected(std::string);
+void native_frontend_disconnected(const std::string&);
+// End the initial connecting panel once the client has queued the native scene.
+void native_frontend_finish_join(PPCContext&);
 // Safe from a NativeSession load callback: only queues the failure. The next
 // guest frontend frame leaves the session and shows its specific message.
 void native_frontend_custom_level_error(std::string);

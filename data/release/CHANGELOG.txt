@@ -1,3 +1,12 @@
+SSNE-RECOOP-Native 1.2.8.4-beta.1 (Windows x64, multiplayer build 267 R15s, protocol 71)
+
+  - Client movement and camera updates follow local input when walking and swimming. Ground handling and corrections have been revised for stairs, low ledges and the stone platform in Senator Cicero's Villa.
+  - Local first-person weapon animations and shot effects have been revised, including muzzle flashes, firing sounds, weapon sway and projectile visibility.
+  - Doors and rotating objective arrows animate more smoothly on clients. Clients can see the native blue enemy spawn effect when the encounter uses it.
+  - Updated co-op joining, invitation transport and recovery, and the transition from the score screen.
+  - Host/client checks covered normal latency and simulated latency above one second on one PC. At very high latency the view can still settle slightly after releasing movement. A second-PC test over a mobile hotspot is pending for this candidate.
+  - Bots and Survival may still have bugs.
+
 SSNE-RECOOP-Native 1.2.8.3 (Windows x64, multiplayer build 252, protocol 71)
 
   - Preloads the opening pistol's muzzle-flash and casing textures during level loading to reduce the first-shot hitch.

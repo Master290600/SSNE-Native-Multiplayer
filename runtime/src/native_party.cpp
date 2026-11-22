@@ -1,4 +1,5 @@
 #include "ssne/native_party.h"
+#include "ssne/native_ground_support.h"
 #include "ssne/connected_camera_updates.h"
 #include "ssne/native_results.h"
 #include "ssne/native_cutscene.h"
@@ -204,8 +205,10 @@ bool native_world_segment(PPCContext& context,const std::array<float,3>& from,co
     for(auto point:{from,to})for(float value:point)if(!std::isfinite(value) || std::abs(value)>1000000.f){error="Invalid native geometry segment";return false;}
     const auto manager=mem_read32(0x802ABAA4);const auto* query=ssne_find_func(0x80140214);
     if(!valid(manager,0x18) || mem_read32(manager)!=0x8021EB70u || !query || mem_read32(query->address)!=0x9421FE60u){error="Native geometry query revision unavailable";return false;}
-    std::vector<uint8_t> stack(0x2000);for(unsigned i=0;i<stack.size();++i)stack[i]=mem_read8(context.r[1]-0x2000+i);
-    auto restore=[&](){for(unsigned i=0;i<stack.size();++i)mem_write8(context.r[1]-0x2000+i,stack[i]);};
+    std::array<uint8_t,0x2000> stack;
+    auto* scratch=host_ptr(context.r[1]-uint32_t(stack.size()));
+    std::memcpy(stack.data(),scratch,stack.size());
+    auto restore=[&](){std::memcpy(scratch,stack.data(),stack.size());};
     const auto a=context.r[1]-0x100,b=a+16,result=a+32;
     for(unsigned i=0;i<3;++i){mem_write32(a+i*4,f2u(from[i]));mem_write32(b+i*4,f2u(to[i]));}
     for(unsigned i=0;i<48;i+=4)mem_write32(result+i,0);
@@ -214,7 +217,7 @@ bool native_world_segment(PPCContext& context,const std::array<float,3>& from,co
     if(call.r[3]) {
         NativeSegmentHit found;
         for(unsigned i=0;i<3;++i){found.position[i]=u2f(mem_read32(result+i*4));found.normal[i]=u2f(mem_read32(result+12+i*4));}
-        found.flags=mem_read32(result+32);hit=found;
+        found.flags=mem_read32(result+32);found.source_kind=mem_read32(result+36);hit=found;
     }
     restore();
     if(hit)for(auto point:{hit->position,hit->normal})for(float value:point)if(!std::isfinite(value)){hit.reset();error="Invalid native geometry result";return false;}
@@ -227,28 +230,58 @@ std::optional<float> native_player_collision_radius(uint32_t actor) {
     const float radius=u2f(mem_read32(0x8020E6C4));
     return std::isfinite(radius) && radius>.05f && radius<100.f?std::optional<float>(radius):std::nullopt;
 }
-bool native_world_sphere(PPCContext& context,const std::array<float,3>& from,const std::array<float,3>& to,float radius,NativeSphereResult& result,std::string& error) {
+static bool query_world_sphere(PPCContext& context,const std::array<float,3>& from,const std::array<float,3>& to,float radius,bool ground,NativeSphereResult& result,std::string& error) {
     result={};error.clear();
     if(mem_read32(0x80000000u)!=0x47334250u || context.r[13]!=0x802E22A0u || context.r[2]!=0x802F22A0u || context.r[1]<0x80002000u || context.r[1]>guest_ram_end()-4){error="Native sphere query context unavailable";return false;}
     if(!std::isfinite(radius) || radius<=0 || radius>100.f){error="Invalid native sphere radius";return false;}
     for(auto point:{from,to})for(float value:point)if(!std::isfinite(value) || std::abs(value)>1000000.f){error="Invalid native sphere segment";return false;}
-    const auto manager=mem_read32(0x802ABAA4);const auto* query=ssne_find_func(0x80140620);
-    if(!valid(manager,0x18) || mem_read32(manager)!=0x8021EB70u || !query || mem_read32(query->address)!=0x9421FDF8u){error="Native sphere query revision unavailable";return false;}
-    std::vector<uint8_t> stack(0x2000);for(unsigned i=0;i<stack.size();++i)stack[i]=mem_read8(context.r[1]-0x2000+i);
-    auto restore=[&](){for(unsigned i=0;i<stack.size();++i)mem_write8(context.r[1]-0x2000+i,stack[i]);};
+    const auto manager=mem_read32(0x802ABAA4);
+    const auto* query=ssne_find_func(ground?0x80141244u:0x80140620u);
+    if(!valid(manager,0x18) || mem_read32(manager)!=0x8021EB70u || !query ||
+       mem_read32(query->address)!=(ground?0x9421FE48u:0x9421FDF8u) ||
+       (ground && (mem_read16(0x8021EBD0u)!=0 || mem_read32(0x8021EBD4u)!=query->address))){
+        error="Native sphere query revision unavailable";return false;
+    }
+    std::array<uint8_t,0x2000> stack;
+    auto* scratch=host_ptr(context.r[1]-uint32_t(stack.size()));
+    std::memcpy(stack.data(),scratch,stack.size());
+    auto restore=[&](){std::memcpy(scratch,stack.data(),stack.size());};
     const auto a=context.r[1]-0x700,b=a+16,corrected=a+32,contacts=a+48;
     for(unsigned i=0;i<3;++i){mem_write32(a+i*4,f2u(from[i]));mem_write32(b+i*4,f2u(to[i]));mem_write32(corrected+i*4,f2u(to[i]));}
     for(unsigned i=0;i<20*48;i+=4)mem_write32(contacts+i,0);
-    // Captured original movement call800C065C:20 contacts, correction enabled,
-    // normal player collision mode1. Output position is resolved by native code.
     PPCContext call=context;call.msr&=~0x8000u;call.r[1]-=0x800;mem_write32(call.r[1],context.r[1]);call.r[3]=manager;call.r[4]=a;call.r[5]=b;call.r[6]=corrected;call.r[7]=contacts;call.r[8]=20;call.r[9]=1;call.r[10]=1;call.ps0[1]=call.ps1[1]=radius;
+    // Movement (800C065C) takes a separate corrected position and capacity.
+    // Ground support (800C0E5C) takes its 20-record output in r6. The PAL
+    // routine clears the optional trigger flag before querying the final hit.
+    if(ground)call.r[6]=contacts;
     try{ssne_call(call,query->address);}catch(...){restore();throw;}
     if(call.r[3]>20){restore();error="Native sphere contact count exceeded capacity";return false;}
     for(unsigned i=0;i<3;++i)result.position[i]=u2f(mem_read32(corrected+i*4));
-    for(unsigned n=0;n<call.r[3];++n){NativeSegmentHit hit;for(unsigned i=0;i<3;++i){hit.position[i]=u2f(mem_read32(contacts+n*48+i*4));hit.normal[i]=u2f(mem_read32(contacts+n*48+12+i*4));}hit.flags=mem_read32(contacts+n*48+32);result.contacts.push_back(hit);}
+    std::array<NativeSegmentHit,20> hits;
+    for(unsigned n=0;n<call.r[3];++n){auto& hit=hits[n];for(unsigned i=0;i<3;++i){hit.position[i]=u2f(mem_read32(contacts+n*48+i*4));hit.normal[i]=u2f(mem_read32(contacts+n*48+12+i*4));}hit.flags=mem_read32(contacts+n*48+32);hit.source_kind=mem_read32(contacts+n*48+36);}
     restore();
+    if(call.r[3])result.contacts.assign(hits.begin(),hits.begin()+call.r[3]);
     for(float value:result.position)if(!std::isfinite(value)){error="Invalid native sphere correction";return false;}
     for(const auto& hit:result.contacts)for(auto point:{hit.position,hit.normal})for(float value:point)if(!std::isfinite(value)){error="Invalid native sphere contact";return false;}
+    return true;
+}
+bool native_world_sphere(PPCContext& context,const std::array<float,3>& from,const std::array<float,3>& to,float radius,NativeSphereResult& result,std::string& error) {
+    return query_world_sphere(context,from,to,radius,false,result,error);
+}
+bool native_ground_support(PPCContext& context,const std::array<float,3>& centre,float radius,
+                           std::optional<NativeSegmentHit>& support,std::string& error) {
+    support.reset();
+    auto start=centre,end=centre;
+    start[1]+=.1f;end[1]-=.25f;
+    NativeSphereResult cast;
+    if(!query_world_sphere(context,start,end,radius,true,cast,error))return false;
+    if(cast.contacts.empty())return true;
+    const auto& hit=cast.contacts.back();
+    if((hit.source_kind!=0 && hit.source_kind!=4) || (hit.flags&0x80000000u) ||
+       hit.normal[1]>-.725f || hit.normal[1]<-1.001f)return true;
+    if(std::hypot(hit.position[0]-centre[0],hit.position[2]-centre[2])>.005f ||
+       hit.position[1]<end[1]-.005f || hit.position[1]>start[1]+.005f)return true;
+    support=hit;
     return true;
 }
 namespace {

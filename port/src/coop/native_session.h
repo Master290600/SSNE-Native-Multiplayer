@@ -1,6 +1,11 @@
 #pragma once
 #include "host_capture_clock.h"
 #include "hitmarker_replica.h"
+#include "local_shot_feedback.h"
+#include "local_native_weapon_presentation.h"
+#include "local_release_weapon_feedback.h"
+#include "local_weapon_loop_feedback.h"
+#include "local_movement.h"
 #include "authoritative_session.h"
 #include "native_bootstrap.h"
 #include "native_replica.h"
@@ -8,6 +13,7 @@
 #include <functional>
 #include <chrono>
 #include <deque>
+#include <set>
 #include <variant>
 #include <mutex>
 #include <atomic>
@@ -108,6 +114,7 @@ private:
     NativeWorld native_;
     NativeReplica replica_{native_};
     ClientPresentation presentation_;
+    LocalMovement local_movement_;
     HostCaptureClock host_capture_clock_;
     HostCaptureClock host_idle_publication_clock_;
     uint64_t host_publication_serial_=0;
@@ -175,6 +182,14 @@ private:
     std::deque<PendingSound> weapon_sounds_;
     uint64_t weapon_sound_order_=0;
     bool drain_weapon_sounds(PPCContext&);
+    void update_local_shot_feedback(PPCContext&,double now);
+    LocalShotFeedback local_shot_feedback_;
+    LocalReleaseWeaponFeedback local_release_weapon_feedback_;
+    LocalWeaponLoopFeedback local_weapon_loop_feedback_;
+    LocalNativeWeaponPresentation local_native_weapon_motion_;
+    uint64_t local_weapon_origin_epoch_=0;
+    std::array<std::map<uint64_t,std::pair<uint64_t,unsigned>>,2> local_weapon_origins_;
+    std::set<uint64_t> local_weapon_last_rounds_;
     std::chrono::steady_clock::time_point test_replica_next_{};
     std::chrono::steady_clock::time_point replica_effect_time_{};
     NativeHudPresentationClock replica_hud_clock_{};

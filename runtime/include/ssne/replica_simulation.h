@@ -17,6 +17,17 @@ uint32_t prepare_native_gameplay_gui(PPCContext&,std::string& error);
 void replica_clear_enemy_poses();
 bool replica_enemy_pose(uint32_t object,uint32_t model,const std::vector<float>& pose);
 bool replica_weapon_pose(uint32_t actor,unsigned weapon,unsigned index,const std::vector<float>& pose);
+// First-person PAL animation asset. Duration and sample times use native
+// 1x playback. The remaining fields bind a local clip to its current rig.
+struct NativeLocalWeaponClip {
+    float duration=0.f;
+    uint32_t model=0,resource=0,data=0,logical=0,animation=0,frames=0;
+    uint32_t initial_animation=UINT32_MAX,initial_frame=0;
+};
+std::optional<NativeLocalWeaponClip> native_local_weapon_clip(uint32_t actor,unsigned weapon,unsigned hand,unsigned logical);
+bool sample_native_local_weapon_clip(PPCContext&,uint32_t actor,unsigned weapon,unsigned hand,
+                                     const NativeLocalWeaponClip&,float seconds,std::vector<float>& pose,
+                                     uint32_t* sampled_frame=nullptr);
 std::optional<std::array<float,12>> native_weapon_camera_reference(uint32_t instance);
 struct NativeMovieState {uint64_t sequence=0;std::string asset;uint32_t frame=0;bool active=false;};
 NativeMovieState native_movie_state();

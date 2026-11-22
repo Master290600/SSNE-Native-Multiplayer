@@ -19,6 +19,7 @@ bool clear_native_replica_results(PPCContext&,std::string&);
 bool native_replica_results_presenting();
 // Main-thread visibility is atomic; menu access and ticking remain guest-thread only.
 bool native_results_presenting();
+bool take_native_results_save_failure();
 uint32_t native_results_menu();
 bool tick_native_results_auto_continue(PPCContext&,void (*before_continue)(PPCContext&),std::string&);
 }

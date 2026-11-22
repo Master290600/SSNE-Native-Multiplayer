@@ -16,6 +16,7 @@ struct Release {
 
 const char* release_feed_url();  // configured project feed, before the testing override
 const char* current_version();  // this launcher's version (SSNE_VERSION)
+bool is_newer_version(const std::string& candidate, const std::string& installed);
 
 // Fetches the latest release. True with `r` filled if it is newer than this launcher and has a package for this
 // OS; false otherwise (error set only if the check itself failed).

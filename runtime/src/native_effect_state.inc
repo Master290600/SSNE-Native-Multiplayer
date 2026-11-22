@@ -107,7 +107,7 @@ bool native_effect_load_state(const std::vector<uint8_t>& bytes,std::string& err
     if(!r.ok || r.pos!=bytes.size()-8)return fail("Truncated or trailing native effect checkpoint data");
     producer_epoch=s.epoch;producer_accepted=s.accepted;hit_sequence=s.tails[0];sequence=s.tails[1];shot_sequence=s.tails[2];loop_sequence=s.tails[3];impact_sequence=s.tails[4];feedback_sequence=s.tails[5];trail_sequence=s.tails[6];emitter_sequence=s.tails[7];casing_sequence=s.tails[8];surface_sequence=s.tails[9];beam_sequence=s.tails[10];audio_order=s.order;automatic_ray_sequence=s.ray;
     confirmed_hits.swap(s.hits);history.swap(s.rockets);shots.swap(s.shots);loop_history.swap(s.loops);impacts.swap(s.impacts);feedback_events.swap(s.feedback);trails.swap(s.trails);emitters.swap(s.emitters);casings.swap(s.casings);surfaces.swap(s.surfaces);beams.swap(s.beams);host_loops.swap(s.active);host_cue_voices.swap(s.cues);weapon_shot_ids.swap(s.weapons);rocket_sources.swap(s.sources);queued_rockets.swap(s.queued);
-    replica_trail_frame.reset();replica_bomb_frame.reset();replica_beam_frames.clear();replica_beams.clear();replica_surfaces.clear();
+    replica_trail_frame.reset();replica_bomb_frame.reset();replica_beam_frames.clear();replica_sirian_views={};replica_beams.clear();replica_surfaces.clear();
     return true;
 }
 

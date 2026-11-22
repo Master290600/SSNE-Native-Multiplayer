@@ -1,4 +1,5 @@
 #include "ssne/native_effect.h"
+#include "ssne/native_gas_view.h"
 #include "ssne/native_entity.h"
 #include "ssne/recomp_hooks.h"
 #include "ssne/runtime.h"
@@ -34,6 +35,7 @@ template<class T>void retain_native_event(std::deque<T>& queue,const T& event){
     queue.push_back(event);
 }
 std::deque<NativeWeaponShot> shots;
+std::array<uint64_t,8> native_weapon_press{};
 std::atomic<bool> test_fire_request{false};
 PPCFunc original_loop_start=nullptr,original_loop_stop=nullptr;
 struct HostLoop {NativeWeaponLoop event;std::chrono::steady_clock::time_point began;};
@@ -71,6 +73,14 @@ std::map<uint32_t,QueuedRocket> queued_rockets;
 std::array<uint32_t,10> queued_words(uint32_t p){std::array<uint32_t,10> out;const unsigned offsets[]={0,8,12,16,20,24,28,32,36,44};for(unsigned i=0;i<out.size();++i)out[i]=mem_read32(p+offsets[i]);return out;}
 PPCFunc original_query=nullptr;unsigned query_probes=0,impact_probes=0;
 PPCFunc original_feedback_sound=nullptr,original_feedback_score=nullptr;
+PPCFunc original_enemy_spawn_flash=nullptr;
+constexpr unsigned enemy_spawn_cue=0x151;
+// PAL's flash factory plays this positional sound. A positive radius extends
+// its existing cue payload; protocol-71 clients that predate the sprite play
+// the same sound and can acknowledge the event normally.
+bool has_enemy_spawn_flash(const NativeFeedbackEvent& event){
+    return event.kind==0 && event.code==enemy_spawn_cue && event.values[3]!=0;
+}
 std::deque<NativeFeedbackEvent> feedback_events;uint64_t feedback_sequence=0;
 PPCFunc original_impact=nullptr;std::deque<NativeBulletImpact> impacts;uint64_t impact_sequence=0;
 PPCFunc original_trail=nullptr;
@@ -387,6 +397,7 @@ void track_shot_voice(uint32_t handle,uint64_t event) {
 void loop_start_hook(PPCContext& c) {
     NativeWeaponLoop event;const bool uzi=(c.lr==0x80061378u || c.lr==0x800616D8u) && c.r[3]==419 && c.r[4]==0;const bool minigun=(c.lr==0x800578D0u || c.lr==0x80057E78u) && c.r[3]==406 && c.r[4]==1;event.weapon=minigun?4:2;bool capture=authoritative && (uzi || minigun) && readable(c.r[31],minigun?0x294:0x248) && mem_read32(c.r[31]+0xC)==(minigun?0x801FB598u:0x801FC858u);
     if(capture){const auto actor=mem_read32(c.r[31]+0x1D4);capture=readable(actor,0x790) && mem_read32(actor+0x48)==0x802121E8u;if(capture){event.slot=mem_read32(actor+0x17C);event.active=true;event.lane=mem_read32(actor+0x4BC+event.weapon*24)==c.r[31]?0:1;capture=mem_read32(actor+0x4BC+event.weapon*24+event.lane*4)==c.r[31];for(unsigned i=0;i<3;++i)event.position[i]=u2f(mem_read32(actor+0x20+i*4));capture=capture && event.slot<8 && event.lane<2 && std::all_of(event.position.begin(),event.position.end(),[](float value){return std::isfinite(value) && std::abs(value)<=1000000.f;});}}
+    if(capture)event.input_press=native_weapon_press[event.slot];
     PartySoundGate gate(c,capture && minigun);ssne_call_original(c,0x8010EB9C,original_loop_start);gate.restore();
     if(capture && int32_t(c.r[3])>=0){std::lock_guard lock(effect_mutex);event.sequence=loop_sequence+1;event.origin=event.sequence;std::string why;if(!validate_native_weapon_loop(event,why)){log_message("[coop-weapon-loop-rejected] "+why);return;}loop_sequence=event.sequence;event.order=++audio_order;host_loops[c.r[3]]={event,std::chrono::steady_clock::now()};retain_native_event(loop_history,event);log_message(std::string(event.weapon==2?"[coop-uzi-loop-host] sequence=":"[coop-minigun-loop-host] sequence=")+std::to_string(event.sequence)+" slot="+std::to_string(event.slot)+" lane="+std::to_string(event.lane)+" active=1 duration_ms=0 origin="+std::to_string(event.origin)+" order="+std::to_string(event.order));}
 }
@@ -439,14 +450,64 @@ void shot_hook(PPCContext& c) {
     }
     const auto instance=c.r[instance_register];
     bool capture=authoritative && known && readable(instance,0x1D8) && (!table || mem_read32(instance+0xC)==table);
-    if(capture){const auto actor=mem_read32(instance+0x1D4);capture=readable(actor,0x790) && mem_read32(actor+0x48)==0x802121E8u;if(capture){capture=mem_read32(actor+0x4BC+shot.weapon*24)==instance || mem_read32(actor+0x4C0+shot.weapon*24)==instance;shot.slot=mem_read32(actor+0x17C);for(unsigned i=0;i<3;++i)shot.position[i]=u2f(mem_read32(actor+0x20+i*4));std::string why;capture=capture && validate_native_weapon_shot(shot,why);}}
+    if(capture){
+        const auto actor=mem_read32(instance+0x1D4);
+        capture=readable(actor,0x790) && mem_read32(actor+0x48)==0x802121E8u;
+        if(capture){
+            for(unsigned hand=0;hand<2;++hand)
+                if(mem_read32(actor+0x4BC+shot.weapon*24+hand*4)==instance){shot.hand=hand;break;}
+            shot.slot=mem_read32(actor+0x17C);
+            for(unsigned i=0;i<3;++i)shot.position[i]=u2f(mem_read32(actor+0x20+i*4));
+            std::string why;
+            capture=shot.hand<2 && validate_native_weapon_shot(shot,why);
+            if(capture){
+                shot.input_press=native_weapon_press[shot.slot];
+                shot.last_round=shot.weapon==1 && c.lr==0x8005643Cu && readable(instance,0x22C) &&
+                                mem_read32(instance+0x228)==11;
+            }
+        }
+    }
     PartySoundGate gate(c,capture && shot.weapon==4);ssne_call_original(c,0x8010E7B0,original_shot);gate.restore();
     if(capture_combo && int32_t(c.r[3])>=0){std::lock_guard lock(effect_mutex);combo.sequence=++feedback_sequence;retain_native_event(feedback_events,combo);}
     if(capture_pickup){std::lock_guard lock(effect_mutex);pickup.sequence=++feedback_sequence;retain_native_event(feedback_events,pickup);log_message("[coop-pickup-sound-host] sequence="+std::to_string(pickup.sequence)+" slot="+std::to_string(pickup.variant)+" code="+std::to_string(pickup.code));}
     if(capture_step){std::lock_guard lock(effect_mutex);step.sequence=++feedback_sequence;retain_native_event(feedback_events,step);}
     if(capture){std::lock_guard lock(effect_mutex);shot.sequence=++shot_sequence;shot.order=++audio_order;if(shot.cue_sound && int32_t(c.r[3])>=0)host_cue_voices[c.r[3]]=shot.sequence;if(!shot.cue_sound && (shot.weapon==1 || shot.weapon==3 || shot.weapon==6))weapon_shot_ids[instance]=shot.sequence;retain_native_event(shots,shot);track_shot_voice(c.r[3],shot.sequence);log_message(std::string(shot.cue_sound?"[coop-weapon-cue-host] sequence=":"[coop-weapon-shot-host] sequence=")+std::to_string(shot.sequence)+" slot="+std::to_string(shot.slot)+" voice="+std::to_string(int32_t(c.r[3]))+" x="+std::to_string(shot.position[0])+" y="+std::to_string(shot.position[1])+" z="+std::to_string(shot.position[2])+" weapon="+std::to_string(shot.weapon)+" cue_sound="+std::to_string(shot.cue_sound)+" order="+std::to_string(shot.order));}
 }
+void enemy_spawn_flash_hook(PPCContext& c) {
+    constexpr uint32_t factory=0x800EA2B0u;
+    // The PAL scripted spawn and wave spawn call this only when their authored
+    // flash flag is set. Other callers use the same pool for players and props.
+    const bool enemy_spawner=c.lr==0x8007A684u || c.lr==0x8007C894u;
+    if(!enemy_spawner || !authoritative || presenting){
+        if(!(enemy_spawner && replica_simulation() && !presenting))
+            ssne_call_original(c,factory,original_enemy_spawn_flash);
+        return;
+    }
+    NativeFeedbackEvent event;
+    event.code=enemy_spawn_cue;
+    const auto count_address=c.r[13]-0x5F48u;
+    const auto before=mem_read32(count_address);
+    bool capture=c.r[4]==UINT32_MAX && c.r[5]==1 && readable(c.r[3],12);
+    if(capture){
+        for(unsigned axis=0;axis<3;++axis)event.values[axis]=u2f(mem_read32(c.r[3]+axis*4));
+        event.values[3]=float(c.ps0[1]);
+        std::string why;
+        capture=validate_native_feedback(event,why);
+    }
+    ssne_call_original(c,factory,original_enemy_spawn_flash);
+    if(capture && mem_read32(count_address)==before+1){
+        std::lock_guard lock(effect_mutex);
+        event.sequence=++feedback_sequence;
+        retain_native_event(feedback_events,event);
+        if(getenv("SSNE_COOP_TRACE_LIFETIMES"))
+            log_message("[coop-enemy-spawn-flash-host] sequence="+std::to_string(event.sequence)+" x="+std::to_string(event.values[0])+" y="+std::to_string(event.values[1])+" z="+std::to_string(event.values[2])+" scale="+std::to_string(event.values[3]));
+    }
+}
 void feedback_sound_hook(PPCContext& c) {
+    // Enemy constructors and retirement can also run when applying a baseline.
+    // The PAL enemy voice dispatcher already sends the host's actual sample
+    // through the feedback journal for a live event.
+    if(replica_simulation() && c.lr==0x80096E08u){c.r[3]=UINT32_MAX;return;}
     if(replica_simulation() && !presenting && mem_read32(0x802DB1BC)==1){c.r[3]=UINT32_MAX;return;}
     NativeFeedbackEvent event;event.code=c.r[3];
     bool capture=authoritative && !presenting && readable(c.r[4],12);
@@ -571,6 +632,11 @@ bool install_native_rocket_effect_capture(bool host,std::string& error) {
     for(const auto [address,signature]:{std::pair{0x8010E86Cu,0x9421FFE0u},std::pair{0x800DB980u,0x9421FFB8u},std::pair{0x800DB850u,0x9421FFE0u}})if(!ssne_find_func(address) || mem_read32(address)!=signature){error="Native feedback lifecycle unavailable";return false;}
     if(!ssne_find_func(0x800DC310) || mem_read32(0x800DC310)!=0x9421FFC0u || !ssne_find_func(0x800DC694) || mem_read32(0x800DC694)!=0x9421FFE8u){error="Native gib presentation lifecycle unavailable";return false;}
     if(!ssne_find_func(0x800EA1C0u) || mem_read32(0x800EA1C0u)!=0x9421FFE8u){error="Native spawn flash updater unavailable";return false;}
+    if(!ssne_find_func(0x800EA2B0u) || mem_read32(0x800EA2B0u)!=0x9421FFB0u){error="Native spawn flash factory unavailable";return false;}
+    if(!original_enemy_spawn_flash){
+        original_enemy_spawn_flash=ssne_find_func(0x800EA2B0u)->func;
+        ssne_install_hook(0x800EA2B0u,enemy_spawn_flash_hook);
+    }
     if(!ssne_find_func(0x800CBAC4u) || mem_read32(0x800CBAC4u)!=0x9421FFB8u){error="Native scenery fragment lifecycle unavailable";return false;}
     if(!original_prop_fragments){original_prop_fragments=ssne_find_func(0x800CBAC4u)->func;ssne_install_hook(0x800CBAC4u,prop_fragment_hook);}
     if(!original_gib){original_gib=ssne_find_func(0x800DC310)->func;ssne_install_hook(0x800DC310,gib_hook);}
@@ -591,7 +657,7 @@ bool install_native_rocket_effect_capture(bool host,std::string& error) {
     if(!original_shot){original_shot=ssne_find_func(0x8010E7B0)->func;ssne_install_hook(0x8010E7B0,shot_hook);}
     for(auto address:{0x8010EB9Cu,0x8010ED14u,0x8010EDFCu})if(!ssne_find_func(address)){error="Native Uzi loop lifecycle unavailable";return false;}
     if(!original_loop_start){original_loop_start=ssne_find_func(0x8010EB9C)->func;ssne_install_hook(0x8010EB9C,loop_start_hook);original_loop_stop=ssne_find_func(0x8010EDFC)->func;ssne_install_hook(0x8010EDFC,loop_stop_hook);}
-    if(!subscription)subscription=observe_native_entities([](const NativeEntityNotice& n){if(n.event==NativeEntityNotice::Event::Removing){std::lock_guard lock(effect_mutex);rocket_sources.erase(n.object);}if(n.event==NativeEntityNotice::Event::LevelExit){std::lock_guard lock(effect_mutex);rocket_sources.clear();queued_rockets.clear();pickup_notices={};pickup_notice_serial=0;++producer_epoch;producer_accepted={};history.clear();shots.clear();loop_history.clear();impacts.clear();feedback_events.clear();pending_splatters.clear();feedback_sequence=0;trails.clear();replica_trails.clear();replica_trail_views.clear();trail_sequence=0;replica_trail_frame.reset();emitters.clear();emitter_sequence=0;casings.clear();replica_casings.clear();casing_sequence=0;surfaces.clear();replica_surfaces.clear();surface_sequence=0;beams.clear();replica_beams.clear();beam_sequence=0;replica_beam_frames.clear();replica_bomb_frame.reset();confirmed_hits.clear();hit_sequence=0;automatic_ray_sequence=0;host_loops.clear();host_cue_voices.clear();replica_cue_voices.clear();replica_loops.clear();sequence=shot_sequence=loop_sequence=impact_sequence=audio_order=0;weapon_shot_ids.clear();}});
+    if(!subscription)subscription=observe_native_entities([](const NativeEntityNotice& n){if(n.event==NativeEntityNotice::Event::Removing){std::lock_guard lock(effect_mutex);rocket_sources.erase(n.object);}if(n.event==NativeEntityNotice::Event::LevelExit){std::lock_guard lock(effect_mutex);rocket_sources.clear();queued_rockets.clear();pickup_notices={};pickup_notice_serial=0;++producer_epoch;producer_accepted={};history.clear();shots.clear();loop_history.clear();impacts.clear();feedback_events.clear();pending_splatters.clear();feedback_sequence=0;trails.clear();replica_trails.clear();replica_trail_views.clear();trail_sequence=0;replica_trail_frame.reset();emitters.clear();emitter_sequence=0;casings.clear();replica_casings.clear();casing_sequence=0;surfaces.clear();replica_surfaces.clear();surface_sequence=0;beams.clear();replica_beams.clear();beam_sequence=0;replica_beam_frames.clear();replica_sirian_views={};replica_bomb_frame.reset();confirmed_hits.clear();hit_sequence=0;automatic_ray_sequence=0;host_loops.clear();host_cue_voices.clear();replica_cue_voices.clear();replica_loops.clear();sequence=shot_sequence=loop_sequence=impact_sequence=audio_order=0;weapon_shot_ids.clear();}});
     return true;
 }
 std::vector<NativeRocketEffect> native_rocket_effect_history(){std::lock_guard lock(effect_mutex);return {history.begin(),history.end()};}
@@ -600,6 +666,9 @@ std::vector<NativeBulletImpact> native_bullet_impact_history(){std::lock_guard l
 std::vector<NativeBulletTrail> native_bullet_trail_history(){std::lock_guard lock(effect_mutex);return {trails.begin(),trails.end()};}
 std::vector<NativeWeaponEmitter> native_weapon_emitter_history(){std::lock_guard lock(effect_mutex);return {emitters.begin(),emitters.end()};}
 bool validate_native_weapon_emitter(const NativeWeaponEmitter& e,std::string& error){return emitter_event_valid(e,error);}
+void present_local_gas_stream(PPCContext& c,uint32_t actor,uint64_t epoch,bool firing,double now){
+    render_owner_gas(c,actor,epoch,firing,now);
+}
 bool play_native_weapon_emitter(PPCContext& c,const NativeWeaponEmitter& e,std::string& error){return replay_native_emitter(c,e,error);}
 std::vector<NativeWeaponCasing> native_weapon_casing_history(){std::lock_guard lock(effect_mutex);return {casings.begin(),casings.end()};}
 bool validate_native_weapon_casing(const NativeWeaponCasing& e,std::string& error){return casing_event_valid(e,error);}
@@ -610,6 +679,7 @@ bool play_native_weapon_surface(PPCContext& c,const NativeWeaponSurface& e,std::
 std::vector<NativeWeaponBeam> native_weapon_beam_history(){std::lock_guard lock(effect_mutex);return {beams.begin(),beams.end()};}
 bool validate_native_weapon_beam(const NativeWeaponBeam& e,std::string& error){return beam_event_valid(e,error);}
 bool play_native_weapon_beam(PPCContext& c,const NativeWeaponBeam& e,std::string& error){return queue_native_beam(c,e,error);}
+std::optional<NativeSirianWeaponView> replica_sirian_weapon_view(unsigned hand,bool charge){return sirian_weapon_view(hand,charge);}
 bool capture_native_bomb_visual(uint32_t actor,unsigned hand,std::vector<float>& v,std::array<uint32_t,2>& masks,std::string& error){return capture_bomb_visual(actor,hand,v,masks,error);}
 bool validate_native_bomb_visual(const std::vector<float>& v,const std::array<uint32_t,2>& masks,std::string& error){return bomb_visual_valid(v,masks,error);}
 bool apply_native_bomb_visual(PPCContext& c,uint32_t actor,unsigned hand,const std::vector<float>& v,const std::array<uint32_t,2>& masks,std::string& error){return apply_bomb_visual(c,actor,hand,v,masks,error);}
@@ -684,7 +754,51 @@ bool apply_native_weapon_loop(PPCContext& context,const NativeWeaponLoop& event,
     PartySoundGate gate(call,event.weapon==4);ssne_call(call,local_player?0x8010EB9Cu:0x8010EC58u);gate.restore();if(getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_COOP_TRACE_LIFETIMES") && event.weapon==4)log_message("[coop-minigun-audio-gate] order="+std::to_string(event.order)+" previous="+std::to_string(gate.previous)+" restored="+std::to_string(mem_read32(call.r[13]-0x5BB0)));if(int32_t(call.r[3])<0){error="Native Uzi loop voice not started";return false;}replica_loops[key]={call.r[3],event.origin,std::chrono::steady_clock::now()-std::chrono::milliseconds(event.elapsed_ms),{},event.weapon};track_shot_voice(call.r[3],0x100000000ull+event.sequence);
     log_message(std::string(event.weapon==2?"[coop-uzi-loop-client] sequence=":"[coop-minigun-loop-client] sequence=")+std::to_string(event.sequence)+" slot="+std::to_string(event.slot)+" lane="+std::to_string(event.lane)+" active=1 duration_ms=0 voice="+std::to_string(call.r[3])+" local="+std::to_string(local_player)+" origin="+std::to_string(event.origin)+" damage_calls="+std::to_string(presentation_damage_calls)+" order="+std::to_string(event.order)+" elapsed_ms="+std::to_string(event.elapsed_ms));return true;
 }
-void disable_native_rocket_effect_capture(){clear_native_hitmarkers();authoritative=false;test_fire_request=false;std::lock_guard lock(effect_mutex);rocket_sources.clear();queued_rockets.clear();pickup_notices={};pickup_notice_serial=0;++producer_epoch;producer_accepted={};history.clear();shots.clear();confirmed_hits.clear();loop_history.clear();impacts.clear();feedback_events.clear();pending_splatters.clear();feedback_sequence=0;trails.clear();replica_trails.clear();replica_trail_views.clear();trail_sequence=0;replica_trail_frame.reset();emitters.clear();emitter_sequence=0;casings.clear();replica_casings.clear();casing_sequence=0;surfaces.clear();replica_surfaces.clear();surface_sequence=0;beams.clear();replica_beams.clear();beam_sequence=0;replica_beam_frames.clear();replica_bomb_frame.reset();host_loops.clear();host_cue_voices.clear();replica_cue_voices.clear();replica_loops.clear();hit_resolver={};weapon_shot_ids.clear();hit_sequence=0;automatic_ray_sequence=0;sequence=shot_sequence=loop_sequence=impact_sequence=audio_order=0;}
+bool start_local_weapon_loop(PPCContext& context,const NativeWeaponLoop& event,std::string& error){
+    if(authoritative || !event.active || !(event.origin&(uint64_t(1)<<62)) ||
+       !validate_native_weapon_loop(event,error))return false;
+    if(replica_loops.contains(event.slot*2+event.lane))return false;
+    return apply_native_weapon_loop(context,event,true,error);
+}
+
+void set_native_weapon_press(unsigned slot,uint64_t press){
+    if(slot<native_weapon_press.size())native_weapon_press[slot]=press;
+}
+
+bool stop_local_weapon_loop(PPCContext& context,unsigned slot,unsigned lane,uint64_t origin){
+    if(authoritative || !context_ok(context) || slot>=8 || lane>1 || !origin)return false;
+    const auto found=replica_loops.find(slot*2+lane);
+    if(found==replica_loops.end() || found->second.origin!=origin)return false;
+    if(weapon_loop_handle_alive(found->second.handle)){
+        Scratch scratch(context);
+        auto call=context;
+        call.msr&=~0x8000u;
+        call.r[1]-=0x100;
+        mem_write32(call.r[1],context.r[1]);
+        call.r[3]=found->second.handle;
+        PresentationScope presentation;
+        ssne_call(call,0x8010EDFC);
+    }
+    replica_loops.erase(found);
+    return true;
+}
+
+bool adopt_local_weapon_loop(uint64_t local_origin,const NativeWeaponLoop& event){
+    std::string ignored;
+    if(authoritative || !event.active || !(local_origin&(uint64_t(1)<<62)) ||
+       !validate_native_weapon_loop(event,ignored))return false;
+    const auto found=replica_loops.find(event.slot*2+event.lane);
+    if(found==replica_loops.end() || found->second.origin!=local_origin ||
+       found->second.weapon!=event.weapon || !weapon_loop_handle_alive(found->second.handle))return false;
+    found->second.origin=event.origin;
+    log_message("[coop-local-weapon-loop-confirmed] slot="+std::to_string(event.slot)+
+                " weapon="+std::to_string(event.weapon)+" lane="+std::to_string(event.lane)+
+                " predicted_origin="+std::to_string(local_origin)+" origin="+std::to_string(event.origin)+
+                " voice="+std::to_string(found->second.handle));
+    return true;
+}
+
+void disable_native_rocket_effect_capture(){native_weapon_press={};clear_native_hitmarkers();authoritative=false;test_fire_request=false;std::lock_guard lock(effect_mutex);rocket_sources.clear();queued_rockets.clear();pickup_notices={};pickup_notice_serial=0;++producer_epoch;producer_accepted={};history.clear();shots.clear();confirmed_hits.clear();loop_history.clear();impacts.clear();feedback_events.clear();pending_splatters.clear();feedback_sequence=0;trails.clear();replica_trails.clear();replica_trail_views.clear();trail_sequence=0;replica_trail_frame.reset();emitters.clear();emitter_sequence=0;casings.clear();replica_casings.clear();casing_sequence=0;surfaces.clear();replica_surfaces.clear();surface_sequence=0;beams.clear();replica_beams.clear();beam_sequence=0;replica_beam_frames.clear();replica_sirian_views={};replica_bomb_frame.reset();host_loops.clear();host_cue_voices.clear();replica_cue_voices.clear();replica_loops.clear();hit_resolver={};weapon_shot_ids.clear();hit_sequence=0;automatic_ray_sequence=0;sequence=shot_sequence=loop_sequence=impact_sequence=audio_order=0;}
 // Native stop API retires records by generation-tagged handle; stale handles
 // must never stop a newly reused sound record.
 std::vector<int64_t> native_weapon_cue_state(){
@@ -732,6 +846,33 @@ bool play_native_weapon_shot(PPCContext& context,const NativeWeaponShot& shot,bo
     track_shot_voice(call.r[3],shot.sequence);
     log_message(std::string(shot.cue_sound?"[coop-weapon-cue-client] sequence=":"[coop-weapon-shot-client] sequence=")+std::to_string(shot.sequence)+" slot="+std::to_string(shot.slot)+" local="+std::to_string(local_player)+" voice="+std::to_string(call.r[3])+" damage_calls="+std::to_string(presentation_damage_calls)+" x="+std::to_string(shot.position[0])+" y="+std::to_string(shot.position[1])+" z="+std::to_string(shot.position[2])+" weapon="+std::to_string(shot.weapon)+" cue_sound="+std::to_string(shot.cue_sound)+" order="+std::to_string(shot.order));return true;
 }
+bool adopt_local_weapon_cue(uint64_t local_sequence,const NativeWeaponShot& shot){
+    if(authoritative || !(local_sequence&(uint64_t(1)<<62)) || !shot.cue_sound)return false;
+    auto local=replica_cue_voices.extract(local_sequence);
+    if(local.empty() || !weapon_loop_handle_alive(local.mapped()))return true;
+    const auto handle=local.mapped();
+    local.key()=shot.sequence;
+    replica_cue_voices.insert(std::move(local));
+    log_message("[coop-local-weapon-cue-adopted] sequence="+std::to_string(shot.sequence)+
+                " slot="+std::to_string(shot.slot)+" weapon="+std::to_string(shot.weapon)+
+                " cue="+std::to_string(shot.cue_sound)+" voice="+std::to_string(handle));
+    return true;
+}
+
+void stop_local_weapon_cue(PPCContext& context,uint64_t sequence){
+    if(authoritative || !context_ok(context) || !sequence)return;
+    const auto cue=replica_cue_voices.extract(sequence);
+    if(cue.empty() || !weapon_loop_handle_alive(cue.mapped()))return;
+    Scratch scratch(context);
+    auto call=context;
+    call.msr&=~0x8000u;
+    call.r[1]-=0x100;
+    mem_write32(call.r[1],context.r[1]);
+    call.r[3]=cue.mapped();
+    PresentationScope presentation;
+    ssne_call(call,0x8010EDFC);
+}
+
 bool play_native_rocket_effect(PPCContext& context,const NativeRocketEffect& e,std::string& error) {
     if(!context_ok(context) || !validate_native_rocket_effect(e,error)){if(error.empty())error="Native rocket effect context unavailable";return false;}
     const auto& type=explosion_classes[e.style];
@@ -784,6 +925,13 @@ bool play_native_energy_transition(PPCContext& context,uint32_t object,std::stri
 }
 bool validate_native_feedback(const NativeFeedbackEvent& e,std::string& error) {
     for(auto v:e.values)if(!std::isfinite(v) || std::abs(v)>1000000.f){error="Invalid native feedback coordinates";return false;}
+    if(has_enemy_spawn_flash(e)){
+        if(e.variant || e.values[3]<=0 || e.values[3]>1000.f ||
+           std::any_of(e.values.begin()+4,e.values.end(),[](float v){return v!=0;})){
+            error="Invalid enemy spawn flash payload";return false;
+        }
+        return true;
+    }
     if(e.kind==8 || e.kind==9){
         if(e.variant>=8 || (e.kind==8 && ((e.code && (e.code<0x180 || e.code>0x183)) || e.values[0]!=0)) || (e.kind==9 && (e.code!=0x89 || e.values[0]!=0)) || std::any_of(e.values.begin()+1,e.values.end(),[](float v){return v!=0;})){error="Invalid native combo audio";return false;}return true;
     }
@@ -798,7 +946,17 @@ bool play_native_feedback(PPCContext& context,const NativeFeedbackEvent& e,std::
     Scratch scratch(context);auto call=context;call.msr&=~0x8000u;call.r[1]-=0x200;mem_write32(call.r[1],context.r[1]);
     for(unsigned i=0;i<6;++i)mem_write32(call.r[1]+0x80+i*4,f2u(e.values[i]));
     PresentationScope presentation;
-    if(!e.kind || e.kind==5 || e.kind==10){
+    if(has_enemy_spawn_flash(e)){
+        // This original transient allocates the sprite, plays its positional
+        // teleport cue and scales it for the local views. It creates no actor.
+        call.r[3]=call.r[1]+0x80;
+        call.r[4]=UINT32_MAX;
+        call.r[5]=1;
+        call.ps0[1]=call.ps1[1]=e.values[3];
+        ssne_call(call,0x800EA2B0u);
+        if(getenv("SSNE_COOP_TRACE_LIFETIMES"))
+            log_message("[coop-enemy-spawn-flash-client] sequence="+std::to_string(e.sequence)+" x="+std::to_string(e.values[0])+" y="+std::to_string(e.values[1])+" z="+std::to_string(e.values[2])+" scale="+std::to_string(e.values[3])+" active="+std::to_string(mem_read32(context.r[13]-0x5F48u)));
+    }else if(!e.kind || e.kind==5 || e.kind==10){
         const auto resource=0x8023AD70u+e.code*24;const auto variants=mem_read32(resource+8);
         if(!variants || variants>256 || !readable(mem_read32(resource+12),variants*4)){error="Native feedback sound resource unavailable";return false;}
         const bool own_pickup=(e.kind==5 || e.kind==10) && int(e.variant)==netplay_local_player();

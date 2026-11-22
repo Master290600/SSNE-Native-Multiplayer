@@ -1,4 +1,5 @@
 #include "ssne/native_results.h"
+#include "ssne/exi.h"
 #include "ssne/native_results_countdown.h"
 #include <chrono>
 #include "ssne/native_entity.h"
@@ -17,9 +18,11 @@ namespace ssne {
 namespace {
 std::optional<NativeResults> result;
 uint32_t gui=0;uint64_t sequence=0,subscription=0,saved_sequence=0;
+uint32_t result_save_manager=0;
 bool save_host=false;PPCFunc continue_original=nullptr,results_original=nullptr,results_cleanup_original=nullptr,results_setup_original=nullptr;
 uint64_t results_setup_serial=0;
 std::atomic<bool> host_results_open{false};
+std::atomic<bool> result_save_failure_notice{false};
 NativeResultsCountdown results_countdown;
 std::atomic<bool> replica_results_open{false};uint32_t replica_results_gui=0;uint64_t replica_results_sequence=0;
 thread_local bool creating_replica_result_title=false;
@@ -74,12 +77,14 @@ void card_cleanup(PPCContext& context){
     }
 }
 void install_card_guards(){
-    constexpr std::array<std::pair<uint32_t,uint64_t>,8> fingerprints{{
+    constexpr std::array<std::pair<uint32_t,uint64_t>,11> fingerprints{{
         {0x80105010u,0xd57d1e8aee5999ccull},
         {0x8010634Cu,0x23be16db54772843ull},{0x80106408u,0xd764b180304120a6ull},
         {0x8010649Cu,0xcd349c3e01d5967eull},{0x80106554u,0xcd349c3e01d5967eull},
         {0x801066ACu,0xbdf9e9fbf2057e22ull},{0x80106678u,0x912b2b560dbe1547ull},
-        {0x80105B6Cu,0x25a0e716f17b59e7ull}}};
+        {0x80105B6Cu,0x25a0e716f17b59e7ull},
+        {0x801073ACu,0x93cc04aa70be11dbull},{0x80107254u,0xb0e6ee4aa090932aull},
+        {0x80107100u,0xe94d35e810d102f5ull}}};
     for(auto [address,expected]:fingerprints){
         uint64_t hash=14695981039346656037ull;
         for(unsigned i=0;i<32;++i){hash^=mem_read8(address+i);hash*=1099511628211ull;}
@@ -95,6 +100,55 @@ void install_card_guards(){
     ssne_install_hook(0x80105B6Cu,trace_card_callback<0x80105B6Cu>);
 }
 bool readable(uint32_t p,unsigned n){return p>=0x80000000u && n<=guest_ram_size() && p<=guest_ram_end()-n;}
+bool owns_result_save(const PPCContext& context){
+    const uint32_t manager=result_save_manager;
+    const auto channel=context.r[3];
+    return manager && save_host && !replica_simulation() && channel==0 &&
+       context.r[13]==0x802E22A0u && readable(manager,0x18) &&
+       manager==mem_read32(context.r[13]-0x7610u) && channel==mem_read32(manager+8) &&
+       gui && gui==mem_read32(context.r[13]-0x760Cu);
+}
+void abandon_result_save(){
+    if(result_save_manager)exi_cancel_result_save();
+    result_save_manager=0;
+}
+void finish_failed_save(PPCContext& context,int32_t error){
+    const auto channel=context.r[3];
+    const auto manager=result_save_manager;
+    abandon_result_save();
+    // Its score GUI is already closing. Use the card manager's native
+    // "continue without saving" action instead of opening an invisible modal.
+    context.r[4]=7;
+    ssne_call(context,0x80107254u);
+    // Event 7 also selects "continue without saving" for the entire session
+    // (the store at 80107318). This automatic skip applies to this write only.
+    // The manager was enabled at begin; leave any other resulting state alone.
+    if(manager==mem_read32(context.r[13]-0x7610u) && mem_read32(manager+0xC)==2)
+        mem_write32(manager+0xC,0);
+    result_save_failure_notice.store(true);
+    log_message("[coop-results-save-failed] sequence="+std::to_string(saved_sequence)+
+                " channel="+std::to_string(channel)+" card_state="+std::to_string(error));
+}
+void result_card_error(PPCContext& context){
+    const auto error=static_cast<int32_t>(context.r[4]);
+    if(error<0 && owns_result_save(context)){
+        finish_failed_save(context,error);
+        return;
+    }
+    ssne_call_original(context,0x801073ACu,ssne_find_func(0x801073ACu)->func);
+}
+void result_card_done(PPCContext& context){
+    // The native card manager emits CBSaveDone(channel, 3) after it has
+    // completed the create or rename. Its other notifications cannot publish.
+    if(context.r[4]==3 && owns_result_save(context)){
+        if(!exi_commit_result_save()){
+            finish_failed_save(context,-5);
+            return;
+        }
+        result_save_manager=0;
+    }
+    ssne_call_original(context,0x80107100u,ssne_find_func(0x80107100u)->func);
+}
 struct ResultStack {uint32_t base;std::vector<uint8_t> saved;ResultStack(const PPCContext& c,unsigned bytes):base(c.r[1]-bytes),saved(bytes){for(unsigned i=0;i<saved.size();++i)saved[i]=mem_read8(base+i);}~ResultStack(){for(unsigned i=0;i<saved.size();++i)mem_write8(base+i,saved[i]);}};
 void setup_results(PPCContext& context){
     ssne_call_original(context,0x80109020u,results_setup_original);++results_setup_serial;
@@ -135,17 +189,29 @@ void continue_and_save(PPCContext& context){
     const bool final_host_continue=save_host && !replica_simulation() && menu==gui && save_sequence && context.r[13]==0x802E22A0u && mem_read32(context.r[13]-0x75F0u)==2;
     if(final_host_continue && results_countdown.was_issued(save_sequence))return;
     if(final_host_continue)results_countdown.issued(save_sequence);
+    if(final_host_continue && std::getenv("SSNE_TEST_HIDDEN") && std::getenv("SSNE_COOP_TEST_CARD_OBSERVE"))
+        log_message("[coop-results-save-check] sequence="+std::to_string(save_sequence)+" ready="+std::to_string(ready)+
+                    " last="+std::to_string(saved_sequence)+" players="+std::to_string(mem_read32(context.r[13]-0x69D0u))+
+                    " manager="+std::to_string(manager)+" card_manager="+std::to_string(mem_read32(context.r[13]-0x7610u))+
+                    " disabled="+std::to_string(readable(manager,16)?mem_read32(manager+0xC):~0u));
     ssne_call_original(context,0x801091A4u,continue_original);
     if(!ready)return;
     // The original cooperative results updater closes/continues the level,
     // then serializes all four configuration sections only for a single player.
     // Extend that native save branch to the authority, without changing count.
     auto save=context;save.msr&=~0x8000u;save.r[3]=manager;save.r[4]=menu;
-    ssne_call(save,0x8010700Cu);saved_sequence=save_sequence;
+    saved_sequence=save_sequence;
+    if(!exi_begin_result_save()){
+        result_save_failure_notice.store(true);
+        log_message("[coop-results-save-failed] sequence="+std::to_string(save_sequence)+" begin=0");
+        return;
+    }
+    result_save_manager=manager;
+    ssne_call(save,0x8010700Cu);
     log_message("[coop-native-progress-save-request] sequence="+std::to_string(save_sequence)+" players="+std::to_string(mem_read32(context.r[13]-0x69D0u))+" manager="+std::to_string(manager)+" state="+std::to_string(mem_read32(manager+0xC)));
 }
 }
-void set_native_results_save_host(bool enabled){save_host=enabled;results_countdown.reset();host_results_open=false;}
+void set_native_results_save_host(bool enabled){abandon_result_save();save_host=enabled;results_countdown.reset();host_results_open=false;}
 void capture_native_results(uint32_t menu,uint32_t total) {
     if(!subscription || replica_simulation() || !readable(menu,0x90) || !readable(total,4))return;
     NativeResults next;next.sequence=++sequence;next.score=mem_read32(total);
@@ -162,6 +228,8 @@ void install_native_results_observer() {
     const auto* next=ssne_find_func(0x801091A4u);const auto* save=ssne_find_func(0x8010700Cu);
     if(!next || !save || mem_read32(next->address)!=0x9421FFD8u || mem_read32(save->address)!=0x9421FFE0u)return;
     install_card_guards();
+    ssne_install_hook(0x801073ACu,result_card_error);
+    ssne_install_hook(0x80107100u,result_card_done);
     continue_original=next->func;ssne_install_hook(next->address,continue_and_save);
     const auto* allocator=ssne_find_func(0x800F57DC);if(!allocator || mem_read32(allocator->address)!=0x9421FFF8u)return;
     original_gui_camera_allocator=allocator->func;ssne_install_hook(allocator->address,result_title_camera);
@@ -170,11 +238,12 @@ void install_native_results_observer() {
     results_setup_original=setup->func;ssne_install_hook(setup->address,setup_results);
     results_cleanup_original=cleanup->func;ssne_install_hook(cleanup->address,cleanup_results);
     results_original=f->func;ssne_install_hook(f->address,begin_host_results);
-    subscription=observe_native_entities([](const NativeEntityNotice& n){if(n.event==NativeEntityNotice::Event::LevelExit){result.reset();gui=0;host_results_open=false;results_countdown.reset();replica_results_open=false;replica_results_gui=0;}});
+    subscription=observe_native_entities([](const NativeEntityNotice& n){if(n.event==NativeEntityNotice::Event::LevelExit){abandon_result_save();result.reset();gui=0;host_results_open=false;results_countdown.reset();replica_results_open=false;replica_results_gui=0;}});
 }
 std::optional<NativeResults> native_results(){if(!result)return {};auto next=*result;for(unsigned i=0;i<13;++i){next.coefficients[i*2]=u2f(mem_read32(0x8023A8C0+i*28+12));next.coefficients[i*2+1]=u2f(mem_read32(0x8023A8C0+i*28+16));}next.active=readable(gui,0x90) && !mem_read32(gui+0x14) && mem_read32(gui+0x6C)!=0;if(save_host)host_results_open=next.active;const auto high=mem_read32(0x8023A8C0+8*28+0x18);next.high_score=readable(high,8)?mem_read32(high+4):next.score;return next;}
 bool native_replica_results_presenting(){return replica_results_open.load();}
 bool native_results_presenting(){return host_results_open.load() || replica_results_open.load();}
+bool take_native_results_save_failure(){return result_save_failure_notice.exchange(false);}
 uint32_t native_results_menu(){return replica_simulation()?replica_results_open?replica_results_gui:0u:host_results_open?gui:0u;}
 bool tick_native_results_auto_continue(PPCContext& context,void (*before_continue)(PPCContext&),std::string& error){
     const auto current=native_results();

@@ -38,6 +38,25 @@ std::array<float,12> energy_visual(uint32_t object){
         // Native charge update uses charge*802004E4; the initial light uses
         // 802004A4. The replica setter adds 802004E0 in both cases.
         result[8]=phase==0 && result[6]==0?u2f(mem_read32(0x802004A4))-u2f(mem_read32(0x802004E0)):result[7]*u2f(mem_read32(0x802004E4));
+        if(phase==0){
+            const auto source=mem_read32(object+0xC8);
+            if(readable(source,0x790) && mem_read32(source+0x48)==0x802121E8u)for(unsigned hand=0;hand<2;++hand){
+                const auto weapon=mem_read32(source+0x4BC+9*24+hand*4);
+                // PAL 8005A158 owns the muzzle sphere at +288. The second
+                // sphere at +28C uses the actor's world-view muzzle.
+                if(!readable(weapon,0x340) || mem_read32(weapon+0xC)!=0x801FB908u ||
+                   mem_read32(weapon+0x1D4)!=source)continue;
+                if(mem_read32(weapon+0x288)==object){
+                    const auto view=mem_read32(weapon+0x33C)?native_energy_charge_owner_view:native_energy_charge_first_view;
+                    result[native_energy_charge_view_index]=float(view+hand);
+                    break;
+                }
+                if(mem_read32(weapon+0x28C)==object){
+                    result[native_energy_charge_view_index]=float(native_energy_charge_world_view+hand);
+                    break;
+                }
+            }
+        }
     }else{
         for(unsigned i=3;i<6;++i)result[i]=u2f(mem_read32(object+native_energy_visual_offsets[i]));
         for(unsigned i=9;i<12;++i)result[i]=u2f(mem_read32(object+native_energy_visual_offsets[i]));

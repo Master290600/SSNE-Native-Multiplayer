@@ -2,6 +2,7 @@
 #include "world_state.h"
 #include "ssne/ppc_context.h"
 #include <chrono>
+#include <optional>
 namespace port::coop {
 // Guest-thread settings for the native mode-1 Survival integration. Original
 // PAL getters remain in use in every other mode and after Survival is disabled.
@@ -24,6 +25,8 @@ bool end_native_auto_aim_override(NativeAutoAimLease&);
 bool capture_native_combo_hud(uint32_t actor,EntityState&,std::string&);
 bool validate_native_combo_hud(uint32_t actor,const EntityState&,std::string&);
 bool apply_native_combo_hud(PPCContext&,uint32_t actor,const EntityState&,std::string&);
+void capture_native_sniper_scope(uint32_t actor,unsigned slot,Properties& mission);
+bool apply_native_sniper_scope(PPCContext&,uint32_t actor,unsigned slot,const Properties& mission,std::string&);
 bool capture_native_reentry_hud(uint32_t actor,EntityState&,std::string&);
 bool validate_native_reentry_hud(uint32_t actor,const EntityState&,std::string&);
 bool apply_native_reentry_hud(PPCContext&,uint32_t actor,const EntityState&,std::string&);
@@ -64,6 +67,16 @@ bool refresh_native_weapon_poses(PPCContext&,std::string& error);
 bool apply_native_weapon_flash(PPCContext&,uint32_t actor,unsigned weapon,unsigned hand,const std::vector<float>&,uint32_t mask,std::string& error,unsigned effect=0);
 bool apply_native_body_flash(PPCContext&,uint32_t actor,unsigned hand,const std::vector<float>&,uint32_t mask,std::string& error);
 bool update_native_muzzle_flashes(PPCContext&,float seconds,std::string& error);
+struct LocalWeaponStatus;
+LocalWeaponStatus capture_native_local_weapon(PPCContext&,uint32_t actor,unsigned* pistol_rearm=nullptr);
+struct NativeLocalWeaponCapacity {
+    unsigned rounds;
+    float interval;
+    bool last_round;
+};
+std::optional<NativeLocalWeaponCapacity> capture_native_local_weapon_capacity(
+    uint32_t actor,unsigned weapon,unsigned hand);
+bool play_native_local_weapon_flash(PPCContext&,uint32_t actor,unsigned weapon,unsigned hand);
 bool refresh_native_actor_pose(PPCContext&,uint32_t actor,EntityKind,std::string& error);
 bool validate_native_corpse_creation(const EntityState&,std::string& error);
 bool apply_native_corpse_lifecycle(PPCContext&,uint32_t,const EntityState&,std::string& error);
@@ -109,6 +122,12 @@ const NativeProjectileClass* native_projectile_class(unsigned definition);
 const NativeProjectileClass* native_projectile_class_by_vtable(uint32_t vtable);
 std::vector<uint32_t> native_projectile_extra_offsets(unsigned definition);
 inline constexpr std::array<uint32_t,12> native_energy_visual_offsets{0x124,0x128,0x12C,0x138,0x13C,0x140,0x14C,0x150,0x154,0x170,0x174,0x178};
+// Phase zero does not use the first explosion coefficient. Carry the
+// stock charge-sphere view and hand there on the wire only. Zero is legacy.
+inline constexpr unsigned native_energy_charge_view_index=9;
+inline constexpr unsigned native_energy_charge_first_view=1;
+inline constexpr unsigned native_energy_charge_world_view=3;
+inline constexpr unsigned native_energy_charge_owner_view=5;
 bool validate_native_projectile_creation(const EntityState&,std::string& error);
 uint32_t create_native_projectile(PPCContext&,const EntityState&,uint32_t source,std::string& error);
 bool present_native_projectile(PPCContext&,uint32_t object,std::string& error);

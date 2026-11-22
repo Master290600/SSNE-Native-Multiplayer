@@ -147,7 +147,7 @@ uint8_t g_coop_weapon=255;
 
 bool network_game(){return g_net_host || g_net_client || g_coop_host || g_coop_client;}
 void halt_invitation_network();
-void stop_network(){std::lock_guard lock(g_session_mutex);g_net.stop();halt_invitation_network();if(g_coop_server)g_coop_server->stop();if(g_coop_peer)g_coop_peer->stop();}
+void stop_network(){std::lock_guard lock(g_session_mutex);halt_invitation_network();g_net.stop();if(g_coop_server)g_coop_server->stop();if(g_coop_peer)g_coop_peer->stop();}
 std::unique_ptr<port::coop::NativeWorld> g_native_world;
 unsigned g_net_players=2;
 uint64_t g_presented_game_frames=0; // UI thread: freshly drawn game images actually presented
@@ -1703,12 +1703,25 @@ void draw_session_overlay() {
     const auto world=g_coop_client?g_coop_peer->latest_world():std::shared_ptr<const port::coop::WorldState>{};
     const auto vote=g_coop_host?g_coop_server->skip_vote():world?world->vote:port::coop::SkipVote{};
     if(vote.cutscene){
-        const auto size=ImGui::GetIO().DisplaySize;
-        ImGui::SetNextWindowPos(ImVec2(size.x*.5f,size.y*.86f),ImGuiCond_Always,ImVec2(.5f,.5f));
+        const bool movie=g_gpu?ssne::movie_presentation::displayed_gpu!=0:ssne::movie_presentation::displayed_software!=0;
+        if(movie){
+            // The native movie draws the button hint and subtitles across
+            // the bottom. Keep the vote count clear of both.
+            const auto* view=ImGui::GetMainViewport();
+            const float inset=ImGui::GetStyle().WindowPadding.x;
+            ImGui::SetNextWindowPos({view->Pos.x+view->Size.x-inset,view->Pos.y+ImGui::GetTextLineHeightWithSpacing()+inset},
+                                   ImGuiCond_Always,{1.f,0.f});
+        }else{
+            const auto size=ImGui::GetIO().DisplaySize;
+            ImGui::SetNextWindowPos({size.x*.5f,size.y*.86f},ImGuiCond_Always,{.5f,.5f});
+        }
         ImGui::SetNextWindowBgAlpha(.9f);
         ImGui::Begin("##coop-vote",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoFocusOnAppearing);
-        ImGui::Text("Skip: %u / %u votes",vote.received,vote.required);
-        ImGui::TextUnformatted(vote.skip_requested?"Skipping...":"Press select / jump to vote");
+        if(movie)port::menu_ui::Text("Skip votes %u / %u",vote.received,vote.required);
+        else{
+            ImGui::Text("Skip: %u / %u votes",vote.received,vote.required);
+            ImGui::TextUnformatted(vote.skip_requested?"Skipping...":"Press select / jump to vote");
+        }
         ImGui::End();
     }
     if(!port::menu_open() && !g_show_overlay && status.connected)return;
@@ -2506,6 +2519,8 @@ int main(int argc, char** argv) {
         draw_multiplayer_chat();
         draw_multiplayer_qol();
         port::menu_ui::set_language(g_set.game_language>=0?unsigned(g_set.game_language):port::native_crosshair_language());
+        if (ssne::take_native_results_save_failure())
+            toast(port::menu_ui::text("Progress could not be saved to the memory card. The session will continue."));
         draw_overlay(data_dir, dt);
         {
             port::MenuInfo mi;

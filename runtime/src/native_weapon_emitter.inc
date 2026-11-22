@@ -48,8 +48,104 @@ bool install_native_emitter_capture(std::string& error){
         ssne_install_hook(emitter_factories[0],emitter_factory_hook<0>);ssne_install_hook(emitter_factories[1],emitter_factory_hook<1>);ssne_install_hook(emitter_factories[2],emitter_factory_hook<2>);}
     return true;
 }
+struct OwnerGasStream {
+    uint64_t epoch=0, producer=0;
+    uint32_t actor=0, mask=0, mode=0;
+    double next=0;
+    std::array<float,3> previous{};
+    uint32_t newborn=0, proxy=0;
+};
+OwnerGasStream owner_gas;
+
+void render_owner_gas(PPCContext& context,uint32_t actor,uint64_t epoch,bool firing,double now){
+    if(!firing){owner_gas.next=0;return;}
+    if(authoritative || !context_ok(context) || !readable(actor,0x790) ||
+       mem_read32(actor+0x17C)!=unsigned(netplay_local_player()) ||
+       mem_read32(actor+0x5DC)!=7 || mem_read32(actor+0x48)!=0x802121E8u)return;
+    const auto gun=mem_read32(actor+0x4BC+7*24),mask=mem_read32(actor+0x16C);
+    if(!readable(gun,0x264) || mem_read32(gun+0xC)!=0x801FADA8u ||
+       mem_read32(gun+0x1D4)!=actor || !mask || (mask&(mask-1)) ||
+       mem_read32(actor+0x170)!=~(mask|0x80000000u))return;
+    const auto mode=mem_read32(gun+0x1E0),marker=mem_read32(gun+0x20C);
+    if(mode>=3 || marker>=256 || !readable(mem_read32(gun),0x38) ||
+       !readable(mem_read32(gun+0x28),0x44) ||
+       mem_read32(0x801FADA8u+0x74)!=0x800044BCu)return;
+    constexpr double interval=1./60.; // One puff per PAL simulation tick per view.
+    const bool resume=owner_gas.actor==actor && owner_gas.epoch==epoch &&
+        owner_gas.producer==producer_epoch && owner_gas.mode==mode &&
+        owner_gas.next>0 && now-owner_gas.next<.1;
+    Scratch scratch(context);PresentationScope presentation;
+    auto call=context;call.msr&=~0x8000u;call.r[1]-=0x240;
+    mem_write32(call.r[1],context.r[1]);
+    const auto matrix=call.r[1]+0xA0,position=call.r[1]+0xE0,velocity=position+12;
+    call.r[3]=gun;call.r[4]=marker;call.r[5]=matrix;
+    ssne_call(call,0x800044BCu);
+    std::array<float,3> muzzle{};
+    for(unsigned axis=0;axis<3;++axis){
+        muzzle[axis]=u2f(mem_read32(matrix+16*axis+12));
+        const auto speed=u2f(mem_read32(matrix+16*axis+8))*u2f(mem_read32(context.r[13]-0x7C88))+
+            u2f(mem_read32(gun+0x1A4+4*axis))*u2f(mem_read32(0x801FAD98u));
+        if(!std::isfinite(muzzle[axis]) || !std::isfinite(speed) || std::abs(speed)>10000)return;
+        mem_write32(velocity+4*axis,f2u(speed));
+        mem_write32(position+4*axis,f2u(muzzle[axis]));
+    }
+    if(resume && now<owner_gas.next){
+        // Some refreshes fall between PAL ticks. Keep only the newest sprite
+        // touching the displayed nozzle until the next puff. Its simulation
+        // position is kept in world space, including when the trigger lifts.
+        const auto puff=owner_gas.newborn;
+        if(readable(puff,0x68) && owner_gas.proxy && mem_read32(puff+0x3C)==owner_gas.proxy &&
+           mem_read32(puff)==mode && u2f(mem_read32(puff+0x44))<.1f){
+            std::array<uint32_t,3> world{};
+            for(unsigned i=0;i<3;++i)world[i]=mem_read32(puff+4+i*4);
+            call.r[3]=puff;call.r[4]=position;ssne_call(call,0x800D99FCu);
+            for(unsigned i=0;i<3;++i)mem_write32(puff+4+i*4,world[i]);
+        }
+        return;
+    }
+    // Keep the native ray query, contact normal and floor-flame handling.
+    // PAL 8007E9B8 consults this switch before it can enqueue an actor hit.
+    // The local visual never runs the weapon attack, consumes ammo or creates
+    // a gameplay message. The shared emitter bookkeeping is borrowed only for
+    // this synchronous call; flyaway sprites have their own position/velocity.
+    const auto index=mem_read32(gun+0x244)<12?mem_read32(gun+0x244):0u;
+    const auto shared=0x8028BB44u+index*0x2Cu,hit_gate=context.r[13]-0x7B40;
+    std::array<uint8_t,0x2C> prior{};
+    std::memcpy(prior.data(),host_ptr(shared),prior.size());
+    const auto saved_gate=mem_read32(hit_gate);
+    mem_write32(hit_gate,0);
+    const auto first=resume?owner_gas.next:now;
+    double emit=first;
+    uint32_t newborn=0;
+    for(;emit<=now;emit+=interval){
+        const bool newest=emit+interval>now;
+        const float fraction=newest?1.f:float((emit-first+interval)/(now-first+interval));
+        for(unsigned axis=0;axis<3;++axis){
+            const auto coordinate=resume?std::lerp(owner_gas.previous[axis],muzzle[axis],fraction):muzzle[axis];
+            mem_write32(position+4*axis,f2u(coordinate));
+        }
+        call.r[3]=index;call.r[4]=position;call.r[5]=velocity;call.r[6]=1;call.r[7]=mask;call.r[8]=0x80;
+        call.ps0[1]=call.ps1[1]=u2f(mem_read32(context.r[13]-0x7C84));
+        call.ps0[2]=call.ps1[2]=u2f(mem_read32(context.r[13]-0x7C80));
+        ssne_call(call,emitter_factories[mode]);
+        if(call.r[3]!=1)continue;
+        newborn=mem_read32(context.r[13]-0x5F9C);
+        // The factory allocates the sprite; its first native update selects
+        // the correct atlas cell and render transform, even at age zero.
+        call.r[3]=newborn;
+        call.ps0[1]=call.ps1[1]=newest?0.f:float(now-emit);
+        ssne_call(call,0x800D9A8Cu);
+    }
+    mem_write32(hit_gate,saved_gate);
+    std::memcpy(host_ptr(shared),prior.data(),prior.size());
+    owner_gas={epoch,producer_epoch,actor,mask,mode,emit,muzzle,newborn,newborn?mem_read32(newborn+0x3C):0};
+}
 bool replay_native_emitter(PPCContext& context,const NativeWeaponEmitter& e,std::string& error){
     if(!context_ok(context) || !emitter_event_valid(e,error) || !emitter_lists_valid(context,error)){if(error.empty())error="Native flame context unavailable";return false;}
+    // 80054F44, 80054FB0 and 8005501C pass the owner's exclusive view
+    // mask. Its presentation was generated from local input. The companion
+    // world-view event and all other players' streams are still replayed.
+    if(owner_gas.mask && owner_gas.producer==producer_epoch && e.tags[2]==owner_gas.mask)return true;
     Scratch scratch(context);auto call=context;call.msr&=~0x8000u;call.r[1]-=0x200;mem_write32(call.r[1],context.r[1]);
     for(unsigned i=0;i<6;++i)mem_write32(call.r[1]+0x80+i*4,f2u(e.values[i]));
     call.r[3]=e.tags[1];call.r[4]=call.r[1]+0x80;call.r[5]=call.r[1]+0x8C;

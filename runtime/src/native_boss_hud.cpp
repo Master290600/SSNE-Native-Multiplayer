@@ -22,12 +22,23 @@ Applied applied;
 struct PresentationClock {Binding binding{};uint64_t epoch=0,frame=0;std::chrono::steady_clock::time_point time{};bool initialized=false;};
 PresentationClock boss_clock;
 bool readable(uint32_t p,unsigned n){return p>=0x80000000u && n<=guest_ram_size() && p<=guest_ram_end()-n;}
-bool revision(){
-    if(mem_read32(0x80000000u)!=0x47334250u || mem_read32(0x80000004u)!=0x39470000u ||
-       mem_read32(widget_vtable+0x1C)!=0x800AD6B4u || mem_read32(widget_vtable+0x14)!=0x800AD510u || mem_read32(drawable_vtable+0x44)!=0x8011D458u)return false;
+bool revision(std::string* error=nullptr){
+    if(mem_read32(0x80000000u)!=0x47334250u || mem_read32(0x80000004u)!=0x39470000u){
+        if(error)*error="Native boss HUD requires original G3BP9G revision0";
+        return false;
+    }
+    if(mem_read32(widget_vtable+0x1C)!=0x800AD6B4u || mem_read32(widget_vtable+0x14)!=0x800AD510u ||
+       mem_read32(drawable_vtable+0x44)!=0x8011D458u){
+        if(error)*error="Native boss HUD vtable layout differs";
+        return false;
+    }
     for(const auto [address,signature]:{std::pair{ratio_setter,0x9421FFF8u},std::pair{active_setter,0x9421FFF0u},
-            std::pair{suppressed_setter,0x9421FFF0u},std::pair{0x800AD6B4u,0x9421FFE8u},std::pair{presentation_tick,0x9421FFF8u},std::pair{0x800AD510u,0x9421FFC8u}})
-        if(!ssne_find_func(address) || mem_read32(address)!=signature)return false;
+            std::pair{suppressed_setter,0x9421FFF0u},std::pair{0x800AD6B4u,0x9421FFE8u},std::pair{presentation_tick,0x9421FFF8u},std::pair{0x800AD510u,0x9421FFC8u}}){
+        if(!ssne_find_func(address) || mem_read32(address)!=signature){
+            if(error)*error="Native boss HUD callback unavailable at "+std::to_string(address);
+            return false;
+        }
+    }
     return true;
 }
 bool gameplay(){return mem_read32(0x802DB7E8u)==4u && mem_read32(0x802DB8CCu)<=1u;}
@@ -64,7 +75,7 @@ bool validate_native_boss_hud(const NativeBossHudState& s,std::string& error){
 }
 bool observe_native_boss_hud(NativeBossHudObservation& out,std::string& error){
     using namespace native_boss_hud_detail;out={};error.clear();
-    if(!revision()){error="Native boss HUD requires original G3BP9G revision0";return false;}
+    if(!revision(&error))return false;
     if(!gameplay())return true;
     Binding b;if(!binding(b)){error="Native boss HUD widget ownership differs";return false;}
     const auto active=mem_read32(active_global),suppressed=mem_read32(suppressed_global);

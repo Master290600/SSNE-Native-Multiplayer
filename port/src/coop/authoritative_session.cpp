@@ -1,4 +1,5 @@
 #include "authoritative_session.h"
+#include "local_shot_feedback.h"
 #include "ps2_content_identity.h"
 #include "custom_map_session.h"
 #include "wire_protocol.h"
@@ -14,6 +15,7 @@
 #include <limits>
 #include <cstdlib>
 #include <bit>
+#include <utility>
 
 namespace port::coop {
 namespace {
@@ -27,7 +29,7 @@ uint64_t milliseconds(){return uint64_t(std::chrono::duration_cast<std::chrono::
 bool initialize_network(){static const bool ok=[](){WSADATA data{};return WSAStartup(MAKEWORD(2,2),&data)==0;}();return ok;}
 bool pin_valid(const std::string& s){return s.size()==6 && std::all_of(s.begin(),s.end(),[](char c){return c>='0' && c<='9';});}
 bool nonblocking(SOCKET s){u_long mode=1;return ioctlsocket(s,FIONBIO,&mode)==0;}
-bool retry_socket(){auto error=WSAGetLastError();return error==WSAEWOULDBLOCK || error==WSAEINPROGRESS;}
+bool retry_socket(int error){return error==WSAEWOULDBLOCK || error==WSAEINPROGRESS;}
 void close_socket(SOCKET& s){if(s!=INVALID_SOCKET){shutdown(s,SD_BOTH);closesocket(s);s=INVALID_SOCKET;}}
 void socket_options(SOCKET s){BOOL yes=TRUE;setsockopt(s,IPPROTO_TCP,TCP_NODELAY,reinterpret_cast<const char*>(&yes),sizeof(yes));}
 void put32(std::vector<uint8_t>& b,uint32_t v){for(int i=3;i>=0;--i)b.push_back(uint8_t(v>>(i*8)));}
@@ -58,29 +60,43 @@ struct Stream {
     size_t sent=0;
     size_t incoming_limit=max_frame_bytes;
     uint64_t last_receive=milliseconds(),last_progress=milliseconds();
+    std::string failure;
+    bool fail(std::string reason){failure=std::move(reason);return false;}
+    bool within_timeouts() {
+        const auto now=milliseconds();
+        if(now-last_receive>15000)return fail("No cooperative data received for 15 seconds.");
+        if(!transmit.empty() && now-last_progress>10000)return fail("No cooperative send progress for 10 seconds.");
+        return true;
+    }
     bool read(uint64_t& total) {
         uint8_t buffer[65536];auto n=recv(socket,reinterpret_cast<char*>(buffer),sizeof(buffer),0);
-        if(n==SOCKET_ERROR)return retry_socket();if(!n)return false;
+        if(n==SOCKET_ERROR){const auto code=WSAGetLastError();return retry_socket(code) || fail("Cooperative receive socket error "+std::to_string(code)+".");}
+        if(!n)return fail("Peer closed the connection.");
         total+=unsigned(n);last_receive=milliseconds();receive.insert(receive.end(),buffer,buffer+n);
-        return receive.size()<=incoming_limit+wire::header_size+sizeof(buffer);
+        return receive.size()<=incoming_limit+wire::header_size+sizeof(buffer) || fail("Cooperative receive buffer exceeded its limit.");
     }
     template<class F> bool parse(F callback) {
         size_t consumed=0;unsigned frames=0;
         while(receive.size()-consumed>=wire::header_size && frames++<128) {
             const auto* p=receive.data()+consumed;
-            if(read32(p)!=wire::magic || (uint16_t(p[4])<<8|p[5])!=wire::version)return false;
+            if(read32(p)!=wire::magic || (uint16_t(p[4])<<8|p[5])!=wire::version)return fail("Cooperative frame header or protocol differs.");
             const auto type=wire::Message(uint16_t(p[6])<<8|p[7]);const auto size=read32(p+8);
-            if(size>incoming_limit)return false;
+            if(size>incoming_limit)return fail("Cooperative frame exceeded its size limit.");
             if(receive.size()-consumed<wire::header_size+size)break;
             std::vector<uint8_t> body(p+wire::header_size,p+wire::header_size+size);
-            if(!callback(type,body))return false;consumed+=wire::header_size+size;
+            if(!callback(type,body)) {
+                if(failure.empty())failure="Rejected cooperative message type "+std::to_string(uint16_t(type))+".";
+                return false;
+            }
+            consumed+=wire::header_size+size;
         }
         if(consumed)receive.erase(receive.begin(),receive.begin()+consumed);return true;
     }
     bool write(uint64_t& total) {
         if(transmit.empty())return true;
         auto n=send(socket,reinterpret_cast<const char*>(transmit.data()+sent),int(transmit.size()-sent),0);
-        if(n==SOCKET_ERROR)return retry_socket();if(!n)return false;
+        if(n==SOCKET_ERROR){const auto code=WSAGetLastError();return retry_socket(code) || fail("Cooperative send socket error "+std::to_string(code)+".");}
+        if(!n)return fail("Peer closed the connection.");
         total+=unsigned(n);sent+=unsigned(n);last_progress=milliseconds();
         if(sent==transmit.size()){transmit.clear();sent=0;}return true;
     }
@@ -127,7 +143,7 @@ bool transfer_active(CustomMapTransferPhase phase){return phase==CustomMapTransf
 }
 
 struct AuthoritativeServer::Impl {
-    struct InputState { ControlInput input;uint64_t sequence=0,received=0,ack=0; };
+    struct InputState { ControlInput input;uint64_t sequence=0,received=0,ack=0,fire_pressed=0; };
     // Every transmitted baseline retains its immutable body and its own event
     // overlay. Acknowledging another revision must not rebind old peer cursors.
     struct PeerSnapshot {
@@ -138,11 +154,25 @@ struct AuthoritativeServer::Impl {
         uint64_t revision()const{return body->revision;}
         WorldReadView view()const{return WorldReadView(*body,mission?*mission:body->mission);}
     };
+    // The local invitation socket can accept data much faster than the far
+    // endpoint. Limit actual unacknowledged work. Small deltas can pipeline
+    // across an ordinary RTT, but one large update must drain on its own.
+    static constexpr size_t world_window_count=4,world_window_bytes=8*1024;
+    struct SentWorld {
+        std::shared_ptr<const PeerSnapshot> snapshot;
+        size_t bytes=0;
+        uint64_t sent_at=0;
+    };
     struct Peer {
         Stream stream;std::string address;PlayerId id;bool assigned=false,reject=false,force_full=true,prefer_chat=true,demand_counted=false;
         std::deque<std::vector<uint8_t>> priority;
-        std::shared_ptr<const PeerSnapshot> baseline,in_flight;
-        std::map<uint64_t,std::shared_ptr<const PeerSnapshot>> sent_worlds;
+        std::shared_ptr<const PeerSnapshot> baseline;
+        SentWorld in_flight;
+        std::map<uint64_t,SentWorld> sent_worlds;
+        size_t pending_world_bytes=0;
+        uint64_t world_stats_at=0,last_world_ack_ms=0;
+        uint64_t world_frames_sent=0,world_bytes_sent=0,world_revisions_acked=0;
+        uint64_t awaiting_full_revision=0;
         uint64_t last_state=0,chat_cursor=0,last_telemetry=0,last_probe=0,probe_token=0;
         bool prefer_telemetry=true;
         struct MapTransfer {uint64_t token=0,offset=0,started=0;CustomMapRequest request;std::shared_ptr<const CustomMapPackage> package;bool offered=false,cached=false;};
@@ -177,7 +207,12 @@ struct AuthoritativeServer::Impl {
     std::map<std::string,LanPermit> lan_permits;
     SOCKET listener=INVALID_SOCKET;std::thread worker;std::atomic<bool> stopping{false};
     std::vector<Peer> peers;
-    explicit Impl(unsigned capacity):authority(capacity){state.capacity=capacity;rebuild();}
+    std::function<void(const std::string&)> disconnect_log;
+    const bool trace_world_queue=[] {
+        const char* value=std::getenv("SSNE_COOP_WORLD_STATS");
+        return value && std::strcmp(value,"1")==0;
+    }();
+    Impl(unsigned capacity,std::function<void(const std::string&)> log):authority(capacity),disconnect_log(std::move(log)){state.capacity=capacity;rebuild();}
     std::array<Participant,max_players> effective_participants()const{
         auto result=authority.participants();for(unsigned i=0;i<max_players;++i)if(result[i].connected)result[i].spectator=result[i].spectator || (spectator_lock_mask&(1u<<i));return result;
     }
@@ -264,6 +299,18 @@ struct AuthoritativeServer::Impl {
         if(target)if(const auto found=view.entities.find(target);found!=view.entities.end() && target!=owner->character)if(!copy(found->second))return {};
         return out;
     }
+    void finish_world_send(Peer& peer) {
+        if(!peer.in_flight.snapshot || !peer.stream.transmit.empty())return;
+        if(trace_world_queue){
+            ++peer.world_frames_sent;
+            peer.world_bytes_sent+=peer.in_flight.bytes;
+        }
+        auto& sent=peer.sent_worlds[peer.in_flight.snapshot->revision()];
+        peer.pending_world_bytes+=peer.in_flight.bytes;
+        peer.in_flight.bytes+=sent.bytes;
+        peer.in_flight.sent_at=sent.snapshot?sent.sent_at:milliseconds();
+        sent=std::exchange(peer.in_flight,{});
+    }
     void drop(Peer& peer) {
         close_socket(peer.stream.socket);
         std::lock_guard lock(mutex);
@@ -333,10 +380,12 @@ struct AuthoritativeServer::Impl {
             if(next!=lobby_ready_mask){lobby_ready_mask=next;rebuild();}return true;
         }
         case wire::Message::Input: {
-            const auto epoch=r.u64(),sequence=r.u64();auto input=read_control(r);if(!r.done() || !sequence || !control_valid(input))return false;
+            const auto epoch=r.u64(),sequence=r.u64();auto input=read_control(r);
+            const auto fire_pressed=r.done()?0:r.u64();
+            if(!r.done() || !sequence || !control_valid(input) || fire_pressed>sequence)return false;
             if(epoch<body->epoch)return true;if(epoch!=body->epoch)return false;
             auto& old=controls[peer.id.slot];if(sequence<=old.sequence)return true;
-            old.sequence=sequence;old.received=milliseconds();merge_input(old.input,input);return true;
+            old.sequence=sequence;old.received=milliseconds();old.fire_pressed=fire_pressed;merge_input(old.input,input);return true;
         }
         case wire::Message::Ready: {
             auto epoch=r.u64();if(!r.done())return false;
@@ -358,7 +407,22 @@ struct AuthoritativeServer::Impl {
             if(epoch<body->epoch)return true;if(epoch!=body->epoch)return false;
             if(authority.request_skip(peer.id,sequence,scene)==CommandResult::Applied)rebuild();return true;
         }
-        case wire::Message::SnapshotRequest:if(!r.done())return false;peer.force_full=true;++publication_serial;return true;
+        case wire::Message::SnapshotRequest:
+            if(!r.done())return false;
+            if(peer.awaiting_full_revision){
+                // Older clients ask again instead of ACKing a full snapshot
+                // for a revision they already acknowledged. Its baseline is
+                // usable and we can stop this duplicate request/reply cycle.
+                if(peer.baseline && peer.awaiting_full_revision==peer.baseline->revision()){
+                    const auto sent=peer.sent_worlds.find(peer.awaiting_full_revision);
+                    if(sent!=peer.sent_worlds.end()){
+                        peer.pending_world_bytes-=sent->second.bytes;
+                        peer.sent_worlds.erase(sent);
+                        peer.awaiting_full_revision=0;
+                    }
+                }
+            }else if(!peer.force_full){peer.force_full=true;++publication_serial;}
+            return true;
         case wire::Message::NativeEventsAck: {
             const auto epoch=r.u64();NativeEventCursors consumed{};for(auto& cursor:consumed)cursor=r.u64();
             if(!r.done())return false;
@@ -373,10 +437,16 @@ struct AuthoritativeServer::Impl {
         }
         case wire::Message::WorldAck: {
             auto revision=r.u64();if(!r.done() || !revision)return false;
-            if(peer.baseline && revision<=peer.baseline->revision())return true;
-            if(auto found=peer.sent_worlds.find(revision);found!=peer.sent_worlds.end())peer.baseline=found->second;
-            else if(peer.in_flight && peer.stream.transmit.empty() && peer.in_flight->revision()==revision)peer.baseline=peer.in_flight;
-            else return false;
+            const auto found=peer.sent_worlds.find(revision);
+            if(found==peer.sent_worlds.end())return (peer.baseline && revision<=peer.baseline->revision()) ||
+                peer.stream.fail("Acknowledgement for an unsent cooperative world revision.");
+            if(trace_world_queue && (!peer.baseline || revision>peer.baseline->revision()))++peer.world_revisions_acked;
+            peer.baseline=found->second.snapshot;
+            peer.last_world_ack_ms=milliseconds()-found->second.sent_at;
+            const auto end=std::next(found);
+            for(auto it=peer.sent_worlds.begin();it!=end;++it)peer.pending_world_bytes-=it->second.bytes;
+            peer.sent_worlds.erase(peer.sent_worlds.begin(),end);
+            if(revision>=peer.awaiting_full_revision)peer.awaiting_full_revision=0;
             return true;
         }
         case wire::Message::Ping:{auto time=r.u64();if(!r.done())return false;std::vector<uint8_t> data;put64(data,time);if(peer.priority.size()<32)peer.priority.push_back(packet(wire::Message::Pong,std::move(data)));return true;}
@@ -470,23 +540,32 @@ struct AuthoritativeServer::Impl {
                     std::vector<uint8_t> data;put64(data,peer.probe_token);peer.priority.push_back(packet(wire::Message::Ping,std::move(data)));
                 }
                 if(ok && peer.stream.transmit.empty()) {
-                    if(peer.in_flight){peer.sent_worlds[peer.in_flight->revision()]=std::move(peer.in_flight);while(peer.sent_worlds.size()>64)peer.sent_worlds.erase(peer.sent_worlds.begin());}
                     if(!peer.priority.empty()){peer.stream.queue(std::move(peer.priority.front()));peer.priority.pop_front();}
                     else if(peer.reject)ok=false;
                     else if(peer.assigned && peer.prefer_chat && queue_chat(peer))peer.prefer_chat=false;
                     else if(peer.assigned && peer.prefer_telemetry && queue_telemetry(peer))peer.prefer_telemetry=false;
                     else if(peer.assigned && peer.prefer_map && queue_custom_map(peer))peer.prefer_map=false;
-                    else if(peer.assigned && milliseconds()-peer.last_state>=16) {
+                    else if(peer.assigned && !peer.awaiting_full_revision && milliseconds()-peer.last_state>=16) {
                         std::shared_ptr<const PeerSnapshot> current;
+                        bool full=false,retry=false;
+                        std::optional<EventConsumer> offered_events;
                         {std::lock_guard lock(mutex);
-                            // Decoration cannot change revision. Avoid copying the
-                            // same complete world on every idle socket poll; preserve
-                            // force-full and unacknowledged-baseline resend behavior.
-                            const bool unchanged=reuse_network_snapshot() && !peer.force_full && peer.baseline && published->revision==peer.baseline->revision();
-                            if(!unchanged && native_events.active() && native_events.epoch()==published->epoch) {
-                                auto& consumer=event_consumers[peer.id.slot];
+                            // The invitation relay accepts writes on a local socket
+                            // before they reach the remote game. Pace snapshots by
+                            // application acknowledgements to keep that queue bounded.
+                            full=peer.force_full || !peer.baseline || published->epoch!=peer.baseline->body->epoch;
+                            const bool pending=peer.sent_worlds.contains(published->revision);
+                            // Recover a missing final delta without filling a slow
+                            // reliable route with duplicates on every send tick.
+                            retry=pending && milliseconds()-peer.last_state>=1000;
+                            const bool window_open=(pending || peer.sent_worlds.size()<world_window_count) &&
+                                                   peer.pending_world_bytes<world_window_bytes;
+                            const bool unchanged=reuse_network_snapshot() && pending && !retry;
+                            const bool send_world=full || (window_open && !unchanged && published->revision!=peer.baseline->revision());
+                            if(send_world && native_events.active() && native_events.epoch()==published->epoch) {
+                                auto consumer=event_consumers[peer.id.slot];
                                 if(consumer.epoch!=published->epoch){consumer.epoch=published->epoch;consumer.consumed={};consumer.offered={};consumer.initialized=false;consumer.offered_initial=false;consumer.initial_floor={};}
-                                if(consumer.initialized && !native_events.available(consumer.consumed)){ok=false;}
+                                if(consumer.initialized && !native_events.available(consumer.consumed)){ok=peer.stream.fail("Cooperative native event history exhausted.");}
                                 else {
                                     if(use_network_world_view()){
                                         // Journal decoration reads only epoch and writes mission.
@@ -506,26 +585,59 @@ struct AuthoritativeServer::Impl {
                                         const char* prefixes[]={"Session.ConfirmedHits.Ids","Session.RocketEffects.Ids","Session.WeaponShots.Ids","Session.WeaponLoops.Ids","Session.BulletImpacts.Ids","Session.Feedback.Ids","Session.BulletTrails.Ids","Session.WeaponEmitters.Ids","Session.WeaponCasings.Ids","Session.ProjectileVisuals.Ids","Session.WeaponSurfaces.Ids","Session.WeaponBeams.Ids"};
                                         for(unsigned n=0;n<native_event_channels;++n){const auto& ids=std::get<std::vector<int64_t>>(decorated.mission.at(prefixes[n]));if(!ids.empty())consumer.offered[n]=std::max(consumer.offered[n],uint64_t(ids[ids.size()-(n==2?2:1)]));}
                                     }
+                                    offered_events=std::move(consumer);
                                 }
-                            }else if(!unchanged)current=std::make_shared<PeerSnapshot>(published);
+                            }else if(send_world)current=std::make_shared<PeerSnapshot>(published);
                         }
-                        if(ok && current && (peer.force_full || !peer.baseline || current->revision()!=peer.baseline->revision())) {
+                        if(ok && current && (full || retry || !peer.sent_worlds.contains(current->revision()))) {
                             try{
-                                std::optional<WorldReadView> before;if(peer.baseline)before.emplace(peer.baseline->view());
-                                peer.stream.queue(packet(wire::Message::World,encode_delta(difference(peer.force_full?nullptr:(before?&*before:nullptr),current->view()))));
-                                peer.in_flight=current;peer.last_state=milliseconds();peer.force_full=false;peer.prefer_chat=true;peer.prefer_telemetry=true;peer.prefer_map=true;
+                                std::optional<WorldReadView> before;
+                                if(!full) {
+                                    // This connection delivers frames in order. A new revision
+                                    // can build on the last complete frame already sent. Using
+                                    // only the latest ACK would repeat the same changes during
+                                    // every RTT. Resends and resyncs keep the confirmed base.
+                                    const auto& base=(!retry && !peer.sent_worlds.empty())
+                                        ?peer.sent_worlds.rbegin()->second.snapshot:peer.baseline;
+                                    before.emplace(base->view());
+                                }
+                                auto frame=packet(wire::Message::World,encode_delta(difference(before?&*before:nullptr,current->view())));
+                                peer.last_state=milliseconds();
+                                if(full || !peer.pending_world_bytes || frame.size()<=world_window_bytes-peer.pending_world_bytes){
+                                    if(offered_events){std::lock_guard lock(mutex);event_consumers[peer.id.slot]=std::move(*offered_events);}
+                                    if(full)peer.awaiting_full_revision=current->revision();
+                                    peer.in_flight={std::move(current),frame.size()};
+                                    peer.stream.queue(std::move(frame));
+                                    peer.force_full=false;peer.prefer_chat=true;peer.prefer_telemetry=true;peer.prefer_map=true;
+                                }
                             }
-                            catch(const std::exception&){ok=false;}
+                            catch(const std::exception&){ok=peer.stream.fail("Could not encode the cooperative world snapshot.");}
                         }
                     }
                     if(ok && peer.stream.transmit.empty() && queue_chat(peer))peer.prefer_chat=false;
                     if(ok && peer.stream.transmit.empty() && queue_telemetry(peer))peer.prefer_telemetry=false;
                     if(ok && peer.stream.transmit.empty() && queue_custom_map(peer))peer.prefer_map=false;
                 }
-                if(ok && FD_ISSET(peer.stream.socket,&writes))ok=peer.stream.write(sent);
+                if(ok && FD_ISSET(peer.stream.socket,&writes)){ok=peer.stream.write(sent);if(ok)finish_world_send(peer);}
+                if(trace_world_queue && peer.assigned && disconnect_log) {
+                    const auto now=milliseconds();
+                    if(now-peer.world_stats_at>=1000) {
+                        peer.world_stats_at=now;
+                        const auto oldest=peer.sent_worlds.empty()?0:now-peer.sent_worlds.begin()->second.sent_at;
+                        disconnect_log("[coop-world-queue] slot="+std::to_string(peer.id.slot)+
+                            " pending_worlds="+std::to_string(peer.sent_worlds.size())+" pending_bytes="+std::to_string(peer.pending_world_bytes)+
+                            " oldest_ms="+std::to_string(oldest)+" last_world_ack_ms="+std::to_string(peer.last_world_ack_ms)+
+                            " sent_frames="+std::to_string(peer.world_frames_sent)+" sent_bytes="+std::to_string(peer.world_bytes_sent)+
+                            " acked_revisions="+std::to_string(peer.world_revisions_acked)+" steady_ms="+std::to_string(now));
+                    }
+                }
                 {std::lock_guard lock(mutex);state.bytes_received+=received;state.bytes_sent+=sent;}
-                if(milliseconds()-peer.stream.last_receive>15000 || (!peer.stream.transmit.empty() && milliseconds()-peer.stream.last_progress>10000))ok=false;
-                if(!ok){drop(peer);peers.erase(peers.begin()+i);}else ++i;
+                if(ok)ok=peer.stream.within_timeouts();
+                if(!ok){
+                    if(peer.assigned && disconnect_log)
+                        disconnect_log("[native-session-peer-drop] slot="+std::to_string(peer.id.slot)+" reason="+peer.stream.failure);
+                    drop(peer);peers.erase(peers.begin()+i);
+                }else ++i;
             }
             // select reports a TCP socket writable even when no packet is due.
             // Bound idle polling without coupling it to the simulation thread.
@@ -535,7 +647,7 @@ struct AuthoritativeServer::Impl {
         std::lock_guard lock(mutex);state.connected=false;lan_permits.clear();lan_id.clear();
     }
 };
-AuthoritativeServer::AuthoritativeServer(unsigned capacity):impl_(std::make_unique<Impl>(capacity)){}
+AuthoritativeServer::AuthoritativeServer(unsigned capacity,std::function<void(const std::string&)> log):impl_(std::make_unique<Impl>(capacity,std::move(log))){}
 bool AuthoritativeServer::set_match_player_limit(unsigned limit){
     auto& p=*impl_;std::lock_guard lock(p.mutex);limit=std::min(limit,p.state.capacity);
     if(!limit)return false;
@@ -704,6 +816,7 @@ std::array<PlayerControl,max_players> AuthoritativeServer::take_controls(Control
             // actions read the analog triggers. Recreate one consumed pulse.
             if(out.input.pressed&ssne::PAD_L)out.input.pad.trigger_l=255;
             if(out.input.pressed&ssne::PAD_R)out.input.pad.trigger_r=255;
+            out.fire_pressed=input.fire_pressed;
         }
         else if(p.lobby_open && !p.results_active() && !player.afk && milliseconds()-input.received<250){
             // Unspawned peers may choose only their own lobby character.
@@ -808,6 +921,7 @@ struct AuthoritativeClient::Impl {
     std::shared_ptr<const WorldState> world=std::make_shared<WorldState>();
     double world_received=0;
     InputLookHistory look_history;
+    LocalControlSample local_control;
     std::deque<AuthoritativeClient::WorldSample> motion_history;
     std::map<uint64_t,std::shared_ptr<const WorldState>> history;
     std::thread worker;std::atomic<bool> stopping{false};
@@ -838,7 +952,7 @@ struct AuthoritativeClient::Impl {
         {
             std::lock_guard lock(mutex);previous=world;
             if(delta.epoch<world->epoch || (delta.epoch==world->epoch && delta.revision<world->revision))return true;
-            if(delta.epoch==world->epoch && delta.revision==world->revision && !delta.full){std::vector<uint8_t> ack;put64(ack,delta.revision);enqueue(wire::Message::WorldAck,std::move(ack));return true;}
+            if(delta.epoch==world->epoch && delta.revision==world->revision){std::vector<uint8_t> ack;put64(ack,delta.revision);enqueue(wire::Message::WorldAck,std::move(ack));return true;}
             if(!delta.full){
                 if(delta.base_revision==world->revision)baseline=world;
                 else if(auto base=history.find(delta.base_revision);base!=history.end())baseline=base->second;
@@ -873,7 +987,7 @@ struct AuthoritativeClient::Impl {
             }
             // Never relabel movement/fire accumulated during decode in the old
             // world as new input. Framed old-epoch commands remain rejectable.
-            if(next->epoch!=world->epoch){pending={};sent_input=input_sequence;retired_history.swap(history);retired_motion.swap(motion_history);look_history.reset(next->epoch);tactical_pings.clear();last_tactical_ping=0;tactical_ping_sent=false;}
+            if(next->epoch!=world->epoch){pending={};sent_input=input_sequence;retired_history.swap(history);retired_motion.swap(motion_history);look_history.reset(next->epoch);local_control={};tactical_pings.clear();last_tactical_ping=0;tactical_ping_sent=false;}
             else if(world->revision)history[world->revision]=world;
             if(next->level!=world->level || !tactical_ping_gameplay(*next))tactical_pings.clear();
             while(history.size()>64){retired.push_back(std::move(history.begin()->second));history.erase(history.begin());}
@@ -993,6 +1107,8 @@ struct AuthoritativeClient::Impl {
                 if(!commands.empty()){stream.queue(std::move(commands.front()));commands.pop_front();}
                 if(state.connected && sent_input!=input_sequence) {
                     std::vector<uint8_t> data;put64(data,world->epoch);put64(data,input_sequence);append_control(data,pending);
+                    // Hosts before local effects still receive the original protocol-71 packet.
+                    if(world->mission.contains(local_weapon_key))put64(data,local_control.fire_pressed);
                     const auto input_frame=packet(wire::Message::Input,std::move(data));
                     stream.transmit.insert(stream.transmit.end(),input_frame.begin(),input_frame.end());
                     stream.last_progress=milliseconds();
@@ -1003,27 +1119,36 @@ struct AuthoritativeClient::Impl {
                     stream.transmit.insert(stream.transmit.end(),chat_frame.begin(),chat_frame.end());chat_outgoing.pop_front();
                     stream.last_progress=milliseconds();
                 }
-                if(stream.transmit.empty() && state.connected && milliseconds()-ping>=1000) {
-                    ping=milliseconds();ping_token=ping;std::vector<uint8_t> data;put64(data,ping);stream.queue(packet(wire::Message::Ping,std::move(data)));
+                if(stream.transmit.empty() && state.connected) {
+                    const auto now=milliseconds();
+                    // Keep an outstanding probe until it is answered or times out.
+                    if(now-ping>=1000 && (!ping_token || now-ping>=5000)) {
+                        ping=now;
+                        ping_token=now;
+                        std::vector<uint8_t> data;
+                        put64(data,ping_token);
+                        stream.queue(packet(wire::Message::Ping,std::move(data)));
+                    }
                 }
             }
             fd_set reads,writes;FD_ZERO(&reads);FD_ZERO(&writes);FD_SET(stream.socket,&reads);
             if(!stream.transmit.empty())FD_SET(stream.socket,&writes);
             // Local submissions do not make the network socket readable. A
             // 10ms idle poll therefore adds input delay even at a 1ms RTT.
-            timeval wait{0,1000};auto selected=select(0,&reads,&writes,nullptr,&wait);if(selected==SOCKET_ERROR){ok=false;break;}
+            timeval wait{0,1000};auto selected=select(0,&reads,&writes,nullptr,&wait);if(selected==SOCKET_ERROR){stream.fail("Cooperative poll socket error "+std::to_string(WSAGetLastError())+".");break;}
             uint64_t received=0,sent=0;if(FD_ISSET(stream.socket,&reads))ok=stream.read(received);
             if(ok)ok=stream.parse([&](auto type,const auto& bytes){return message(type,bytes);});
             if(ok && FD_ISSET(stream.socket,&writes))ok=stream.write(sent);
             {std::lock_guard lock(mutex);state.bytes_received+=received;state.bytes_sent+=sent;
                 if(transfer_active(custom_map_receiver.status().phase) && milliseconds()-custom_map_progress>30000){std::vector<uint8_t> cancel;put64(cancel,custom_map_receiver.token());put64(cancel,custom_map_receiver.status().request.epoch);enqueue(wire::Message::CustomMapCancel,std::move(cancel));custom_map_receiver.fail("Custom map download stalled.");}
             }
-            if(milliseconds()-stream.last_receive>15000 || (!stream.transmit.empty() && milliseconds()-stream.last_progress>10000))ok=false;
+            if(ok)ok=stream.within_timeouts();
         }
         close_socket(stream.socket);std::lock_guard lock(mutex);state.connecting=false;state.connected=false;
         if(transfer_active(custom_map_receiver.status().phase))custom_map_receiver.cancel("Disconnected during custom map transfer.");
-        if(stopping)state.message="Disconnected.";else if(state.message=="Connected to authoritative host." || state.message=="Connected; receiving authoritative world.")state.message="Host disconnected or stalled.";
-        else if(state.message=="Connecting to authoritative host.")state.message="Connection closed before player assignment; check protocol and game data.";
+        if(stopping)state.message="Disconnected.";
+        else if(state.message=="Connected to authoritative host." || state.message=="Connected; receiving authoritative world." ||
+                state.message=="Connecting to authoritative host.")state.message=std::move(stream.failure);
     }
 };
 AuthoritativeClient::AuthoritativeClient():impl_(std::make_unique<Impl>()){}
@@ -1043,23 +1168,47 @@ bool AuthoritativeClient::start(const std::string& address,uint16_t port,const s
 bool AuthoritativeClient::start_lan(const std::string& address,uint16_t port,const std::string& ticket,uint64_t fingerprint,const std::string& name,unsigned skin){return start_connection(address,port,ticket,fingerprint,name,skin,true);}
 bool AuthoritativeClient::start_connection(const std::string& address,uint16_t port,const std::string& pin,uint64_t fingerprint,const std::string& name,unsigned skin,bool lan) {
     auto& p=*impl_;if(p.worker.joinable() || !initialize_network() || !port || !(lan?valid_lan_secret(pin):pin_valid(pin)) || !chat_name_valid(name) || !valid_skin_choice(skin))return false;
-    p.skin=uint8_t(skin);p.address=address;p.port=port;p.pin=pin;p.fingerprint=fingerprint;p.name=name;p.state={};p.world=std::make_shared<WorldState>();p.history.clear();p.motion_history.clear();p.look_history.reset(1);p.world_received=0;p.commands.clear();p.chat_outgoing.clear();p.chat.clear();p.chat_rate.clear();p.chat_sequence=0;p.tactical_pings.clear();p.latencies={};p.last_tactical_ping=p.ping_token=0;p.tactical_ping_sent=false;p.pending={};p.input_sequence=p.command_sequence=p.sent_input=0;p.state.port=port;p.state.connecting=true;p.state.message="Connecting to authoritative host.";p.stopping=false;p.custom_map_receiver=CustomMapReceiver{};p.custom_map_serial=p.custom_map_progress=0;
+    p.skin=uint8_t(skin);p.address=address;p.port=port;p.pin=pin;p.fingerprint=fingerprint;p.name=name;p.state={};p.world=std::make_shared<WorldState>();p.history.clear();p.motion_history.clear();p.look_history.reset(1);p.local_control={};p.world_received=0;p.commands.clear();p.chat_outgoing.clear();p.chat.clear();p.chat_rate.clear();p.chat_sequence=0;p.tactical_pings.clear();p.latencies={};p.last_tactical_ping=p.ping_token=0;p.tactical_ping_sent=false;p.pending={};p.input_sequence=p.command_sequence=p.sent_input=0;p.state.port=port;p.state.connecting=true;p.state.message="Connecting to authoritative host.";p.stopping=false;p.custom_map_receiver=CustomMapReceiver{};p.custom_map_serial=p.custom_map_progress=0;
     p.worker=std::thread([&p]{p.run();});return true;
 }
 NetworkStatus AuthoritativeClient::status()const{std::lock_guard lock(impl_->mutex);return impl_->state;}
 std::shared_ptr<const WorldState> AuthoritativeClient::latest_world()const{std::lock_guard lock(impl_->mutex);return impl_->world;}
 AuthoritativeClient::WorldSample AuthoritativeClient::world_sample()const{std::lock_guard lock(impl_->mutex);return {impl_->world,impl_->world_received};}
 std::vector<AuthoritativeClient::WorldSample> AuthoritativeClient::motion_samples(uint64_t after,uint64_t through)const{std::lock_guard lock(impl_->mutex);std::vector<WorldSample> out;for(const auto& s:impl_->motion_history)if(s.world->revision>after && s.world->revision<=through)out.push_back(s);return out;}
-PredictedLook AuthoritativeClient::predicted_look(uint64_t epoch,uint64_t ack){
+PredictedLook AuthoritativeClient::predicted_look(uint64_t epoch,uint64_t ack,double now,
+                                                  const std::array<float,3>& host_angles,float pitch_low,float pitch_high,double scale){
     std::lock_guard lock(impl_->mutex);
-    const auto slot=impl_->state.player.slot;
-    const auto confirmed=slot<max_players && impl_->world->epoch==epoch?impl_->world->input_ack[slot]:0;
-    return impl_->look_history.pending(epoch,ack,std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),confirmed);
+    return impl_->look_history.sample(epoch,ack,now,host_angles,pitch_low,pitch_high,scale);
 }
 void AuthoritativeClient::clear_predicted_look(){std::lock_guard lock(impl_->mutex);impl_->look_history.reset(impl_->world->epoch);}
 void AuthoritativeClient::ready(uint64_t epoch){std::lock_guard lock(impl_->mutex);std::vector<uint8_t> bytes;put64(bytes,epoch);impl_->enqueue(wire::Message::Ready,std::move(bytes));}
 void AuthoritativeClient::lobby_ready(bool ready){std::lock_guard lock(impl_->mutex);auto token=impl_->world->epoch;if(const auto it=impl_->world->mission.find("Session.Lobby.ReadyToken");it!=impl_->world->mission.end())if(const auto value=std::get_if<int64_t>(&it->second))token=std::bit_cast<uint64_t>(*value);std::vector<uint8_t> bytes;put64(bytes,token);bytes.push_back(ready);impl_->enqueue(wire::Message::LobbyReady,std::move(bytes));}
-void AuthoritativeClient::submit_input(ControlInput input){if(!control_valid(input))return;std::lock_guard lock(impl_->mutex);merge_input(impl_->pending,input);++impl_->input_sequence;impl_->look_history.append(impl_->world->epoch,impl_->input_sequence,input.yaw,input.pitch,std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());}
+void AuthoritativeClient::submit_input(ControlInput input){
+    if(!control_valid(input))return;
+    auto& p=*impl_;
+    std::lock_guard lock(p.mutex);
+    merge_input(p.pending,input);
+    const auto sequence=++p.input_sequence;
+    const auto epoch=p.world->epoch;
+    p.look_history.append(epoch,sequence,input.yaw,input.pitch);
+
+    auto& local=p.local_control;
+    const auto fire_down=[](const ssne::PadState& pad){return (pad.buttons&ssne::PAD_R) || pad.trigger_r>=128;};
+    const bool previous_fire=fire_down(local.input.pad),fire=fire_down(input.pad);
+    if(!local.fire_released && !fire)local.fire_released=sequence;
+    if((fire && !previous_fire) || (input.pressed&ssne::PAD_R))local.fire_pressed=sequence;
+    if(previous_fire && !fire)local.fire_released=sequence;
+    if(((input.pad.buttons&ssne::PAD_L) && !(local.input.pad.buttons&ssne::PAD_L)) ||
+       (input.pressed&ssne::PAD_L))local.jump_pressed=sequence;
+    local.epoch=epoch;
+    local.sequence=sequence;
+    local.input=input;
+    local.sampled_at=std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+LocalControlSample AuthoritativeClient::local_control() const{
+    std::lock_guard lock(impl_->mutex);
+    return impl_->local_control;
+}
 void AuthoritativeClient::set_afk(bool value){std::lock_guard lock(impl_->mutex);std::vector<uint8_t> bytes;put64(bytes,impl_->world->epoch);put64(bytes,++impl_->command_sequence);bytes.push_back(value);impl_->enqueue(wire::Message::Afk,std::move(bytes));}
 void AuthoritativeClient::set_spectator(bool value){std::lock_guard lock(impl_->mutex);std::vector<uint8_t> bytes;put64(bytes,impl_->world->epoch);put64(bytes,++impl_->command_sequence);bytes.push_back(value);impl_->enqueue(wire::Message::Spectator,std::move(bytes));}
 void AuthoritativeClient::vote_skip(uint64_t scene){std::lock_guard lock(impl_->mutex);std::vector<uint8_t> bytes;put64(bytes,impl_->world->epoch);put64(bytes,++impl_->command_sequence);put64(bytes,scene);impl_->enqueue(wire::Message::Skip,std::move(bytes));}

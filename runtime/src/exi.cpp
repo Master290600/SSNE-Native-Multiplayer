@@ -26,6 +26,12 @@
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #include "ssne/ppc_context.h"
@@ -50,6 +56,7 @@ bool g_trace = getenv("SSNE_TRACE_EXI") != nullptr;
 struct MemCard {
     std::string path;
     std::vector<uint8_t> data;
+    std::vector<uint8_t> before_result_save;
     uint32_t size_mbit = 16;
     // flash state
     uint8_t command = 0;
@@ -126,18 +133,25 @@ struct MemCard {
         }
         LARGE_INTEGER offset{};offset.QuadPart=dirty_begin;
         DWORD written=0;
-        bool ok=SetFilePointerEx(file,offset,nullptr,FILE_BEGIN)!=0;
-        if(ok)ok=WriteFile(file,data.data()+dirty_begin,dirty_end-dirty_begin,&written,nullptr)!=0;
-        if(!ok)failure=GetLastError();
-        else if(written!=dirty_end-dirty_begin){ok=false;failure=ERROR_WRITE_FAULT;}
+        bool ok=true;
+        // During a result save the guest still receives backing-file errors
+        // at their original flash pages. Only the final directory is published.
+        if(before_result_save.empty()){
+            ok=SetFilePointerEx(file,offset,nullptr,FILE_BEGIN)!=0 &&
+               WriteFile(file,data.data()+dirty_begin,dirty_end-dirty_begin,&written,nullptr)!=0;
+            if(!ok)failure=GetLastError();
+            else if(written!=dirty_end-dirty_begin){ok=false;failure=ERROR_WRITE_FAULT;}
+        }
         if(!CloseHandle(file)){ok=false;failure=GetLastError();}
         if(!ok){fprintf(stderr,"[exi] card backing write failed: offset=%u bytes=%u win32=%lu path=%s\n",dirty_begin,dirty_end-dirty_begin,failure,path.c_str());return false;}
         if(retries)fprintf(stdout,"[exi] card backing sharing retry recovered: offset=%u bytes=%u retries=%u\n",dirty_begin,dirty_end-dirty_begin,retries);
 #else
         std::fstream f(fs::u8path(path), std::ios::in | std::ios::out | std::ios::binary);
         if (!f) { fprintf(stderr,"[exi] card backing open failed: offset=%u bytes=%u path=%s\n",dirty_begin,dirty_end-dirty_begin,path.c_str()); return false; }
-        f.seekp(dirty_begin);
-        f.write(reinterpret_cast<const char*>(data.data() + dirty_begin), dirty_end-dirty_begin);
+        if(before_result_save.empty()){
+            f.seekp(dirty_begin);
+            f.write(reinterpret_cast<const char*>(data.data() + dirty_begin), dirty_end-dirty_begin);
+        }
         f.flush();f.close();
         if (!f) { fprintf(stderr,"[exi] card backing write failed: offset=%u bytes=%u path=%s\n",dirty_begin,dirty_end-dirty_begin,path.c_str()); return false; }
 #endif
@@ -676,6 +690,96 @@ std::string exi_memcard_path() {
     std::lock_guard<std::mutex> lk(g_mutex);
     return g_card[0] ? g_card[0]->path : std::string();
 }
+bool exi_begin_result_save() {
+    std::lock_guard lock(g_mutex);
+    init_locked();
+    auto* card=g_card[0];
+    if(!card || !card->before_result_save.empty())return false;
+    if(card->dirty_end && !card->flush(0,0))return false;
+    card->before_result_save=card->data;
+    return true;
+}
+
+// Keep the previous image addressable throughout this replacement, even when
+// the game closes or the filesystem rejects the final rename. Check for a
+// newer external save under a writer lock before accepting the staged bytes.
+static bool publish_result_card(const MemCard& card) {
+    const auto path=fs::u8path(card.path);
+#ifdef _WIN32
+    const auto pid=GetCurrentProcessId();
+#else
+    const auto pid=getpid();
+#endif
+    const auto temp=fs::u8path(card.path+".coop-save-"+std::to_string(pid)+".tmp");
+#ifdef _WIN32
+    FILE* out=_wfopen(temp.c_str(),L"wb");
+#else
+    FILE* out=fopen(temp.c_str(),"wb");
+#endif
+    if(!out)return false;
+    bool ok=fwrite(card.data.data(),1,card.data.size(),out)==card.data.size() && fflush(out)==0;
+#ifdef _WIN32
+    if(ok)ok=_commit(_fileno(out))==0;
+#else
+    if(ok)ok=fsync(fileno(out))==0;
+#endif
+    if(fclose(out)!=0)ok=false;
+    if(ok){
+        std::vector<uint8_t> current(card.before_result_save.size());
+#ifdef _WIN32
+        // Serialize native publishers across game processes. Delete-on-close
+        // releases the lock file even if one of them terminates here.
+        const auto lock_path=fs::u8path(card.path+".coop-save.lock");
+        const auto lock=CreateFileW(lock_path.c_str(),GENERIC_WRITE|DELETE,0,nullptr,OPEN_ALWAYS,
+                                    FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,nullptr);
+        const auto file=lock==INVALID_HANDLE_VALUE ? INVALID_HANDLE_VALUE :
+            CreateFileW(path.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_DELETE,
+                        nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+        LARGE_INTEGER size{};
+        DWORD got=0;
+        ok=file!=INVALID_HANDLE_VALUE && GetFileSizeEx(file,&size) && size.QuadPart==LONGLONG(current.size()) &&
+           ReadFile(file,current.data(),DWORD(current.size()),&got,nullptr) && got==current.size() &&
+           current==card.before_result_save;
+        if(file!=INVALID_HANDLE_VALUE)CloseHandle(file);
+        if(ok)ok=MoveFileExW(temp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
+        if(lock!=INVALID_HANDLE_VALUE)CloseHandle(lock);
+#else
+        const int file=open(path.c_str(),O_RDWR);
+        struct stat handle{},named{};
+        ok=file>=0 && flock(file,LOCK_EX|LOCK_NB)==0 && fstat(file,&handle)==0 && stat(path.c_str(),&named)==0 &&
+           handle.st_dev==named.st_dev && handle.st_ino==named.st_ino && handle.st_size==off_t(current.size()) &&
+           pread(file,current.data(),current.size(),0)==ssize_t(current.size()) && current==card.before_result_save &&
+           rename(temp.c_str(),path.c_str())==0;
+        if(file>=0)close(file);
+#endif
+    }
+    if(!ok){std::error_code ignored;fs::remove(temp,ignored);}
+    return ok;
+}
+
+bool exi_commit_result_save() {
+    std::lock_guard lock(g_mutex);
+    auto* card=g_card[0];
+    if(!card || card->before_result_save.empty())return false;
+    if(!card->path.empty() && !publish_result_card(*card))return false;
+    card->before_result_save.clear();
+    return true;
+}
+
+bool exi_result_save_pending() {
+    std::lock_guard lock(g_mutex);
+    return g_card[0] && !g_card[0]->before_result_save.empty();
+}
+
+void exi_cancel_result_save() {
+    std::lock_guard lock(g_mutex);
+    auto* card=g_card[0];
+    if(!card || card->before_result_save.empty())return;
+    card->data=std::move(card->before_result_save);
+    card->before_result_save.clear();
+    card->dirty_begin=card->dirty_end=0;
+}
+
 bool exi_begin_client_session(){
     std::lock_guard lock(g_mutex);init_locked();if(g_client_card_leased)return false;
     if(!g_card[0]){g_client_card_leased=true;return true;}

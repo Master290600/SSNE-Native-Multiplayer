@@ -308,7 +308,7 @@ bool zoomed_in() { return now_ms() - g_cam_zoom_ms.load() < 250; }
 float player_zoom_fov(uint32_t player) {
     if (mem_read32(player + 0x5DC) != 8) return 0;
     uint32_t rifle = mem_read32(player + 0x4BC + 8 * 0x18);
-    if (rifle < 0x80000000u || rifle >= 0x817FFF00u) return 0;
+    if (rifle < 0x80000000u || rifle > guest_ram_end()-0x234u) return 0;
     float zoom = u2f(mem_read32(rifle + 0x230));
     return zoom > 1.01f && zoom < 100.0f ? 80.0f / zoom : 0;
 }
@@ -1471,12 +1471,9 @@ void hle_look_update(PPCContext& ctx) {
     if (dyaw == 0 && dpitch == 0) return;
     // Zoomed in (the sniper rifle narrows the FOV), the same turn moves the image further: the mouse turns by the
     // zoom (ratio of the tangents), so it moves the crosshair over the image at the same speed at any zoom.
-    if (float cam = player_zoom_fov(player); cam > 1.0f) {
-        constexpr double h = 0.5 * 0.017453292519943295;
-        double zoom = std::tan(h * cam) / std::tan(h * kGameFov);
-        dyaw *= zoom;
-        dpitch *= zoom;
-    }
+    const double zoom=mouse_look_scale(player);
+    dyaw*=zoom;
+    dpitch*=zoom;
     if (player < 0x80000000u || player >= guest_ram_end()) return;
     constexpr double kTwoPi = 6.283185307179586;
     double yaw = std::fmod(double(u2f(mem_read32(player + 0x290))) + dyaw, kTwoPi);
@@ -2976,6 +2973,12 @@ BotWorld netplay_bot_world() {
     world.pitch=u2f(mem_read32(world.client.id+0x294));
     world.enemies=netplay_bot_enemies();
     return world;
+}
+double mouse_look_scale(uint32_t player){
+    if(player<0x80000000u || player>guest_ram_end()-0x5E0u)return 1.;
+    const float fov=player_zoom_fov(player);
+    constexpr double half_degree=.5*.017453292519943295;
+    return fov>1.f?std::tan(half_degree*fov)/std::tan(half_degree*kGameFov):1.;
 }
 void netplay_mouse(int port, double yaw, double pitch) {
     if (port < 0 || unsigned(port) >= g_netplay_count) return;

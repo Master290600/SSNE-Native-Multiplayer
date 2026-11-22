@@ -74,6 +74,89 @@ SOCKET accept_pending(SOCKET listener) {
     DWORD timeout=5000;setsockopt(peer,SOL_SOCKET,SO_RCVTIMEO,reinterpret_cast<const char*>(&timeout),sizeof(timeout));
     return peer;
 }
+void check_lagged_world_acknowledgements() {
+    AuthoritativeServer host(2);
+    require(host.start(0,"123456",1234,"Delayed world acknowledgement host"),"Delayed world host start");
+    WorldState world;world.level="Lagged client fixture";world.tick=1;
+    std::string error;require(host.publish(world,error),error.c_str());
+    const auto peer=raw_peer(host.status().port);
+    const auto next_world=[&] {
+        const auto end=Clock::now()+std::chrono::seconds(5);
+        for(;;){
+            const auto [type,body]=receive_frame(peer);
+            if(type==wire::Message::World){
+                WorldDelta delta;require(decode_delta(body,delta,error),error.c_str());return delta;
+            }
+            require(Clock::now()<end,"Did not receive a world snapshot");
+        }
+    };
+    const auto send_number=[&](wire::Message type,uint64_t number){
+        std::vector<uint8_t> body;put64(body,number);auto bytes=frame(type,body);
+        require(transfer(peer,bytes.data(),bytes.size(),true),"Lagged peer send");
+    };
+    const auto drive_publication=[&](unsigned count){
+        for(unsigned i=0;i<count;++i){
+            ++world.tick;require(host.publish(world,error),error.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    };
+    const auto first=next_world();
+    require(first.full,"First world must be a full snapshot");
+    const auto sent_before=host.status().bytes_sent;
+    // More than the previous 64-snapshot lifetime, with the ACK withheld but an
+    // otherwise reliable connection. Queueing full worlds here starves slow links.
+    drive_publication(80);
+    require(host.status().bytes_sent<sent_before+1024,"Host queued repeated full worlds while awaiting initial acknowledgement");
+    send_number(wire::Message::WorldAck,first.revision);
+    const auto caught_up=next_world();
+    require(!caught_up.full && caught_up.base_revision==first.revision && caught_up.tick==world.tick,"Late initial ACK did not deliver the latest world");
+
+    drive_publication(44);
+    // The ordered Pong fences the frames already sent during the missed ACKs.
+    send_number(wire::Message::Ping,777);
+    unsigned queued=1;
+    auto last_queued=caught_up.revision;
+    for(;;){
+        const auto [type,body]=receive_frame(peer);
+        if(type==wire::Message::Pong && get64(body)==777)break;
+        if(type==wire::Message::World){
+            WorldDelta delta;require(decode_delta(body,delta,error),error.c_str());
+            require(!delta.full && delta.base_revision==last_queued,"Ordered delta did not use its immediate predecessor");
+            last_queued=delta.revision;++queued;
+        }
+    }
+    require(queued>=2 && queued<=4,"Small updates must pipeline within a bounded acknowledgement window");
+    send_number(wire::Message::WorldAck,caught_up.revision);
+    const auto resumed=next_world();
+    require(resumed.base_revision==last_queued && resumed.tick==world.tick,"Retained acknowledgement did not resume snapshot publication");
+    send_number(wire::Message::WorldAck,resumed.revision);
+    auto resnapshot=frame(wire::Message::SnapshotRequest,{});
+    require(transfer(peer,resnapshot.data(),resnapshot.size(),true),"Forced resnapshot request");
+    const auto forced=next_world();
+    require(forced.full && forced.revision==resumed.revision,"Forced resnapshot did not preserve the authoritative state");
+    require(transfer(peer,resnapshot.data(),resnapshot.size(),true),"Older client resnapshot retry");
+    ++world.tick;require(host.publish(world,error),error.c_str());
+    const auto after_retry=next_world();
+    require(!after_retry.full && after_retry.base_revision==resumed.revision && after_retry.tick==world.tick,"Older client resnapshot retry stalled publication");
+    send_number(wire::Message::WorldAck,after_retry.revision);
+
+    world.mission["test_pose"]=std::vector<float>(2500,1.0f);
+    ++world.tick;require(host.publish(world,error),error.c_str());
+    const auto large=next_world();
+    require(encode_delta(large).size()>8192,"Fixture must exceed the world byte budget");
+    drive_publication(8);
+    send_number(wire::Message::Ping,778);
+    for(;;){
+        const auto [type,body]=receive_frame(peer);
+        require(type!=wire::Message::World,"New worlds queued behind an already oversized world");
+        if(type==wire::Message::Pong && get64(body)==778)break;
+    }
+    send_number(wire::Message::WorldAck,large.revision);
+    const auto latest=next_world();
+    require(latest.tick==world.tick && latest.base_revision==large.revision &&
+            !latest.mission.set.contains("test_pose"),"Host did not coalesce intervening updates after a large world");
+    closesocket(peer);host.stop();
+}
 void check_connecting_lifecycle() {
     uint16_t port=0;auto listener=loopback_endpoint(port,true);AuthoritativeClient client;
     require(!client.status().connecting && !client.status().connected,"Unstarted client has pending connection");
@@ -90,7 +173,8 @@ void check_connecting_lifecycle() {
     require(transfer(peer,assigned.data(),assigned.size(),true),"Lifecycle assignment send");
     wait_for([&]{return client.status().connected;},"Lifecycle assignment not accepted");
     require(!client.status().connecting,"Assigned client still reports Pending");
-    closesocket(peer);wait_for([&]{auto s=client.status();return !s.connecting && !s.connected;},"Disconnected client retained a live lifecycle state");client.stop();
+    closesocket(peer);wait_for([&]{auto s=client.status();return !s.connecting && !s.connected;},"Disconnected client retained a live lifecycle state");
+    require(client.status().message.find("closed the connection")!=std::string::npos || client.status().message.find("receive socket error")!=std::string::npos,"Disconnect lost its transport reason");client.stop();
     require(client.start("127.0.0.1",port,"123456",1234,"Cancelled lifecycle"),"Cancelled lifecycle start");peer=accept_pending(listener);
     require(client.status().connecting && !client.status().connected,"Unassigned retry lost Pending");
     client.stop();require(!client.status().connecting && !client.status().connected,"Cancelled client retained Pending");closesocket(peer);closesocket(listener);
@@ -200,7 +284,7 @@ int main() {
     check_lobby_readiness();check_lobby_legacy_epoch_fallback();check_lobby_setup_atomic_readiness();check_lobby_failed_start_recovery();
     AuthoritativeServer host(8);host.submit_host_input({});
     require(host.start(0,"123456",1234),"Host start");auto host_id=host.status().player;auto port=host.status().port;
-    check_connecting_lifecycle();
+    check_connecting_lifecycle();check_lagged_world_acknowledgements();
     AuthoritativeClient bad;require(bad.start("127.0.0.1",port,"123456",4321,"Wrong data"),"Wrong-data client start");
     wait_for([&]{return !bad.status().connecting;},"Wrong fingerprint retained Pending");require(!bad.status().connected && bad.status().message.find("differs")!=std::string::npos,"Wrong fingerprint not rejected");bad.stop();
     require(bad.start("127.0.0.1",port,"654321",1234,"Wrong PIN"),"Wrong-PIN client start");

@@ -498,10 +498,13 @@ void update(PPCContext& ctx){
     if(world)for(unsigned slot=0;slot<p->count;++slot)ready_count+=world->players[slot].connected && bool(ready_mask&(uint64_t(1)<<slot));
     for(unsigned slot=0;slot<8;++slot)ready_badge(ctx,*p,slot,slot<p->count && world && world->players[slot].connected && bool(ready_mask&(uint64_t(1)<<slot)),view);
     const auto difficulty_text=difficulty==0?FrontText::Easy:difficulty==1?FrontText::Normal:difficulty==2?FrontText::Hard:FrontText::Serious;
+    auto client_hint=FrontText::LobbyWaitingReady;
+    if(map.empty())client_hint=FrontText::LobbyWaitingForMap;
+    else if(occupied && ready_count==occupied)client_hint=FrontText::LobbyWaitingForHost;
     const std::array<std::string,13> information{
         std::string(tr(lobby_mode_text(mode)))+"    "+std::to_string(occupied)+" / "+std::to_string(p->count)+" "+tr(FrontText::Players),
         tr(FrontText::LobbySettings),
-        server?std::string{}:std::string(tr(map.empty()?FrontText::LobbySelectFirst:FrontText::LobbyWaitingReady)),
+        server?std::string{}:std::string(tr(client_hint)),
         map.empty()?std::string(tr(FrontText::LobbyNoMap)):metadata.valid?metadata.title:map,
         tr(FrontText::Skill),
         occupied>1?std::string(tr(FrontText::LobbyReady))+" "+std::to_string(ready_count)+" / "+std::to_string(occupied):std::string{},

@@ -1,6 +1,8 @@
 #include "updater.h"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <stdexcept>
@@ -10,7 +12,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <sstream>
+#include <optional>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -55,17 +58,36 @@ std::string json_string(const std::string& js, const std::string& key, size_t fr
     return js.substr(q + 1, e - q - 1);
 }
 
-std::vector<int> parse_version(const std::string& v) {
-    std::vector<int> out;
-    std::stringstream ss(v[0] == 'v' ? v.substr(1) : v);
-    std::string part;
-    while (std::getline(ss, part, '.')) out.push_back(atoi(part.c_str()));
-    return out;
+struct Version {
+    std::array<unsigned, 4> core{};
+    std::optional<unsigned> beta;
+};
+
+bool consume_number(std::string_view& text, unsigned& value) {
+    if (text.empty()) return false;
+    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (result.ec != std::errc{}) return false;
+    text.remove_prefix(static_cast<size_t>(result.ptr - text.data()));
+    return true;
 }
-bool newer(const std::string& a, const std::string& b) {  // a > b
-    std::vector<int> x = parse_version(a), y = parse_version(b);
-    x.resize(std::max(x.size(), y.size())); y.resize(x.size());
-    return x > y;
+
+std::optional<Version> parse_version(std::string_view text) {
+    if (text.starts_with('v')) text.remove_prefix(1);
+    Version result;
+    for (auto& part : result.core) {
+        if (!consume_number(text, part)) return {};
+        if (!text.starts_with('.')) break;
+        if (&part == &result.core.back()) return {};
+        text.remove_prefix(1);
+    }
+    if (text.empty()) return result;
+    constexpr std::string_view beta_prefix = "-beta.";
+    if (!text.starts_with(beta_prefix)) return {};
+    text.remove_prefix(beta_prefix.size());
+    unsigned beta = 0;
+    if (!consume_number(text, beta) || !text.empty()) return {};
+    result.beta = beta;
+    return result;
 }
 
 // Moves `from` to `to`, replacing it. A file in use (the running launcher on Windows) can't be replaced but can be
@@ -92,6 +114,14 @@ bool replace_file(const fs::path& from, const fs::path& to, std::vector<std::str
 const char* current_version() { return SSNE_VERSION; }
 const char* release_feed_url() { return kLatestUrl; }
 
+bool is_newer_version(const std::string& candidate, const std::string& installed) {
+    const auto next = parse_version(candidate), current = parse_version(installed);
+    if (!next || !current) return false;
+    if (next->core != current->core) return next->core > current->core;
+    if (!next->beta || !current->beta) return !next->beta && current->beta.has_value();
+    return *next->beta > *current->beta;
+}
+
 bool check(Release& r, std::string& error) {
     const char* url = getenv("SSNE_UPDATE_URL");  // testing: another release feed
     fs::path tmp = fs::temp_directory_path() / "ssne-native-latest.json";
@@ -105,7 +135,7 @@ bool check(Release& r, std::string& error) {
     std::string tag = json_string(js, "tag_name", 0);
     if (tag.empty()) { error = "no release information"; return false; }
     r.version = tag[0] == 'v' ? tag.substr(1) : tag;
-    if (!newer(r.version, current_version())) return false;
+    if (!is_newer_version(r.version, current_version())) return false;
     for (size_t at = 0;;) {
         std::string u = json_string(js, "browser_download_url", at, &at);
         if (u.empty()) break;

@@ -36,8 +36,11 @@ void set_native_hit_identity_resolver(std::function<NativeHitIdentity(uint32_t)>
 std::vector<NativeConfirmedHit> native_confirmed_hit_history();
 bool validate_native_confirmed_hit(const NativeConfirmedHit&,std::string& error);
 struct NativeRocketEffect {uint64_t sequence=0;unsigned style=0;std::array<float,10> values{};};
-struct NativeWeaponShot {uint64_t sequence=0,order=0;unsigned slot=0;std::array<float,3> position{};unsigned weapon=6,cue_sound=0,cue_flags=1;};
-struct NativeWeaponLoop {uint64_t sequence=0,order=0;unsigned slot=0,lane=0,weapon=2;uint64_t origin=0;bool active=false;uint32_t duration_ms=0,elapsed_ms=0;std::array<float,3> position{};};
+struct NativeWeaponShot {uint64_t sequence=0,order=0;unsigned slot=0;std::array<float,3> position{};unsigned weapon=6,cue_sound=0,cue_flags=1;uint64_t input_press=0;unsigned hand=2;bool last_round=false;};
+struct NativeWeaponLoop {uint64_t sequence=0,order=0;unsigned slot=0,lane=0,weapon=2;uint64_t origin=0;bool active=false;uint32_t duration_ms=0,elapsed_ms=0;std::array<float,3> position{};uint64_t input_press=0;};
+void set_native_weapon_press(unsigned slot,uint64_t press);
+bool adopt_local_weapon_cue(uint64_t local_sequence,const NativeWeaponShot&);
+void stop_local_weapon_cue(PPCContext&,uint64_t sequence);
 struct NativeBulletImpact {uint64_t sequence=0;std::array<uint32_t,5> tags{};std::array<float,9> vectors{};};
 // Original 800EE020 line effect: world-space start/end and its native view mask.
 // It exists for one rendered frame and is independent of a collision impact.
@@ -115,6 +118,11 @@ bool play_native_weapon_surface(PPCContext&,const NativeWeaponSurface&,std::stri
 std::vector<NativeWeaponBeam> native_weapon_beam_history();
 bool validate_native_weapon_beam(const NativeWeaponBeam&,std::string& error);
 bool play_native_weapon_beam(PPCContext&,const NativeWeaponBeam&,std::string& error);
+struct NativeSirianWeaponView {
+    std::array<float,12> weapon{};
+    std::array<uint32_t,8> matrices{};
+};
+std::optional<NativeSirianWeaponView> replica_sirian_weapon_view(unsigned hand,bool charge);
 // W11 sustained presentation: model/controller existence and visibility,
 // model matrix12, controller position3/radius, resource UV matrix12.
 bool capture_native_bomb_visual(uint32_t actor,unsigned hand,std::vector<float>&,std::array<uint32_t,2>& masks,std::string& error);
@@ -134,6 +142,11 @@ std::vector<NativeWeaponLoop> native_weapon_loop_history();
 std::vector<NativeWeaponLoop> native_weapon_active_loops();
 bool validate_native_weapon_loop(const NativeWeaponLoop&,std::string& error);
 bool apply_native_weapon_loop(PPCContext&,const NativeWeaponLoop&,bool local_player,std::string& error);
+// Locally presented firing loops use an origin outside the host's journal.
+// A matching confirmation adopts that voice without starting another one.
+bool start_local_weapon_loop(PPCContext&,const NativeWeaponLoop&,std::string& error);
+bool stop_local_weapon_loop(PPCContext&,unsigned slot,unsigned lane,uint64_t origin);
+bool adopt_local_weapon_loop(uint64_t local_origin,const NativeWeaponLoop& confirmation);
 bool update_native_weapon_loops(PPCContext&,std::string& error);
 // Stop the old sustained weapon only; preserves other actors and one-shot cues.
 bool stop_native_weapon_loops_for_actor(PPCContext&,uint32_t actor,unsigned weapon,std::string& error);

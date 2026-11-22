@@ -13,6 +13,7 @@ std::chrono::steady_clock::time_point native_connect_started;
 port::coop::LanAdvertisement native_advertisement;
 port::coop::LanBrowser native_browser;
 std::unique_ptr<port::coop::invite::InviteTransport> native_invitation;
+port::coop::invite::InvitationRetirement native_invitation_retirement;
 port::coop::invite::Config native_invitation_config;
 std::string native_invitation_config_error,native_invitation_join_name;
 uint64_t native_invitation_join_fingerprint=0;
@@ -29,11 +30,14 @@ uint64_t native_invitation_clipboard_generation=0,native_invitation_copy_sequenc
 port::coop::NativeInvitationCopyState native_invitation_copy_state=port::coop::NativeInvitationCopyState::Idle;
 // UI-thread shutdown stops workers but keeps the object alive until the guest
 // observer has retired. Menu status callbacks may still read it during quit.
-void halt_invitation_network(){if(native_invitation)native_invitation->stop();}
+void halt_invitation_network(){
+    if(native_invitation)native_invitation->stop();
+    native_invitation_retirement.drain();
+}
 void stop_invitation_network(){
     native_invitation_copy_pending=false;native_invitation_copy_deadline={};native_session_fingerprint=0;
     {std::lock_guard lock(native_invitation_clipboard_mutex);++native_invitation_clipboard_generation;native_invitation_clipboard={};native_invitation_copy_state=port::coop::NativeInvitationCopyState::Idle;}
-    halt_invitation_network();native_invitation.reset();
+    native_invitation_retirement.retire(std::move(native_invitation));
     native_invitation_host_pending=false;native_invitation_join_pending=false;native_invitation_join_name.clear();native_invitation_join_fingerprint=0;native_invitation_join_skin=255;
 }
 void flush_native_invitation_clipboard(){
@@ -85,8 +89,9 @@ void copy_native_lobby_invitation(){
     auto failed=[](){native_invitation_copy_pending=false;std::lock_guard clipboard_lock(native_invitation_clipboard_mutex);native_invitation_copy_state=port::coop::NativeInvitationCopyState::Failed;};
     if(!native_invitation_config_error.empty()){failed();return;}
     try{
-        if(native_invitation){const auto status=native_invitation->status();if(status.phase==port::coop::invite::Phase::Failed){if(status.peers){failed();return;}native_invitation.reset();}}
+        if(native_invitation){const auto status=native_invitation->status();if(status.phase==port::coop::invite::Phase::Failed){if(status.peers){failed();return;}native_invitation_retirement.retire(std::move(native_invitation));}}
         if(!native_invitation){
+            if(!native_invitation_retirement.prepare()){failed();return;}
             auto invitation=std::make_unique<port::coop::invite::InviteTransport>();std::string why;
             if(!invitation->host(g_coop_server->status().port,g_lan_pin,native_session_fingerprint,native_invitation_config,why)){failed();log_line("[native-lobby-invite] "+why);return;}
             native_invitation=std::move(invitation);
@@ -198,6 +203,7 @@ std::string start_native_session_impl(bool hosting,const port::coop::FrontendEnd
     if(g_coop_host || g_coop_client || native_connecting)return "already active";
     if(endpoint.internet && !native_invitation_config_error.empty())return "invite:settings";
     try{
+        if(endpoint.internet && !native_invitation_retirement.prepare())return "invite:connection";
         snapshot_native_setup();native_lan_join=room!=nullptr;g_lan_pin=room?std::string{}:endpoint.pin;g_coop_capacity=8;g_coop_level="lobby";
         const auto fingerprint=port::netplay::content_hash(native_data_directory+"/sys/main.dol");
         if(!fingerprint)return "Multiplayer game data differs";
@@ -207,7 +213,7 @@ std::string start_native_session_impl(bool hosting,const port::coop::FrontendEnd
         const auto preferences=port::coop::native_frontend_options();if(!preferences.name.empty())name=port::coop::native_name_utf8(preferences.name);
         const unsigned skin=port::coop::valid_skin_choice(preferences.skin)?preferences.skin:255;
         if(hosting){
-            g_coop_server=std::make_unique<port::coop::AuthoritativeServer>(8);
+            g_coop_server=std::make_unique<port::coop::AuthoritativeServer>(8,log_line);
             if(!g_coop_server->start(uint16_t(endpoint.port),endpoint.pin,fingerprint,name,skin)){g_coop_server.reset();return "host failed";}
             native_session_fingerprint=fingerprint;
             g_coop_server->set_lan_join_enabled(!preferences.use_password);
@@ -242,6 +248,7 @@ void setup_native_frontend(const std::string& data){
     port::coop::install_native_lobby(nullptr,nullptr);
     native_data_directory=data;native_offline_states=g_states_dir;
     if(!port::coop::invite::load_settings(g_settings_path+".internet",native_invitation_config,native_invitation_config_error))log_line("[native-invitation] Internet settings unavailable; LAN remains available.");
+    native_invitation_config.diagnostic=log_line;
     const auto hidden_invitation=getenv("SSNE_TEST_HIDDEN"),local_invitation=getenv("SSNE_TEST_INVITE_LOCAL");
     if(hidden_invitation && local_invitation && !std::strcmp(hidden_invitation,"1") && !std::strcmp(local_invitation,"1")){
         // A private native UI fixture must never discover the user's router or
@@ -367,8 +374,10 @@ void session_frontend_frame(PPCContext& c,uint64_t frame){
     if(native_connecting && native_invitation_join_pending){
         std::lock_guard lock(g_session_mutex);const auto status=native_invitation?native_invitation->status():port::coop::invite::Status{};
         if(status.phase==port::coop::invite::Phase::Failed || std::chrono::steady_clock::now()-native_connect_started>std::chrono::milliseconds(native_invitation_config.connect_timeout_ms+25000)){
+            log_line("[native-session-connect-error] "+(status.message.empty()?std::string("Invitation setup timed out."):status.message));
             native_connection_error="invite:connection";stop_native_session(c);
         }else if(status.network_ready && !start_native_invitation_peer()){
+            log_line("[native-session-connect-error] Could not start the invitation's local game connection.");
             native_connection_error="invite:connection";stop_native_session(c);
         }
     }
@@ -379,7 +388,16 @@ void session_frontend_frame(PPCContext& c,uint64_t frame){
             native_connection_error=status.message;log_line("[native-session-connect-error] "+status.message);stop_native_session(c);
         }
     }
-    if(g_coop_client && g_coop_peer && !g_coop_peer->status().connected){const auto why=g_coop_peer->status().message;stop_native_session(c);port::coop::native_frontend_disconnected(why);}
+    if(g_coop_client && g_coop_peer){
+        const auto peer=g_coop_peer->status();
+        if(!peer.connected){
+            const auto invitation=native_invitation?native_invitation->status():port::coop::invite::Status{};
+            log_line("[native-session-disconnect] "+peer.message+
+                (invitation.phase==port::coop::invite::Phase::Failed ? " Invitation transport: "+invitation.message : ""));
+            stop_native_session(c);
+            port::coop::native_frontend_disconnected(peer.message);
+        }
+    }
     port::coop::native_frontend_frame(c);
     publish_native_mouse_presentation();
     port::consume_native_menu_pointer(c);

@@ -82,6 +82,7 @@ bool has_options_button(){return page==Page::OnlineSetup || page==Page::Direct |
 FrontText edit_error=FrontText::Count;
 std::atomic<Edit> editing{Edit::None};std::atomic<uint64_t> input{0};
 std::atomic<unsigned> hotkey{0};unsigned action=99,skill=2,cursor=0;bool changing=false,local_mode=false,setup_seen=false,wait_release=false,notify_error=false,last_host=false,host_pin_initialized=false;
+bool waiting_for_host_world=false;
 uint64_t mouse_epoch=1;
 unsigned focus=0,room_offset=0,main_idle_frames=0;bool replace_all=false;
 LanRoomSort room_sort=LanRoomSort::Ping;LanRoomFilter room_filter;
@@ -567,6 +568,7 @@ void prepare_host_endpoint(){
     }
 }
 void cancel_connection(PPCContext& c){
+    waiting_for_host_world=false;
     transfer_lobby_gui=0;
     custom_map_cancel=true;{std::lock_guard lock(custom_map_mutex);custom_map_progress={};custom_map_phase=NativeCustomMapPhase::None;}
     const auto origin=connection_origin();error="cancelled";notify_error=false;close(c,0);release_transfer_pause(c);
@@ -636,7 +638,7 @@ void configure_invitation_host(PPCContext& c){
     }
     setup_seen=false;main_idle_frames=0;handoff_release=true;close(c,0);
 }
-FrontText failure(){if(error=="invalid-invite")return FrontText::InviteInvalid;if(error=="host failed")return FrontText::HostFailed;if(error.starts_with("invite:"))return FrontText::InviteFailed;if(error.starts_with("custom-level:"))return FrontText::CustomLevelUnavailable;if(error=="lan-expired")return FrontText::LanExpired;if(error=="invalid-address")return FrontText::InvalidAddress;if(error=="invalid-pin")return FrontText::InvalidPin;if(error=="invalid-port")return FrontText::InvalidPort;if(error=="lost")return FrontText::Lost;if(error.find("differs")!=std::string::npos || error.find("PIN")!=std::string::npos)return FrontText::Version;if(error.find("full")!=std::string::npos)return FrontText::Full;if(error=="invalid")return FrontText::Invalid;return FrontText::Failed;}
+FrontText failure(){if(error=="invalid-invite")return FrontText::InviteInvalid;if(error=="host failed")return FrontText::HostFailed;if(error.starts_with("invite:"))return FrontText::InviteFailed;if(error.starts_with("custom-level:"))return FrontText::CustomLevelUnavailable;if(error=="lan-expired")return FrontText::LanExpired;if(error=="invalid-address")return FrontText::InvalidAddress;if(error=="invalid-pin")return FrontText::InvalidPin;if(error=="invalid-port")return FrontText::InvalidPort;if(error=="lost:timeout")return FrontText::ConnectionTimeout;if(error=="lost")return FrontText::Lost;if(error.find("differs")!=std::string::npos || error.find("PIN")!=std::string::npos)return FrontText::Version;if(error.find("full")!=std::string::npos)return FrontText::Full;if(error=="invalid")return FrontText::Invalid;return FrontText::Failed;}
 std::shared_ptr<const ssne::CustomCrosshairImage> online_icon_image(){
     // Optional artwork is extracted locally from the user's PS2 disc. The
     // executable/source package contains no original game pixels.
@@ -699,7 +701,9 @@ void update(PPCContext& c){
         hint=invitation_display(value.code)+"\n"+tr(value.phase==5?FrontText::InviteFailed:value.phase==1?FrontText::InvitePreparing:value.route==2?FrontText::InviteRelay:value.route==1?FrontText::InviteDirect:FrontText::InviteWaiting);
         if(lobby_invitation_label()==FrontText::InvitationCopied)hint+="\n"+std::string(tr(FrontText::InvitationCopied));break;
     }
-    case Page::Connecting:{heading=FrontText::Connection;buttons={tr(FrontText::Connecting),"","",tr(FrontText::Cancel)};hint=last_invitation?std::string(tr(FrontText::JoinInvitationHelp)):endpoint.address+":"+std::to_string(endpoint.port);
+    case Page::Connecting:{heading=FrontText::Connection;buttons={tr(FrontText::Connecting),"","",tr(FrontText::Cancel)};
+        hint=waiting_for_host_world && active()?tr(FrontText::SynchronizingHost):
+            last_invitation?std::string(tr(FrontText::JoinInvitationHelp)):endpoint.address+":"+std::to_string(endpoint.port);
         if(custom_map_busy()){
             const auto transfer=native_frontend_custom_map_progress();const auto phase=transfer.phase;
             buttons[0]=tr(phase==NativeCustomMapPhase::Requesting?FrontText::CustomMapRequesting:phase==NativeCustomMapPhase::Downloading?FrontText::CustomMapDownloading:phase==NativeCustomMapPhase::Verifying?FrontText::CustomMapVerifying:FrontText::CustomMapInstalling);
@@ -777,14 +781,14 @@ void start(PPCContext& c,bool hosting,bool invitation=false){
     if(invitation && !hosting){std::string why;const auto parsed=invite::decode_invitation(invitation_code,why);if(!parsed){error="invalid-invite";show(c,Page::Error);return;}address.invitation_code=invite::encode_invitation(*parsed);address.address="127.0.0.1";address.port=27341;address.pin=parsed->pin;}
     if(!hosting && !invitation){const auto colon=address.address.rfind(':');if(colon!=std::string::npos){try{address.port=unsigned(std::stoul(address.address.substr(colon+1)));}catch(...){address.port=0;}address.address.resize(colon);}}
     if(const auto invalid=frontend_endpoint_error(address);invalid!=FrontendEndpointError::None){error=invalid==FrontendEndpointError::Address?"invalid-address":invalid==FrontendEndpointError::Pin?"invalid-pin":"invalid-port";ssne::log_message("[native-network-menu] validation failed: "+error);show(c,Page::Error);return;}
-    error=services.start?services.start(hosting,address):"unavailable";if(!error.empty()){ssne::log_message("[native-network-menu] start failed: "+error);show(c,Page::Error);return;}setup_seen=false;main_idle_frames=0;if(hosting && invitation)show(c,Page::InviteStatus);else if(hosting)close(c,0);else show(c,Page::Connecting);
+    error=services.start?services.start(hosting,address):"unavailable";if(!error.empty()){ssne::log_message("[native-network-menu] start failed: "+error);show(c,Page::Error);return;}setup_seen=false;main_idle_frames=0;if(hosting && invitation)show(c,Page::InviteStatus);else if(hosting)close(c,0);else{waiting_for_host_world=true;show(c,Page::Connecting);}
 }
 void join_lan(PPCContext& c,const FrontendRoom& room){
     transfer_lobby_gui=0;retry_room=room;last_host=false;last_invitation=false;endpoint.internet=false;endpoint.invitation_code.clear();endpoint.address=room.address;endpoint.port=room.port;
     native_frontend_custom_map_progress({});notify_error=false;error.clear();
     error=services.join_lan?services.join_lan(room):"unavailable";
     if(!error.empty()){ssne::log_message("[native-network-menu] LAN join failed: "+error);show(c,Page::Error);return;}
-    setup_seen=false;main_idle_frames=0;show(c,Page::Connecting);
+    setup_seen=false;main_idle_frames=0;waiting_for_host_world=true;show(c,Page::Connecting);
 }
 }
 bool native_frontend_start_profile(PPCContext& c){
@@ -800,7 +804,7 @@ bool native_frontend_startup_ready(){
 void configure_native_startup_language(int language){startup_language_override.store(language>=-1 && language<=2?language:-1,std::memory_order_relaxed);}
 unsigned native_menu_language(){const auto language=mem_read32(0x802DB838);return language<3?language:0;}
 MultiplayerOptions native_frontend_options(){return options;}
-void configure_native_frontend(NativeFrontendServices value){transfer_lobby_gui=0;services=std::move(value);
+void configure_native_frontend(NativeFrontendServices value){waiting_for_host_world=false;transfer_lobby_gui=0;services=std::move(value);
     startup_readiness.reset();
     options={};if(!services.options_path.empty()){
         std::ifstream in(services.options_path,std::ios::binary);std::string magic;MultiplayerOptions saved;
@@ -828,8 +832,20 @@ bool native_frontend_pending_actions(){
        handoff_release.load() || changing || notify_error || result_overlay || custom_level_error_pending.load() || custom_map_phase.load()!=NativeCustomMapPhase::None)return true;
     std::lock_guard lock(text_mutex);return !text_events.empty();
 }
-void native_frontend_return_main(){transfer_lobby_gui=0;return_main_requested=true;next_back={};}
-void native_frontend_disconnected(std::string){transfer_lobby_gui=0;if(custom_level_error_pending.load() || error.starts_with("custom-level:") || error=="cancelled")return;native_frontend_custom_map_progress({});error="lost";notify_error=true;}
+void native_frontend_return_main(){waiting_for_host_world=false;transfer_lobby_gui=0;return_main_requested=true;next_back={};}
+void native_frontend_finish_join(PPCContext& c){
+    if(!std::exchange(waiting_for_host_world,false))return;
+    if(page==Page::Connecting && gui)close(c,0);
+}
+void native_frontend_disconnected(const std::string& reason){
+    waiting_for_host_world=false;
+    transfer_lobby_gui=0;
+    if(custom_level_error_pending.load() || error.starts_with("custom-level:") || error=="cancelled")return;
+    native_frontend_custom_map_progress({});
+    error=reason.starts_with("No cooperative data received") || reason.starts_with("No cooperative send progress")
+        ? "lost:timeout" : "lost";
+    notify_error=true;
+}
 void native_frontend_custom_level_error(std::string message){transfer_lobby_gui=0;std::lock_guard lock(text_mutex);pending_custom_level_error=message.substr(0,256);custom_level_error_pending=true;}
 void native_frontend_custom_map_progress(NativeCustomMapProgress progress){
     std::lock_guard lock(custom_map_mutex);
@@ -969,6 +985,11 @@ void native_frontend_frame(PPCContext& c){
         unsigned checked=0;
         for(auto root=mem_read32(0x8028BFA4);root && checked++<128;root=mem_read32(root+8)){
             if(root<0x80000000u || root>ssne::guest_ram_end()-0x90)break;
+            const bool interrupted_join=notify_error && root==gui && storage.contains(root) &&
+                (page==Page::Connecting || !mem_read32(root+0x7c));
+            if(!mem_read32(root+0x14) && interrupted_join){
+                in_pause=false;return_main_requested=false;break;
+            }
             if(!mem_read32(root+0x14) && (call(c,0x800F6030,root,0x9a) || call(c,0x800F6030,root,0x3d))){
                 gui=root;in_pause=false;
                 if(native_root_id()==0x3d){if(uint16_t(input.load())&(ssne::PAD_A|ssne::PAD_B|ssne::PAD_START))break;return_main_requested=false;ssne::log_message("[native-network-menu] original main menu restored");}
@@ -1032,11 +1053,16 @@ void native_frontend_frame(PPCContext& c){
         if(gui)show(c,requested==2?Page::SessionOptions:Page::Connection);
     }
     if(page==Page::Connecting && !custom_map_busy()){
-        const auto lobby=transfer_lobby_gui.exchange(0);
-        if(active()){close(c,0);release_transfer_pause(c);if(lobby && lobby==gui && mem_read32(0x802DB7E8)==3)resume_native_lobby(c);}
-        else if(services.connecting && !services.connecting()){release_transfer_pause(c);error=services.status?services.status():"failed";show(c,Page::Error);}
+        if(active() && !waiting_for_host_world){
+            const auto lobby=transfer_lobby_gui.exchange(0);
+            close(c,0);release_transfer_pause(c);
+            if(lobby && lobby==gui && mem_read32(0x802DB7E8)==3)resume_native_lobby(c);
+        }else if(!active() && !notify_error && services.connecting && !services.connecting()){
+            waiting_for_host_world=false;
+            release_transfer_pause(c);error=services.status?services.status():"failed";show(c,Page::Error);
+        }
     }
-    if(custom_map_phase.load()==NativeCustomMapPhase::Ready && page!=Page::Connecting){
+    if(custom_map_phase.load()==NativeCustomMapPhase::Ready && (page!=Page::Connecting || waiting_for_host_world)){
         release_transfer_pause(c);auto complete=native_frontend_custom_map_progress();complete.phase=NativeCustomMapPhase::None;native_frontend_custom_map_progress(std::move(complete));
     }
     std::deque<std::pair<unsigned,std::string>> events;{std::lock_guard lock(text_mutex);events.swap(text_events);}
@@ -1165,7 +1191,7 @@ bool restore_native_frontend_state(const std::vector<uint8_t>& bytes,std::string
         std::map<uint32_t,Storage> roots;for(unsigned i=0;i<count;++i){const auto root=r.u32();Storage v{r.u32(),r.u32(),format==0x4e464533?r.u32():0};require(!v.extra || pointer(v.extra,8192));require(pointer(root,96)&&(v.heap<32||pointer(v.heap,4))&&pointer(v.memory,4096)&&roots.emplace(root,v).second);}
         require(bool(count)==bool(next.memory));const auto root=r.u32(),p=r.u32();const bool pause=r.flag(),local=r.flag(),seen=r.flag(),survival=format==0x4e464533?r.flag():false;r.done();
         require((!root||pointer(root,96))&&p<=unsigned(Page::Direct));require(p==0||roots.contains(root));
-        if(apply){for(const auto& [owner,stored]:storage){(void)stored;online_setup_native::forget(owner);}setup_restore_skin=p==unsigned(Page::OnlineSetup);native_frontend_custom_map_progress({});transfer_lobby_gui=0;transfer_pause_gui=0;transfer_pause_slot=-1;set_native_lobby_survival(survival);++mouse_epoch;result_overlay=false;retry_room.reset();reset_room_view();handoff_release=false;registry=next;storage.swap(roots);gui=root;page=Page(p);bots_return=page==Page::Bots?Page::SessionOptions:Page::Closed;options_return=active()?Page::Connection:Page::Home;in_pause=pause;local_mode=local;setup_seen=seen;visible=page!=Page::Closed;editing=Edit::None;input=0;hotkey=0;action=99;wait_release=true;invalidate_labels();std::lock_guard lock(text_mutex);text_events.clear();}
+        if(apply){for(const auto& [owner,stored]:storage){(void)stored;online_setup_native::forget(owner);}setup_restore_skin=p==unsigned(Page::OnlineSetup);native_frontend_custom_map_progress({});waiting_for_host_world=false;transfer_lobby_gui=0;transfer_pause_gui=0;transfer_pause_slot=-1;set_native_lobby_survival(survival);++mouse_epoch;result_overlay=false;retry_room.reset();reset_room_view();handoff_release=false;registry=next;storage.swap(roots);gui=root;page=Page(p);bots_return=page==Page::Bots?Page::SessionOptions:Page::Closed;options_return=active()?Page::Connection:Page::Home;in_pause=pause;local_mode=local;setup_seen=seen;visible=page!=Page::Closed;editing=Edit::None;input=0;hotkey=0;action=99;wait_release=true;invalidate_labels();std::lock_guard lock(text_mutex);text_events.clear();}
         return true;
     }catch(const std::exception& e){why=e.what();return false;}
 }

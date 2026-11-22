@@ -1,4 +1,4 @@
-SSNE-RECOOP-Native 1.2.8.3 · Multiplayer-Build 252 · Windows x64
+SSNE-RECOOP-Native 1.2.8.4-beta.1 · Multiplayer-Build 267 R15s · Windows x64
 
 Spiel installieren
 
@@ -9,17 +9,13 @@ Spiel installieren
 
 Für die Kartenbearbeitung und einen erneuten Build öffnest du SSNE-RECOOP-Native.exe. Behalte den Ordner Multiplayer mit seinen Laufzeitdateien zusammen mit dem Hauptordner.
 
-Update von Version 1.2.8.1 oder 1.2.8.2
+Beta auf einer vorhandenen Installation testen
 
-Akzeptiere das GitHub-Update im Launcher. Der Launcher startet neu und erstellt ein bereits installiertes Spiel automatisch neu.
-
-Manuelles Update
-
-Schließe Spiel und Launcher, sichere Spielstände und Einstellungen und entpacke dieses ZIP vollständig in den bisherigen Installationsordner. Öffne SSNE-RECOOP-Native.exe und wähle „Update Game“ oder „Build Game“. Dieser Build verwendet Multiplayer-Protokoll 71.
+Schließe Spiel und Launcher, sichere Spielstände und Einstellungen und entpacke dieses ZIP vollständig in den bisherigen Installationsordner. Öffne SSNE-RECOOP-Native.exe und wähle „Update Game“ oder „Build Game“. Dieser Build verwendet Multiplayer-Protokoll 71. Der Launcher sucht auf GitHub weiterhin nach stabilen Updates.
 
 Offizielle Mehrspieler-Inhalte der PS2-Fassung
 
-„Build Game“ richtet die 15 zusätzlichen Karten, ihre Vorschaubilder, sechs Skins und das Online-Symbol automatisch ein. Für die Einrichtung genügt dieselbe europäische GameCube-Disc wie für die Kampagne. Alle Teilnehmer einer gemeinsamen Runde sollten Version 1.2.8.3 verwenden.
+„Build Game“ richtet die 15 zusätzlichen Karten, ihre Vorschaubilder, sechs Skins und das Online-Symbol automatisch ein. Für die Einrichtung genügt dieselbe europäische GameCube-Disc wie für die Kampagne. Alle Teilnehmer einer gemeinsamen Runde sollten Version 1.2.8.4-beta.1 verwenden.
 
 Bekannte Probleme
 

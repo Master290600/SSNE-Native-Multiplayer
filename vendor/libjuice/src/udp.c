@@ -396,7 +396,7 @@ static int has_duplicate_addr(struct sockaddr *addr, const addr_record_t *record
 	return false;
 }
 
-#if !defined(_WIN32) && defined(NO_IFADDRS)
+#if defined(_WIN32) || defined(NO_IFADDRS)
 // Helper function to get the IPv6 address of the default interface
 static int get_local_default_inet6(uint16_t port, struct sockaddr_in6 *result) {
 	const char *dummy_host = "2001:db8::1"; // dummy public unreachable address
@@ -498,9 +498,22 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 	}
 
 	SOCKET_ADDRESS_LIST *list = (SOCKET_ADDRESS_LIST *)buf;
+	// Windows can list a permanent IPv6 address before its temporary sibling.
+	// ICE sends from a wildcard socket, so advertise the address Windows would
+	// actually use on the default route before deduplicating that prefix.
+	struct sockaddr_in6 preferred;
+	const bool have_preferred = bound.addr.ss_family == AF_INET6 &&
+	                            get_local_default_inet6(port, &preferred) == 0 &&
+	                            !addr_is_local((const struct sockaddr *)&preferred) &&
+	                            !IN6_IS_ADDR_V4MAPPED(&preferred.sin6_addr);
 	for (int i = 0; i < list->iAddressCount; ++i) {
 		struct sockaddr *sa = list->Address[i].lpSockaddr;
 		socklen_t len = list->Address[i].iSockaddrLength;
+		if (have_preferred && sa->sa_family == AF_INET6 &&
+		    memcmp(&((const struct sockaddr_in6 *)sa)->sin6_addr, &preferred.sin6_addr, 8) == 0) {
+			sa = (struct sockaddr *)&preferred;
+			len = sizeof(preferred);
+		}
 		if ((sa->sa_family == AF_INET ||
 		     (sa->sa_family == AF_INET6 && bound.addr.ss_family == AF_INET6)) &&
 		    !addr_is_local(sa)) {

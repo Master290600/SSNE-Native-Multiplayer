@@ -1,9 +1,13 @@
 #pragma once
 #include "native_world.h"
 #include "native_bone_spans.h"
+#include "native_door_clock.h"
+#include "native_arrow_clock.h"
+#include "local_shot_feedback.h"
 #include "ssne/ppc_context.h"
 #include <set>
 #include <algorithm>
+#include <array>
 #include <vector>
 namespace port::coop {
 namespace presentation_detail {
@@ -41,12 +45,14 @@ public:
     NativeReplica& operator=(NativeReplica&&)=delete;
     NativeReplicaResult apply(uint64_t epoch,const std::map<EntityId,EntityState>& authoritative);
     NativeReplicaResult apply(PPCContext&,uint64_t epoch,const std::map<EntityId,EntityState>& authoritative);
-    NativeReplicaResult apply_with_vehicles(PPCContext&,uint64_t epoch,const std::map<EntityId,EntityState>&,const Properties& mission);
+    NativeReplicaResult apply_with_vehicles(PPCContext&,uint64_t epoch,const std::map<EntityId,EntityState>&,const Properties& mission,
+                                           LocalWeaponFlashLease flash={});
     uint32_t local_address(EntityId server_id) const;
     bool play_projectile_visual(PPCContext&,uint64_t epoch,const NativeProjectileVisual&,uint64_t frame,std::string& error);
-    bool advance_projectile_visuals(PPCContext&,uint64_t frame,std::string& error);
+    bool advance_projectile_visuals(PPCContext&,float seconds,std::string& error);
     bool advance_combo_huds(PPCContext&,float seconds,std::string& error);
     bool advance_particles(PPCContext&,float seconds,std::string& error);
+    bool play_local_weapon_flash(PPCContext&,uint32_t actor,unsigned weapon,unsigned hand);
     // A render lease changes only verified camera/model/bone storage. Gameplay
     // fields and proxy visibility/lifetime are never borrowed for smoothing.
     bool begin_presentation(const std::map<EntityId,EntityState>&,std::string& error);
@@ -56,16 +62,35 @@ public:
 private:
     friend struct NativeReplicaRenderTest; // Private owned-PAL lease/rollback observability.
     bool begin_presentation_native(const std::map<EntityId,EntityState>&,const Properties*,std::string& error);
-    NativeReplicaResult apply_native(PPCContext&,uint64_t,const std::map<EntityId,EntityState>&,const Properties* vehicles);
+    NativeReplicaResult apply_native(PPCContext&,uint64_t,const std::map<EntityId,EntityState>&,const Properties* vehicles,
+                                     LocalWeaponFlashLease flash={});
     NativeReplicaResult apply_scalars(uint64_t,const std::map<EntityId,EntityState>&,bool lifecycle_projection=false);
+    struct MuzzleFlashBasis {
+        uint32_t instance=0,root=0;
+        std::array<float,12> emitted{},relative{};
+    };
+    // Addresses only identify the current native effect, never serve as a
+    // cached write target. Capture a new basis on every local emission.
+    std::array<std::array<MuzzleFlashBasis,3>,2> muzzle_flash_bases_{};
+    const MuzzleFlashBasis* capture_muzzle_flash_basis(unsigned hand,unsigned effect,
+        uint32_t instance,uint32_t root,const std::array<float,12>& gun,
+        const std::array<float,12>& flash,bool emitted=false);
     NativeWorld& local_;
     uint64_t epoch_=0;
     std::map<EntityId,EntityId> bindings_;
+    std::map<EntityId,NativeDoorClock> door_clocks_;
+    std::map<EntityId,NativeArrowClock> arrow_clocks_;
     std::vector<EntityId> particle_ids_; // Epoch/lifetime IDs, never cached guest pointers.
     std::map<EntityId,Properties> combo_presented_;
     struct ComboTimer {uint32_t actor=0;int64_t phase=0;float received=0,remaining=0;};
     std::map<EntityId,ComboTimer> combo_timers_;
-    struct ProjectileVisual {NativeProjectileVisual event;EntityId local=0;uint64_t frame=0;bool final_pose=false;};
+    struct ProjectileVisual {
+        NativeProjectileVisual event;
+        EntityId local=0;
+        uint32_t frame=0;
+        float duration=0,arc=0,elapsed=0;
+        bool final_pose=false;
+    };
     std::map<EntityId,ProjectileVisual> projectile_visuals_;
     std::set<EntityId> seen_projectiles_;
     uint64_t projectile_visual_sequence_=0;

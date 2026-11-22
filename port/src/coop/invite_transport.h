@@ -1,9 +1,14 @@
 #pragma once
 #include "invite_signalling.h"
+#include <array>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace port::coop::invite {
@@ -24,6 +29,7 @@ struct Config {
     uint32_t connect_timeout_ms=45000;
     // Empty selects the production WinHTTP factory. Tests supply a private bus.
     std::function<std::unique_ptr<Signalling>()> signalling_factory;
+    std::function<void(const std::string&)> diagnostic;
 };
 struct Status {
     Phase phase=Phase::Idle;
@@ -47,9 +53,30 @@ public:
     Status status() const;
     std::string invitation() const;
     std::string pin() const;
+    void request_stop();
     void stop();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// The guest owns the active invitation; this worker owns retired invitations.
+// The owner must call prepare() before starting an invitation, then retire()
+// promptly when it stops using that transport. Neither call waits for I/O.
+class InvitationRetirement {
+public:
+    ~InvitationRetirement();
+    bool prepare();
+    void retire(std::unique_ptr<InviteTransport> invitation);
+    void drain();
+private:
+    void run();
+    static constexpr std::size_t limit_ = 4;
+    std::array<std::unique_ptr<InviteTransport>, limit_> queue_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::thread worker_;
+    std::size_t next_ = 0, queued_ = 0, pending_ = 0;
+    bool closing_ = false;
 };
 }

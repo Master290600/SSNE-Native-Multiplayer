@@ -6,6 +6,12 @@ PPCFunc original_weapon_beam=nullptr;
 PPCFunc original_sirian_beam=nullptr,original_sirian_beam_stop=nullptr;
 PPCFunc original_sirian_charge_update=nullptr,original_sirian_charge_stop=nullptr;
 std::map<uint32_t,uint32_t> replica_beam_frames;
+struct SirianViewBinding {
+    uint32_t instance=0,gun=0;
+    NativeSirianWeaponView view;
+    std::array<uint32_t,8> proxies{};
+};
+std::array<std::array<SirianViewBinding,2>,2> replica_sirian_views{};
 bool beam_event_valid(const NativeWeaponBeam& e,std::string& error){
     if(!e.sequence || e.sequence>uint64_t(INT64_MAX) || e.slot>=8 || (e.weapon!=8 && e.weapon!=9) || e.hand>1 ||
         (e.weapon==8?e.flags!=1:(e.flags!=0 && e.flags!=1 && e.flags!=3 && e.flags!=4 && e.flags!=5))){error="Invalid native beam identity";return false;}
@@ -23,6 +29,55 @@ uint32_t beam_instance(unsigned slot,unsigned weapon=8,unsigned hand=0){
     if((weapon!=8 && weapon!=9) || hand>1)return 0;
     const auto instance=mem_read32(actor+0x4BC+weapon*24+hand*4);
     return readable(instance,weapon==8?0x294:0x340) && mem_read32(instance+0xC)==(weapon==8?0x801FC590u:0x801FB908u) && mem_read32(instance+0x1D4)==actor?instance:0;
+}
+// 5A8E8 builds two layers of the owner-view beam (23C/240) and its
+// muzzle flash (proxy at 250) and four owner-only arcs (2CC..2D8). The hit flash at 264 and
+// the alternate-view muzzle at 278 must stay in world space. Charging uses
+// the native first-person arc and card proxies.
+constexpr std::array<unsigned,8> sirian_view_offsets(bool charge){
+    return charge?std::array<unsigned,8>{0x30C,0x310,0x314,0x318,0x320,0x324,0x328,0x32C}:
+                  std::array<unsigned,8>{0x23C,0x240,0x250,0x2CC,0x2D0,0x2D4,0x2D8,0};
+}
+uint32_t sirian_proxy_matrix(uint32_t proxy){
+    if(!readable(proxy,0x38))return 0;
+    const auto table=mem_read32(proxy),matrix=mem_read32(proxy+4);
+    return readable(table,0x30) && mem_read32(table+0x2C)==0x8013E954u && readable(matrix,48)?matrix:0;
+}
+void record_sirian_view(uint32_t instance,const NativeWeaponBeam& event){
+    if(event.slot!=unsigned(netplay_local_player()))return;
+    const bool charge=event.flags&4;
+    auto& binding=replica_sirian_views[event.hand][charge];
+    binding={};
+    if(!(event.flags&1))return;
+    const auto actor=mem_read32(instance+0x1D4),gun=mem_read32(instance);
+    const auto matrix=sirian_proxy_matrix(gun);
+    if(mem_read32(actor+0x5DC)!=9 || !matrix)return;
+    for(unsigned i=0;i<12;++i){
+        const auto value=u2f(mem_read32(matrix+i*4));
+        if(!std::isfinite(value) || std::abs(value)>1000000.f)return;
+        binding.view.weapon[i]=value;
+    }
+    binding.instance=instance;
+    binding.gun=gun;
+    const auto offsets=sirian_view_offsets(charge);
+    for(unsigned i=0;i<offsets.size();++i)if(offsets[i]){
+        const auto proxy=mem_read32(instance+offsets[i]);
+        binding.proxies[i]=proxy;
+        binding.view.matrices[i]=sirian_proxy_matrix(proxy);
+    }
+}
+std::optional<NativeSirianWeaponView> sirian_weapon_view(unsigned hand,bool charge){
+    if(hand>=2)return {};
+    const auto& reference=replica_sirian_views[hand][charge];
+    const auto instance=beam_instance(unsigned(netplay_local_player()),9,hand);
+    if(!instance || instance!=reference.instance || mem_read32(instance)!=reference.gun)return {};
+    auto view=reference.view;
+    const auto offsets=sirian_view_offsets(charge);
+    for(unsigned i=0;i<offsets.size();++i)if(view.matrices[i]){
+        const auto proxy=mem_read32(instance+offsets[i]);
+        if(proxy!=reference.proxies[i] || sirian_proxy_matrix(proxy)!=view.matrices[i])view.matrices[i]=0;
+    }
+    return view;
 }
 bool bind_beam_instance(uint32_t instance,NativeWeaponBeam& event){
     if(!readable(instance,0x1D8))return false;const auto actor=mem_read32(instance+0x1D4);if(!readable(actor,0x790))return false;
@@ -117,6 +172,12 @@ bool replay_sirian_beam(PPCContext& call,uint32_t instance,const NativeWeaponBea
         // Temporarily provide the host visual inputs; do not run its timer or
         // physical projectile state machine on the replica.
         std::array<uint32_t,4> saved{};for(unsigned axis=0;axis<3;++axis){saved[axis]=mem_read32(instance+0x180+axis*4);mem_write32(instance+0x180+axis*4,f2u(event.values[axis]));}
+        // The local charge curves join animated prong markers to the muzzle.
+        // PAL must evaluate both ends against this same local weapon pose.
+        if(event.slot==unsigned(netplay_local_player())){
+            call.r[3]=instance;
+            ssne_call(call,0x800A0884u);
+        }
         saved[3]=mem_read32(instance+0x1E4);mem_write32(instance+0x1E4,f2u(event.values[3]));
         if(!mem_read32(instance+0x30C)){call.r[3]=instance;call.r[4]=1;ssne_call(call,0x8005B7CCu);}
         call.r[3]=instance;ssne_call(call,0x8005B94Cu);
@@ -132,6 +193,13 @@ bool replay_sirian_beam(PPCContext& call,uint32_t instance,const NativeWeaponBea
     if(mem_read32(instance+0x23C) && had_secondary!=bool(event.flags&2))stop_sirian_beam(call,instance);
     const std::array<unsigned,3> offsets{0x180,0x330,0x2A0};std::array<uint32_t,10> saved{};
     for(unsigned point=0;point<3;++point)for(unsigned axis=0;axis<3;++axis){saved[point*3+axis]=mem_read32(instance+offsets[point]+axis*4);mem_write32(instance+offsets[point]+axis*4,f2u(event.values[(point==0?0:point==1?6:9)+axis]));}
+    // Its short electric arcs are built from the current model's three
+    // prong markers relative to +180. Stale host coordinates here would
+    // stretch the arc control points across the screen when turning.
+    if(event.slot==unsigned(netplay_local_player())){
+        call.r[3]=instance;
+        ssne_call(call,0x800A0884u);
+    }
     saved[9]=mem_read32(instance+0x33C);mem_write32(instance+0x33C,(event.flags&2)?1:0);
     for(unsigned axis=0;axis<3;++axis)mem_write32(call.r[1]+0x100+axis*4,f2u(event.values[3+axis]));
     call.r[3]=instance;call.r[4]=call.r[1]+0x100;call.ps0[1]=call.ps1[1]=event.values[12];ssne_call(call,0x8005A8E8u);
@@ -173,7 +241,11 @@ bool update_native_beams(PPCContext& c,float seconds,std::string& error){
                 const bool ready=it->weapon==8?!mem_read32(candidate+0x24C):(it->flags&1) || !replica_beam_frames.contains(candidate) || replica_beam_frames.at(candidate)!=frame;
                 if(ready){found=it;instance=candidate;break;}blocked.insert(candidate);}
             if(found==replica_beams.end())break;event=*found;replica_beams.erase(found);}
-        if(event.weapon==9){if(!replay_sirian_beam(call,instance,event,error))return false;if(event.flags&1)replica_beam_frames[instance]=frame;else replica_beam_frames.erase(instance);}
+        if(event.weapon==9){
+            if(!replay_sirian_beam(call,instance,event,error))return false;
+            record_sirian_view(instance,event);
+            if(event.flags&1)replica_beam_frames[instance]=frame;else replica_beam_frames.erase(instance);
+        }
         else{
         if(!beam_proxies_valid(instance,false,error))return false;
         if(mem_read32(instance+0x24C)){error="Original beam did not retire before retrigger";return false;}

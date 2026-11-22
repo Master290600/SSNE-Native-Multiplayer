@@ -74,7 +74,7 @@ void frame_regressions(){
     }
     auto a=world(0,0,-.2f),b=world(.05f,1,.8f);b->revision=2;
     const auto a_entities=a->entities,b_entities=b->entities;const auto a_mission=a->mission,b_mission=b->mission;
-    ClientPresentation p;require(p.push(a,100,{0,1}),"First sample did not establish epoch");require(!p.push(b,100.05,{0,1}),"Continuous second sample reset interpolation");
+    ClientPresentation p;require(p.push(a,100,{0,1})==PresentationTransition::Discontinuity,"First sample did not establish epoch");require(p.push(b,100.05,{0,1})==PresentationTransition::Continuous,"Continuous second sample reset interpolation");
     bool had_intermediate=false;
     for(double now:{100.001,100.004,100.01,100.02,100.04,100.07}){
         const auto sampled=p.sample(now);require(sampled.size()==2,"Render sampling lost an entity");
@@ -94,10 +94,10 @@ void frame_regressions(){
     }
     require(had_intermediate,"Frame test never exercised interpolation");
     require(a->entities==a_entities && b->entities==b_entities && a->mission==a_mission && b->mission==b_mission,"Sampling modified retained authoritative snapshots");
-    auto reset=world(1,3,5);reset->epoch=2;require(p.push(reset,200,{0,1}),"Epoch change did not cut interpolation");
+    auto reset=world(1,3,5);reset->epoch=2;require(p.push(reset,200,{0,1})==PresentationTransition::Discontinuity,"Epoch change did not cut interpolation");
     require(p.sample(200.001).at(2)==presentation_fields(reset->entities.at(2)),"Old-epoch pose leaked into new level");
     auto layout=world(1.05f,3.5f,8);layout->epoch=2;layout->entities.at(2).properties["enemy_bone_count"]=int64_t(4);layout->entities.at(2).properties["enemy_bone_layout"]=int64_t(72);layout->entities.at(2).properties["enemy_bone_matrices"]=pose(4,8);
-    require(!p.push(layout,200.05,{0,1}),"Other model layout reset the owner buffer");const auto layout_frame=p.sample(200.002);
+    require(p.push(layout,200.05,{0,1})==PresentationTransition::Continuous,"Other model layout reset the owner buffer");const auto layout_frame=p.sample(200.002);
     require(bits_equal(vector(layout_frame.at(2).properties.at("enemy_bone_matrices")),vector(layout->entities.at(2).properties.at("enemy_bone_matrices"))),"Layout change blended incompatible skeletons");
     auto retired=std::make_shared<WorldState>(*layout);retired->mission["Session.Motion.Time"]=1.10f;retired->entities.erase(2);auto newcomer=layout->entities.at(2);newcomer.id=3;retired->entities.emplace(3,newcomer);
     p.push(retired,200.10,{0,1});const auto retired_frame=p.sample(200.003);
@@ -147,6 +147,70 @@ std::shared_ptr<WorldState> rich_world(float time,float phase){
     EntityState door;door.id=8;door.kind=EntityKind::Door;door.properties["position"]=std::array<float,3>{3,0,0};w->entities.emplace(8,door);
     std::vector<int64_t> tags(20);tags[0]=100;tags[1]=1;tags[6]=2;w->mission["Session.Vehicles.Tags"]=tags;
     auto values=pose(11,phase);values.resize(128);values[0]=phase;values[1]=0;values[2]=1;values[3]=3.12f+phase;values[4]=0;values[5]=0;values[6]=100+phase;values[7]=200+phase;w->mission["Session.Vehicles.Values"]=values;return w;
+}
+void look_regressions(){
+    const PlayerId owner{0,1};
+    auto initial=rich_world(0.f,0.f),delayed=rich_world(.35f,0.f);
+    ClientPresentation presentation;
+    require(presentation.push(initial,100.,owner)==PresentationTransition::Discontinuity,"Initial camera pose did not establish its identity");
+    InputLookHistory history;
+    const std::array<float,3> host_angles{.1f,.02f,.01f};
+    history.append(initial->epoch,1,250000,-100000);
+    require(presentation.push(delayed,100.35,owner)==PresentationTransition::SampleGap,"Delayed world sample was treated as a camera discontinuity");
+
+    const auto pending=history.sample(delayed->epoch,0,101.6,host_angles,-1.f,1.f);
+    require(std::abs(pending.yaw-.25)<.00001 && std::abs(pending.pitch+.1)<.00001,
+            "A long acknowledgement delay discarded a local mouse turn");
+    auto rendered=presentation.sample(101.6).at(1);
+    const auto& authoritative=delayed->entities.at(1);
+    follow_local_camera(rendered,authoritative,pending,-1.f,1.f);
+    PresentationMatrix camera;
+    require(presentation_matrix(rendered.properties,"camera_row",camera),"Delayed sample lost its camera matrix");
+    const auto predicted=native_camera_rotation({.35f,.12f,.01f});
+    require(std::abs(camera[2]-predicted[2])<.00001f && camera[3]==0.f && camera[7]==1.7f,
+            "Unconfirmed turn reset the rendered orientation or changed camera translation");
+    for(unsigned hand=0;hand<2;++hand){
+        PresentationMatrix gun;
+        const auto prefix="weapon_model"+std::to_string(hand)+"_row";
+        require(presentation_matrix(rendered.properties,prefix,gun),"Predicted camera lost a first-person weapon root");
+        const auto relative=matrix_product(matrix_rigid_inverse(camera),gun);
+        require(std::abs(relative[3]-(hand?.3f:-.3f))<.00001f &&
+                std::abs(relative[7]+.4f)<.00001f && std::abs(relative[11]-.8f)<.00001f,
+                "First-person weapon did not remain attached during delayed mouse input");
+    }
+    const auto held=history.sample(delayed->epoch,0,102.5,host_angles,-1.f,1.f);
+    require(std::abs(held.yaw-.25)<.00001,"The local camera returned to an old pose while waiting");
+    const std::array<float,3> acknowledged{.35f,.12f,.01f};
+    const auto confirmed=history.sample(delayed->epoch,1,102.51,acknowledged,-1.f,1.f);
+    require(std::abs(confirmed.yaw)<.00001 && std::abs(confirmed.pitch)<.00001,"Matching host pose replayed a local turn");
+
+    history.append(delayed->epoch,2,1800000,0);
+    history.append(delayed->epoch,3,1800000,0);
+    const auto wrapped=history.sample(delayed->epoch,1,102.52,acknowledged,-1.f,1.f);
+    require(std::abs(wrapped.yaw-std::remainder(3.6,6.283185307179586))<.00001,
+            "Local camera stopped at the old accumulated yaw limit");
+    const auto corrected=history.sample(delayed->epoch,3,102.53,acknowledged,-1.f,1.f);
+    require(std::abs(corrected.yaw)<std::abs(wrapped.yaw) && std::abs(corrected.yaw)>2.,
+            "A divergent host acknowledgement stepped the local camera instead of blending");
+
+    history.reset(delayed->epoch);
+    const std::array<float,3> at_limit{0.f,.95f,0.f};
+    history.sample(delayed->epoch,0,102.54,at_limit,-1.f,1.f,.5);
+    history.append(delayed->epoch,4,0,-600000);
+    history.append(delayed->epoch,5,0,600000);
+    const auto scoped=history.sample(delayed->epoch,0,102.55,at_limit,-1.f,1.f,.5);
+    require(std::abs(scoped.pitch-.25)<.00001,"Local mouse look lost native zoom or sequential pitch limits");
+    history.reset(delayed->epoch+1);
+    require(history.sample(delayed->epoch+1,0,102.56,host_angles,-1.f,1.f).yaw==0.,
+            "A new camera lifetime inherited a stale local turn");
+
+    auto changed_mode=rich_world(.7f,0.f);
+    changed_mode->entities.at(1).properties["camera_mode"]=int64_t(1);
+    require(presentation.push(changed_mode,100.7,owner)==PresentationTransition::Discontinuity,"Sample gap hid a camera mode transition");
+    auto teleport=rich_world(1.05f,0.f);
+    teleport->entities.at(1).properties["camera_mode"]=int64_t(1);
+    teleport->entities.at(1).properties["position"]=std::array<float,3>{100,0,0};
+    require(presentation.push(teleport,101.05,owner)==PresentationTransition::Discontinuity,"Sample gap hid a player teleport");
 }
 struct CacheComparison {
     ClientPresentation reference,cached;
@@ -213,4 +277,4 @@ void cached_frame_regressions(){
 }
 
 }
-int main(){try{vector_regressions();frame_regressions();cached_frame_regressions();std::cout<<"PASS presentation poses: exact float bits, immutable inputs, alias/fallback handling, complete frames, epoch/layout/lifetime/teleport guards and cached/reference frames; reuse="<<presentation_vector_reuse_enabled()<<'\n';return 0;}catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}}
+int main(){try{vector_regressions();frame_regressions();look_regressions();cached_frame_regressions();std::cout<<"PASS presentation poses: exact float bits, immutable inputs, alias/fallback handling, complete frames, epoch/layout/lifetime/teleport guards, delayed camera acknowledgements and cached/reference frames; reuse="<<presentation_vector_reuse_enabled()<<'\n';return 0;}catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}}

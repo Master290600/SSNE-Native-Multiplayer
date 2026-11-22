@@ -1,4 +1,6 @@
 #include "native_lifecycle.h"
+#include "local_shot_feedback.h"
+#include "native_local_special_ready.h"
 #include "native_vehicle.h"
 #include "native_bootstrap.h"
 #include <cctype>
@@ -579,6 +581,185 @@ bool apply_native_body_flash(PPCContext& context,uint32_t actor,unsigned hand,co
     // These carry the world-space muzzle and exclude the owner's own view.
     return apply_native_flash_owner(context,body+0xC0+hand*0x14,true,state,mask,error);
 }
+namespace {
+uint32_t local_feedback_weapon(uint32_t actor,unsigned weapon,unsigned hand){
+    if(weapon>=12 || hand>=2 || !readable(actor,0x790) || mem_read32(actor+0x48)!=0x802121E8u ||
+       mem_read32(actor+0x5DC)!=weapon || mem_read32(actor+0x4C8+weapon*24)<=hand ||
+       mem_read32(actor+0x328) || mem_read32(actor+0x340)!=1 ||
+       mem_read32(actor+0x370) || !(u2f(mem_read32(actor+0xCC))>0.f) ||
+       !ssne::native_party_actor_occupied(actor) || ssne::native_party_spawn_waiting(actor))return 0;
+    const auto instance=mem_read32(actor+0x4BC+weapon*24+hand*4);
+    if(!readable(instance,0x228) || mem_read32(instance+0x1D4)!=actor ||
+       mem_read32(instance+0x1B0)!=mem_read32(actor+0x5E8))return 0;
+    const auto table=mem_read32(instance+0xC);
+    constexpr std::array<uint32_t,12> tables{
+        0,0x801FB280u,0x801FC858u,0x801FC2D0u,0x801FB598u,0x801FAFF0u,0x801FBB38u,0,0,0,0,0};
+    if(!readable(table,0x160) || (tables[weapon] && table!=tables[weapon]))return 0;
+    const auto proxy=mem_read32(instance);
+    if(!readable(proxy,0x38) || !readable(mem_read32(proxy+4),48) || mem_read8(proxy+0x2D)>1)return 0;
+    return instance;
+}
+uint32_t local_feedback_mode(uint32_t instance,unsigned mode){
+    const auto count=mem_read32(instance+0x1BC),modes=mem_read32(instance+0x1D0);
+    if(!count || count>18 || mode>=count || !readable(modes,60*count))return 0;
+    return modes+60*mode;
+}
+unsigned local_feedback_ammunition(uint32_t instance,uint32_t cfg){
+    const auto ammo_kind=int32_t(mem_read32(cfg+0x38));
+    const auto minimum=int16_t(mem_read16(cfg+0x20));
+    const auto inventory=mem_read32(instance+0x1B0);
+    if(ammo_kind<0 || ammo_kind>=18 || minimum<=0 || !readable(inventory,36))return 0;
+    const auto available=int16_t(mem_read16(inventory+2*unsigned(ammo_kind)));
+    return available>0?unsigned(available/minimum):0;
+}
+bool local_weapon_muzzle_position(PPCContext& call,uint32_t instance,uint32_t actor,unsigned weapon,unsigned hand){
+    if(!ssne_find_func(0x800A0884u) || mem_read32(0x800A0884u)!=0x9421FFA0u)return false;
+    const auto bone=int32_t(mem_read32(instance+0x20C));
+    const auto vtable=mem_read32(instance+0xC);
+    if(bone>=0){
+        const auto binding=native_weapon_pose_binding(actor,weapon,hand);
+        if(!binding || !binding->model || unsigned(bone)>=binding->count ||
+           !ssne_find_func(mem_read32(vtable+0x74)))return false;
+    }else{
+        // A negative index tells the original locator to use its class offset.
+        const auto proxy_vtable=mem_read32(mem_read32(instance));
+        if(!readable(proxy_vtable,0x30) || !ssne_find_func(mem_read32(proxy_vtable+0x2C)) ||
+           !ssne_find_func(mem_read32(vtable+0x15C)))return false;
+    }
+    call.r[3]=instance;
+    ssne_call(call,0x800A0884u);
+    for(unsigned axis=0;axis<3;++axis){
+        const auto value=u2f(mem_read32(instance+0x180+axis*4));
+        if(!std::isfinite(value) || std::abs(value)>1000000.f)return false;
+    }
+    return true;
+}
+}
+
+LocalWeaponStatus capture_native_local_weapon(PPCContext& context,uint32_t actor,unsigned* pistol_rearm){
+    if(pistol_rearm)*pistol_rearm=0;
+    if(!readable(actor,0x790))return {};
+    const auto weapon=mem_read32(actor+0x5DC);
+    if(weapon>=12)return {};
+    LocalWeaponStatus status{weapon,0,0,0};
+    for(unsigned hand=0;hand<2;++hand){
+        const auto instance=local_feedback_weapon(actor,weapon,hand);
+        if(!instance)continue;
+        const unsigned bit=1u<<hand;
+        status.available|=bit;
+        if(weapon==0 || weapon==7 || weapon==9 || weapon==10 || weapon==11){
+            if(local_special_weapon_ready(actor,instance,weapon,&context))status.ready|=bit;
+            if(local_special_weapon_sustained(actor,instance,weapon,&context))status.firing|=bit;
+            if(weapon==10 && mem_read32(instance+0x10)==12 && mem_read32(instance+0x24) &&
+               !mem_read32(instance+0x20))status.firing|=bit;
+            continue;
+        }
+        const auto clip=mem_read32(instance+0x10);
+        const bool animating=mem_read32(instance+0x24) && !mem_read32(instance+0x20);
+        const auto phase=mem_read32(instance+0x1B4);
+        const bool continuous=weapon==2 || weapon==4;
+        const bool fire_pose=weapon==1?clip==2 || clip==4:clip==(weapon==5?13u:12u);
+        if(!continuous && animating && fire_pose)status.firing|=bit;
+        const bool waits_for_pose=!(fire_pose && (weapon==1 || weapon==6));
+        const bool pistol_held=pistol_rearm && weapon==1 && phase==3;
+        if(!mem_read16(instance+0xA) || (phase!=0 && !pistol_held && !(continuous && (phase==2 || phase==3))) ||
+           (!continuous && animating && waits_for_pose))continue;
+        const auto mode=mem_read32(instance+0x1E0);
+        const auto cfg=local_feedback_mode(instance,mode);
+        if(!cfg)continue;
+        const float divisor=u2f(mem_read32(cfg+0x1C)),rate=u2f(mem_read32(instance+0x1E8));
+        const float charge=u2f(mem_read32(cfg+0x24));
+        if(!std::isfinite(divisor) || divisor<=0.f || !std::isfinite(rate) ||
+           !std::isfinite(charge) || (weapon!=4 && charge>0.f))continue;
+        if(weapon==5 && (!readable(instance,0x230) || mode>2 || mem_read32(instance+0x22C) ||
+                         !(u2f(mem_read32(instance+0x228))<=1.f/60.f)))continue;
+        if(weapon==1){
+            if(mode!=0 || !readable(instance,0x24C) || mem_read32(instance+0x220) ||
+               mem_read32(instance+0x228)>=11 ||
+               !(u2f(mem_read32(instance+0x1F8))<=u2f(mem_read32(instance+0x1B8))))continue;
+            // On a new trigger PAL writes 2.0 to +1E8 and zero to +1FC
+            // before updating both pistols (800C56E4/800C56FC). The +220
+            // hand lock, magazine and reload animation still apply.
+            if(pistol_rearm && 2.f>=1.f/divisor)*pistol_rearm|=bit;
+            if(pistol_held || !(u2f(mem_read32(instance+0x1FC))<=0.f))continue;
+        }else if(!local_feedback_ammunition(instance,cfg))continue;
+        if(continuous && phase!=0)status.firing|=bit;
+        else if(weapon==5?rate>1.f/divisor:rate>=1.f/divisor)status.ready|=bit;
+    }
+    // The right-hand pistol's successful shot inserts the left-hand delay
+    // before the native player controller updates that second weapon.
+    if(weapon==1 && (status.ready&1))status.ready=1;
+    return status;
+}
+
+std::optional<NativeLocalWeaponCapacity> capture_native_local_weapon_capacity(
+    uint32_t actor,unsigned weapon,unsigned hand){
+    if(weapon!=1 && weapon!=3 && weapon!=6)return {};
+    const auto instance=local_feedback_weapon(actor,weapon,hand);
+    if(!instance || !mem_read16(instance+0xA))return {};
+    const auto mode=mem_read32(instance+0x1E0);
+    if(mode>(weapon==6?2u:0u))return {};
+    const auto cfg=local_feedback_mode(instance,mode);
+    if(!cfg)return {};
+    const float divisor=u2f(mem_read32(cfg+0x1C));
+    const float charge=u2f(mem_read32(cfg+0x24));
+    if(!(divisor>=0.2f && divisor<=25.f) || charge!=0.f)return {};
+
+    unsigned rounds=0;
+    if(weapon==1){
+        // The original Desert Hawk checks its own magazine before each shot.
+        if(!readable(instance,0x22C))return {};
+        const auto spent=mem_read32(instance+0x228);
+        if(spent>12)return {};
+        rounds=12-spent;
+    }else{
+        rounds=local_feedback_ammunition(instance,cfg);
+    }
+    return NativeLocalWeaponCapacity{std::min(rounds,255u),1.f/divisor,rounds==1};
+}
+
+bool play_native_local_weapon_flash(PPCContext& context,uint32_t actor,unsigned weapon,unsigned hand){
+    const auto offset=native_weapon_flash_offset(weapon);
+    const auto instance=offset?local_feedback_weapon(actor,weapon,hand):0;
+    if(!instance || !context_ok(context) || !native_weapon_flash_timed(weapon) ||
+       !readable(instance,offset+16) || mem_read8(mem_read32(instance)+0x2D)!=0)return false;
+    const auto method=weapon==1?0x8005672Cu:weapon==2?0x80061A48u:weapon==4?0x800584F4u:weapon==8?0x80060684u:0u;
+    if(weapon!=3 && (!method || !ssne_find_func(method) || mem_read32(method)!=0x9421FF58u))return false;
+    struct MuzzleRestore {
+        uint32_t position;
+        std::array<uint32_t,3> original;
+        ~MuzzleRestore(){for(unsigned i=0;i<3;++i)mem_write32(position+i*4,original[i]);}
+    } restore{instance+0x180,{mem_read32(instance+0x180),mem_read32(instance+0x184),mem_read32(instance+0x188)}};
+    StackScratch scratch(context);
+    auto call=context;
+    call.msr&=~0x8000u;
+    call.r[1]-=0x100;
+    mem_write32(call.r[1],context.r[1]);
+    if(!local_weapon_muzzle_position(call,instance,actor,weapon,hand))return false;
+    call=context;call.msr&=~0x8000u;call.r[1]-=0x100;
+    const auto owner=instance+offset;
+    if(weapon==3){
+        // Use the original timed radial flash. The two decorative barrel
+        // particles instead need the native shotgun simulation to retire them.
+        for(auto fn:{0x8009B06Cu,0x8009A8CCu,0x8009A7ACu,0x8009AC48u})if(!ssne_find_func(fn))return false;
+        const auto mask=mem_read32(mem_read32(instance)+0x30);
+        const float life=u2f(mem_read32(0x8027729Cu));
+        if(!mask || !std::isfinite(life) || life<=0.f || life>.25f)return false;
+        call.r[3]=0;ssne_call(call,0x8009B06Cu);
+        if(!call.r[3])return false;
+        call.r[4]=call.r[3];call.r[3]=owner;call.r[5]=5;
+        call.ps0[1]=call.ps1[1]=u2f(mem_read32(0x801FC2B8u));
+        ssne_call(call,0x8009A8CCu);
+        if(!mem_read32(owner+12))return false;
+        call.r[3]=owner;call.r[4]=instance+0x180;ssne_call(call,0x8009A7ACu);
+        call.r[3]=owner;call.r[4]=mask;ssne_call(call,0x8009AC48u);
+        mem_write32(owner+8,f2u(life));
+    }else{
+        call.r[3]=instance;
+        ssne_call(call,method);
+    }
+    return mem_read32(owner+12)!=0;
+}
 bool update_native_muzzle_flashes(PPCContext& context,float seconds,std::string& error){
     if(!context_ok(context) || !ssne_find_func(0x8009ACF8u) || !std::isfinite(seconds) || seconds<0 || seconds>.1f){error="Native muzzle flash clock unavailable";return false;}
     StackScratch scratch(context);
@@ -710,6 +891,7 @@ bool apply_native_interaction_hint(PPCContext& context,uint32_t actor,const Enti
 }
 #include "native_player_notices.inc"
 #include "native_hud_combo.inc"
+#include "native_sniper_scope.inc"
 #include "native_reentry_hud.inc"
 #include "native_weapon_bar.inc"
 #include "native_weapon_sidebar.inc"
@@ -1051,6 +1233,7 @@ bool validate_native_rocket_creation(const EntityState& e,std::string& error) {
     if(mem_read32(0x80000000)!=0x47334250u || !readable(mem_read32(0x802ABAAC),4))return fail("Native rocket manager unavailable");
     for(auto address:{0x8009DD48u,0x8009EB94u,0x801505F8u,0x80075EA4u})if(!ssne_find_func(address))return fail("Native rocket lifecycle unavailable");
     if(mem_read32(0x802022E0u+0x4C)!=0x80075EA4u)return fail("Native rocket class signature differs");
+    if(mem_read32(0x802022E0u+0x15C)!=0x8009ECDCu || !ssne_find_func(0x8009ECDCu) || mem_read32(0x8009ECDCu)!=0x9421FF20u)return fail("Native rocket body render callback unavailable");
     return true;
 }
 uint32_t create_native_rocket(PPCContext& context,const EntityState& e,uint32_t source,std::string& error) {
@@ -1068,6 +1251,14 @@ uint32_t create_native_rocket(PPCContext& context,const EntityState& e,uint32_t 
     for(unsigned i=0;i<3;++i){mem_write32(object+0x20+i*4,f2u(position[i]));mem_write32(object+0x104+i*4,f2u(velocity[i]));}
     call.r[3]=object;call.r[4]=source;ssne_call(call,0x8009EB94);
     call.r[3]=mem_read32(0x802ABAAC);call.r[4]=object;ssne_call(call,0x801505F8);
+    // The weapon sets PAL pitch/yaw after registration (8005D000).
+    // A standard rocket flies straight and its existing wire state carries
+    // that firing direction in velocity.
+    const float horizontal=std::hypot(velocity[0],velocity[2]);
+    if(horizontal>0.f || velocity[1]!=0.f){
+        mem_write32(object+0x2C,f2u(-std::atan2(velocity[1],horizontal)));
+        mem_write32(object+0x30,f2u(std::atan2(velocity[0],velocity[2])));
+    }
     return object;
 }
 bool present_native_rocket(PPCContext& context,uint32_t object,std::string& error) {
@@ -1075,6 +1266,9 @@ bool present_native_rocket(PPCContext& context,uint32_t object,std::string& erro
     // Only the visual setters from 80076328. Never call its collision/damage
     // update, nor 8009E798 (which also performs collision and removal).
     StackScratch scratch(context);PPCContext call=context;call.msr&=~0x8000u;call.r[1]-=0x100;mem_write32(call.r[1],context.r[1]);
+    // The PAL body lives at +CC. The separate +160 proxy draws its glow.
+    call.r[3]=object;
+    ssne_call(call,0x8009ECDCu);
     auto invoke=[&](uint32_t target,uint32_t address){call.r[3]=target;call.r[4]=object+0x20;ssne_call(call,address);};
     const auto model=mem_read32(object+0x160);
     if(model){const auto vt=readable(model,4)?mem_read32(model):0;if(!readable(vt,0x30) || !ssne_find_func(mem_read32(vt+0x2C))){error="Native rocket model transform unavailable";return false;}call.r[3]=model+uint32_t(int32_t(int16_t(mem_read16(vt+0x28))));ssne_call(call,mem_read32(vt+0x2C));const auto matrix=call.r[3];if(!readable(matrix,48)){error="Invalid native rocket model matrix";return false;}for(unsigned i=0;i<3;++i)mem_write32(matrix+12+i*16,mem_read32(object+0x20+i*4));}
@@ -1152,6 +1346,10 @@ bool validate_native_projectile_creation(const EntityState& e,std::string& error
         }else if(key=="projectile_energy_visual"){
             const auto* values=std::get_if<std::vector<float>>(&value);if(e.definition!=6 || !values || values->size()!=native_energy_visual_offsets.size())return fail("Invalid energy projectile presentation layout");
             for(unsigned i=0;i<values->size();++i)if(!std::isfinite((*values)[i]) || std::abs((*values)[i])>10000.f || (i>=6 && (*values)[i]<0)){error="Invalid energy projectile presentation coefficient index="+std::to_string(i)+" value="+std::to_string((*values)[i]);return false;}
+            const auto phase=e.properties.find("projectile_energy_phase");
+            const auto* state=phase==e.properties.end()?nullptr:std::get_if<int64_t>(&phase->second);
+            const auto view=(*values)[native_energy_charge_view_index];
+            if(state && *state==0 && (view>native_energy_charge_owner_view+1 || view!=std::floor(view)))return fail("Invalid Sirian charge view");
         }else return fail("Projectile property has no verified native schema");
     }
     for(const auto* key:{"position","spawn_position","velocity","projectile_rotation","projectile_scale","projectile_source"})if(!e.properties.contains(key))return fail("Incomplete native grenade state");
@@ -1163,6 +1361,10 @@ bool validate_native_projectile_creation(const EntityState& e,std::string& error
     if(!native_projectile_extra_offsets(e.definition).empty() && !e.properties.contains("projectile_extra_visual"))return fail("Monster projectile visual state missing");
     if(mem_read32(0x80000000)!=0x47334250u || !readable(mem_read32(0x802ABAAC),4) || mem_read32(type->vtable+0x4C)!=type->initialize)return fail("Native projectile class/manager signature differs");
     for(auto address:{0x8009DD48u,0x8009EB94u,0x801505F8u,type->initialize,0x8009B160u,0x800EEF8Cu})if(!ssne_find_func(address))return fail("Native projectile lifecycle unavailable");
+    if(e.definition<=4 && (mem_read32(type->vtable+0x15C)!=0x8009ECDCu || !ssne_find_func(0x8009ECDCu) || mem_read32(0x8009ECDCu)!=0x9421FF20u))
+        return fail("Native projectile body render callback unavailable");
+    if(e.definition==5 && (mem_read32(type->vtable+0x15C)!=0x80075C94u || !ssne_find_func(0x80075C94u)))
+        return fail("Native secondary grenade render callback unavailable");
     if(e.definition==12 && (mem_read32(type->vtable+0x15C)!=0x80065E74 || !ssne_find_func(0x80065E74)))return fail("Native power projectile render callback unavailable");
     if(e.definition==6 && (mem_read32(type->vtable+0x15C)!=0x8007277C || !ssne_find_func(0x8007277C) || !ssne_find_func(0x8007223C) || !ssne_find_func(0x80071CD0)))return fail("Native energy projectile render lifecycle unavailable");
     if(e.definition==17 && (mem_read32(type->vtable+0x15C)!=0x800732E4 || mem_read32(type->vtable+0x54)!=0x8007301C || !ssne_find_func(0x800732E4) || !ssne_find_func(0x8007301C)))return fail("Native spinning projectile render lifecycle unavailable");
@@ -1194,7 +1396,11 @@ uint32_t create_native_projectile(PPCContext& context,const EntityState& e,uint3
         // Original initialization resets the charge scale. Restore the host's
         // visual pose after resources have been allocated by the native class.
         for(const auto& [key,offset]:{std::pair{"position",0x20u},std::pair{"projectile_rotation",0x2Cu},std::pair{"projectile_scale",0x68u}}){const auto& v=std::get<std::array<float,3>>(e.properties.at(key));for(unsigned i=0;i<3;++i)mem_write32(object+offset+i*4,f2u(v[i]));}
-        const auto& visual=std::get<std::vector<float>>(e.properties.at("projectile_energy_visual"));for(unsigned i=0;i<visual.size();++i)mem_write32(object+native_energy_visual_offsets[i],f2u(visual[i]));mem_write32(object+0x148,uint32_t(std::get<int64_t>(e.properties.at("projectile_energy_phase"))));
+        const auto& visual=std::get<std::vector<float>>(e.properties.at("projectile_energy_visual"));
+        const auto phase=uint32_t(std::get<int64_t>(e.properties.at("projectile_energy_phase")));
+        for(unsigned i=0;i<visual.size();++i)
+            mem_write32(object+native_energy_visual_offsets[i],f2u(phase==0 && i==native_energy_charge_view_index?0.f:visual[i]));
+        mem_write32(object+0x148,phase);
     }
     if(e.properties.contains("projectile_extra_visual")){
         const auto offsets=native_projectile_extra_offsets(e.definition);const auto& v=std::get<std::vector<float>>(e.properties.at("projectile_extra_visual"));
@@ -1275,6 +1481,8 @@ bool present_native_projectile(PPCContext& context,uint32_t object,std::string& 
         if(!context_ok(context) || !readable(object,mem_read32(object+0x48)==0x80201650?0x164:0x168)){error="Invalid native special rocket presentation";return false;}
         StackScratch scratch(context);PPCContext call=context;call.msr&=~0x8000u;call.r[1]-=0x100;mem_write32(call.r[1],context.r[1]);
         for(unsigned i=0;i<6;++i)mem_write32(call.r[1]+0x40+i*4,mem_read32(object+0x20+i*4));mem_write32(call.r[1]+0x58,0);call.r[3]=object;call.r[4]=call.r[1]+0x40;ssne_call(call,0x8009B160);
+        call.r[3]=object;
+        ssne_call(call,0x8009ECDCu);
         if(const auto trail=mem_read32(object+(mem_read32(object+0x48)==0x80201650?0x124:0x12C))){call.r[3]=trail;call.r[4]=object+0x20;ssne_call(call,0x800EEF8C);}
         if(mem_read32(object+0x48)==0x80201650)if(const auto particles=mem_read32(object+0x128)){call.r[3]=particles;call.r[4]=object+0x20;ssne_call(call,0x800EF784);}
         if(const auto model=mem_read32(object+0x160)){const auto vt=readable(model,4)?mem_read32(model):0;if(!readable(vt,0x30) || !ssne_find_func(mem_read32(vt+0x2C))){error="Native special rocket model unavailable";return false;}call.r[3]=model+uint32_t(int32_t(int16_t(mem_read16(vt+0x28))));ssne_call(call,mem_read32(vt+0x2C));if(!readable(call.r[3],48)){error="Invalid special rocket model matrix";return false;}for(unsigned i=0;i<3;++i)mem_write32(call.r[3]+12+i*16,mem_read32(object+0x20+i*4));}
@@ -1290,10 +1498,26 @@ bool present_native_projectile(PPCContext& context,uint32_t object,std::string& 
     call.r[3]=object;call.r[4]=call.r[1]+0x40;ssne_call(call,0x8009B160);
     if(type->trail)if(const auto trail=mem_read32(object+type->trail)){call.r[3]=trail;call.r[4]=object+0x20;ssne_call(call,0x800EEF8C);}
     if(type->definition==10)if(const auto particles=mem_read32(object+0x15C)){call.r[3]=particles;call.r[4]=object+0x20;ssne_call(call,0x800EF830);}
-    if(type->definition==8 || type->definition==10 || type->definition==13 || type->definition==14 || type->definition==15 || type->definition==16 || type->definition>=18){
+    if(type->definition==3 || type->definition==4 || type->definition==5 || type->definition==8 || type->definition==10 || type->definition==13 || type->definition==14 || type->definition==15 || type->definition==16 || type->definition>=18){
         // Original virtual +15C contains only model matrix construction for
         // these classes. Their AI, movement and collision ticks stay disabled.
         call.r[3]=object;ssne_call(call,mem_read32(type->vtable+0x15C));
+    }
+    if (type->definition == 8) {
+        const auto anchor = mem_read32(object + 0x12C);
+        const auto emitter = mem_read32(object + 0x130);
+        if (readable(anchor, 0x20) && mem_read32(anchor) == 0x8021E7F8u &&
+            readable(emitter, 4) && mem_read32(emitter) == 0x8021DFA8u &&
+            mem_read32(anchor + 0x1C) == emitter) {
+            const auto matrix = mem_read32(anchor + 4);
+            if (readable(matrix, 48)) {
+                // The original renderer accumulates the last simulation tick's
+                // motion in the Legionnaire's particle anchor. Replica snapshots
+                // can skip or repeat that tick. Rebase before render interpolation.
+                for (unsigned axis = 0; axis < 3; ++axis)
+                    mem_write32(matrix + 12 + axis * 16, mem_read32(object + 0x20 + axis * 4));
+            }
+        }
     }
     return true;
 }

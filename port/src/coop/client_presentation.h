@@ -7,37 +7,81 @@
 #include <deque>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 
 namespace port::coop {
 // Presentation only. None of these values are sent back as gameplay state.
 struct PredictedLook { double yaw=0,pitch=0; };
 class InputLookHistory {
-    struct Entry {uint64_t sequence;int32_t yaw,pitch;double at;};
-    std::deque<Entry> entries_;
-    uint64_t epoch_=0;
-public:
-    void reset(uint64_t epoch){entries_.clear();epoch_=epoch;}
-    void append(uint64_t epoch,uint64_t sequence,int32_t yaw,int32_t pitch,double at){
-        if(epoch!=epoch_)reset(epoch);
-        if(yaw || pitch)entries_.push_back({sequence,yaw,pitch,at});
-        while(entries_.size()>2048)entries_.pop_front();
+    static constexpr double turn=6.283185307179586;
+    struct Entry {uint64_t sequence;int32_t yaw,pitch;};
+    // Inputs arriving before the first usable camera pose are rebased at its acknowledgement.
+    std::deque<Entry> initial_inputs_;
+    uint64_t epoch_=0,last_local_input_=0;
+    double yaw_=0,pitch_=0,pitch_low_=0,pitch_high_=0,scale_=1,last_sample_=0;
+    bool initialized_=false,moved_=false;
+
+    void move(const Entry& input){
+        yaw_=std::remainder(yaw_+input.yaw*scale_/1000000.,turn);
+        pitch_=std::clamp(pitch_-input.pitch*scale_/1000000.,pitch_low_,pitch_high_);
+        last_local_input_=input.sequence;
+        moved_=true;
     }
-    PredictedLook pending(uint64_t epoch,uint64_t ack,double now,uint64_t confirmed_ack=0){
+public:
+    void reset(uint64_t epoch){
+        initial_inputs_.clear();
+        epoch_=epoch;
+        last_local_input_=0;
+        initialized_=moved_=false;
+    }
+    void append(uint64_t epoch,uint64_t sequence,int32_t yaw,int32_t pitch){
+        if(epoch!=epoch_)reset(epoch);
+        if(!yaw && !pitch)return;
+        if(initialized_)move({sequence,yaw,pitch});
+        else {
+            if(initial_inputs_.size()==2048)initial_inputs_.pop_front();
+            initial_inputs_.push_back({sequence,yaw,pitch});
+        }
+    }
+    PredictedLook sample(uint64_t epoch,uint64_t ack,double now,const std::array<float,3>& host_angles,
+                         float pitch_low,float pitch_high,double scale=1.){
         if(epoch!=epoch_)return {};
-        // GPU frames can still display the prior pose while the guest prepares
-        // a newer acknowledged pose. Keep that short history for BOTH readers.
-        // Confirmation retires prediction for the new pose, but an older GPU
-        // camera still needs that delta. Its input can already be older than
-        // 250 ms when that camera is produced. Keep confirmed history for the
-        // bounded display pipeline; unconfirmed/stalled input still expires.
-        while(!entries_.empty()){
-            const auto& e=entries_.front();const auto age=now-e.at;
-            if(age>1. || (age>.25 && e.sequence>confirmed_ack))entries_.pop_front();else break;
+        pitch_low_=pitch_low;
+        pitch_high_=pitch_high;
+        scale_=scale;
+        const double target_yaw=host_angles[0],target_pitch=std::clamp(double(host_angles[1]),pitch_low_,pitch_high_);
+        if(!initialized_){
+            yaw_=target_yaw;
+            pitch_=target_pitch;
+            last_sample_=now;
+            initialized_=true;
+            for(const auto& input:initial_inputs_)if(input.sequence>ack)move(input);
+            initial_inputs_.clear();
         }
-        PredictedLook out;for(const auto& e:entries_)if(e.sequence>ack && (now-e.at<=.25 || e.sequence<=confirmed_ack)){
-            out.yaw+=e.yaw/1000000.;out.pitch+=e.pitch/1000000.;
+        const auto elapsed=std::clamp(now-last_sample_,0.,.05);
+        last_sample_=now;
+        pitch_=std::clamp(pitch_,pitch_low_,pitch_high_);
+        if(!last_local_input_){
+            yaw_=target_yaw;
+            pitch_=target_pitch;
+        }else if(!moved_ && ack>=last_local_input_){
+            // Acknowledged input may have been clamped or merged by the host.
+            // Correct the remaining visual difference without stepping the camera.
+            const auto yaw_error=std::remainder(target_yaw-yaw_,turn);
+            const auto pitch_error=target_pitch-pitch_;
+            if(std::abs(yaw_error)<.00001 && std::abs(pitch_error)<.00001){
+                yaw_=target_yaw;
+                pitch_=target_pitch;
+                last_local_input_=0;
+            }else {
+                const auto blend=-std::expm1(-elapsed/.14);
+                yaw_=std::remainder(yaw_+yaw_error*blend,turn);
+                pitch_+=pitch_error*blend;
+            }
         }
-        out.yaw=std::clamp(out.yaw,-2.,2.);out.pitch=std::clamp(out.pitch,-2.,2.);return out;
+        moved_=false;
+        if(!last_local_input_)return {};
+        return {std::remainder(yaw_-target_yaw,turn),double(host_angles[1])-pitch_};
     }
 };
 using PresentationMatrix=std::array<float,12>;
@@ -71,15 +115,31 @@ inline PresentationMatrix presentation_look_rotation(const std::array<float,3>& 
         matrix_rigid_inverse(native_camera_rotation(frame_angles))),camera);
 }
 inline bool presentation_driving(const EntityState& e){auto it=e.properties.find("movement_mode");const auto* mode=it==e.properties.end()?nullptr:std::get_if<int64_t>(&it->second);return e.kind==EntityKind::Player && mode && *mode==3;}
-inline bool presentation_continuous(const EntityState& a,const EntityState& b,double seconds){
-    if(a.id!=b.id || a.kind!=b.kind || a.definition!=b.definition || a.resource!=b.resource || a.owner!=b.owner || seconds<=0 || seconds>.25)return false;
+enum class PresentationTransition { Continuous, SampleGap, Discontinuity };
+inline PresentationTransition presentation_transition(const EntityState& a,const EntityState& b,double seconds){
+    if(a.id!=b.id || a.kind!=b.kind || a.definition!=b.definition || a.resource!=b.resource || a.owner!=b.owner || seconds<=0)
+        return PresentationTransition::Discontinuity;
+    auto water_view=[](const EntityState& player,int64_t movement,int64_t camera){
+        const auto m=player.properties.find("movement_mode"),c=player.properties.find("camera_mode");
+        return player.kind==EntityKind::Player && m!=player.properties.end() && c!=player.properties.end() &&
+               std::get_if<int64_t>(&m->second) && std::get<int64_t>(m->second)==movement &&
+               std::get_if<int64_t>(&c->second) && std::get<int64_t>(c->second)==camera;
+    };
+    bool shore=false;
     for(const char* key:{"camera_mode","camera_frozen","movement_mode","corpse_mode","corpse_active"}){
-        auto x=a.properties.find(key),y=b.properties.find(key);if((x==a.properties.end())!=(y==b.properties.end()) || (x!=a.properties.end() && x->second!=y->second))return false;
+        const auto x=a.properties.find(key),y=b.properties.find(key);
+        if((x==a.properties.end())!=(y==b.properties.end()))return PresentationTransition::Discontinuity;
+        if(x==a.properties.end() || x->second==y->second)continue;
+        if(std::string_view(key)=="camera_mode" || std::string_view(key)=="movement_mode"){
+            shore=shore || (water_view(a,1,0) && water_view(b,2,1)) || (water_view(a,2,1) && water_view(b,1,0));
+            if(shore)continue;
+        }
+        return PresentationTransition::Discontinuity;
     }
     auto health=[](const EntityState& e){auto it=e.properties.find("health");return it==e.properties.end()?1.f:std::get<float>(it->second);};
-    if((health(a)>0)!=(health(b)>0))return false;
-    const auto x=a.properties.find("position"),y=b.properties.find("position");if(x==a.properties.end() || y==b.properties.end())return false;
-    const auto* p=std::get_if<std::array<float,3>>(&x->second);const auto* q=std::get_if<std::array<float,3>>(&y->second);if(!p || !q)return false;
+    if((health(a)>0)!=(health(b)>0))return PresentationTransition::Discontinuity;
+    const auto x=a.properties.find("position"),y=b.properties.find("position");if(x==a.properties.end() || y==b.properties.end())return PresentationTransition::Discontinuity;
+    const auto* p=std::get_if<std::array<float,3>>(&x->second);const auto* q=std::get_if<std::array<float,3>>(&y->second);if(!p || !q)return PresentationTransition::Discontinuity;
     double limit=std::max(.75,40.*seconds);
     if(b.kind==EntityKind::Projectile || presentation_driving(b))limit=std::max(3.,160.*seconds);
     else if(b.kind==EntityKind::Enemy && b.definition==5){
@@ -87,10 +147,18 @@ inline bool presentation_continuous(const EntityState& a,const EntityState& b,do
         // can straddle one extra native movement tick (50 Hz PAL or 60 Hz).
         limit=40.*(seconds+1./50.);
     }
-    double d=0;for(unsigned i=0;i<3;++i)d+=double((*p)[i]-(*q)[i])*((*p)[i]-(*q)[i]);return std::isfinite(d) && d<limit*limit;
+    double d=0;for(unsigned i=0;i<3;++i)d+=double((*p)[i]-(*q)[i])*((*p)[i]-(*q)[i]);
+    if(!std::isfinite(d) || d>=limit*limit)return PresentationTransition::Discontinuity;
+    // Switch the original camera pose immediately at the shoreline, keeping
+    // local input history across a continuous, living player's movement.
+    return seconds>.25 || shore ? PresentationTransition::SampleGap : PresentationTransition::Continuous;
+}
+inline bool presentation_continuous(const EntityState& a,const EntityState& b,double seconds){
+    return presentation_transition(a,b,seconds)==PresentationTransition::Continuous;
 }
 inline bool presentation_field(const std::string& key){
     if(key.starts_with("rotor_row") || key=="pickup_glow_pose")return true;
+    if(key=="camera_mode" || key=="projectile_source" || key=="projectile_energy_phase" || key=="projectile_energy_visual")return true;
     return key=="position" || key=="enemy_rotation" || key=="enemy_scale" || key.starts_with("camera_row") || key=="render_visible" || key.starts_with("render_row") || key.starts_with("body_render") ||
         ((key.starts_with("body") || key.starts_with("enemy_")) && key.find("_bone_")!=std::string::npos) ||
         (key.starts_with("weapon_model") && (key.find("_row")!=std::string::npos || key.find("_bone_")!=std::string::npos || key=="weapon_model_slot" || key=="weapon_model_visibility"));
@@ -195,7 +263,7 @@ class ClientPresentation {
                 if(!presentation_field(key))continue;
                 CachedField field{&key,&value};
                 if(plan.continuous){
-                    bool eligible=true;
+                    bool eligible=key!="projectile_energy_visual";
                     if(current.owner==owner_ && !presentation_driving(current) && key.starts_with("camera_row"))eligible=false;
                     if(current.owner==owner_ && key.starts_with("weapon_model") && key.find("_row")!=std::string::npos)eligible=false;
                     if(eligible && key.starts_with("weapon_model")){
@@ -224,20 +292,21 @@ class ClientPresentation {
     }
 public:
     void reset(){samples_.clear();clear_cache();++history_generation_;epoch_=0;cursor_=last_render_=0;interval_=1./60;jitter_=0;}
-    bool push(std::shared_ptr<const WorldState> world,double received,PlayerId owner){
+    PresentationTransition push(std::shared_ptr<const WorldState> world,double received,PlayerId owner){
         auto it=world->mission.find("Session.Motion.Time");const auto* t=it==world->mission.end()?nullptr:std::get_if<float>(&it->second);
-        if(!t || !std::isfinite(*t))return false;
-        bool cut=world->epoch!=epoch_ || owner!=owner_;
-        if(!samples_.empty()){
+        if(!t || !std::isfinite(*t))return PresentationTransition::Continuous;
+        auto transition=PresentationTransition::Discontinuity;
+        if(world->epoch==epoch_ && owner==owner_ && !samples_.empty()){
             const auto& old=*samples_.back().world;
             const auto* a=own(old,owner),*b=own(*world,owner);
-            cut|=!a || !b || !presentation_continuous(*a,*b,*t-samples_.back().host);
             // Revisions for votes/ready/ack may reuse the same captured pose.
-            if(!cut && *t<=samples_.back().host)return false;
-            if(*t==samples_.back().host && a && b && a->properties==b->properties)return false;
+            if(a && b){
+                if(*t==samples_.back().host && *a==*b)return PresentationTransition::Continuous;
+                transition=presentation_transition(*a,*b,*t-samples_.back().host);
+            }
         }
-        if(cut){reset();epoch_=world->epoch;owner_=owner;cursor_=*t;last_render_=received;}
-        else if(!samples_.empty()){
+        if(transition!=PresentationTransition::Continuous){reset();epoch_=world->epoch;owner_=owner;cursor_=*t;last_render_=received;}
+        else {
             const auto span=double(*t)-samples_.back().host;
             interval_=.8*interval_+.2*std::clamp(span,.008,.10);
             // A delayed ordered packet can release a burst of snapshots. Host
@@ -248,7 +317,7 @@ public:
             jitter_=std::max(jitter_*std::exp(-span/3.),std::clamp(variation,0.,.12));
         }
         samples_.push_back({std::move(world),*t,received});while(samples_.size()>32)samples_.pop_front();
-        ++history_generation_;cache_valid_=false;return cut;
+        ++history_generation_;cache_valid_=false;return transition;
     }
     static const EntityState* own(const WorldState& world,PlayerId player){for(const auto& [id,e]:world.entities)if(e.kind==EntityKind::Player && e.owner==player)return &e;return nullptr;}
     std::map<EntityId,EntityState> sample(double now,Properties* vehicles=nullptr){
@@ -297,6 +366,7 @@ public:
             auto e=presentation_fields(current);auto a=before->world->entities.find(id),b=after->world->entities.find(id);
             if(a!=before->world->entities.end() && b!=after->world->entities.end() && span>0 && presentation_continuous(a->second,b->second,span) && presentation_continuous(b->second,current,std::max(.001,latest.host-after->host))){
                 for(auto& [key,value]:e.properties){
+                    if(key=="projectile_energy_visual")continue;
                     // The local camera uses the latest orientation, so replaying
                     // pending mouse deltas never fights an older buffered angle.
                     if(current.owner==owner_ && !presentation_driving(current) && key.starts_with("camera_row"))continue;

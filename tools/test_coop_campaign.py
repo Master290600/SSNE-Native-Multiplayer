@@ -88,7 +88,7 @@ class Peers:
  def restart_client(self):
   old=self.processes['client'];self.pulse('QUIT',('client',));old.wait(timeout=8)
   self.streams[-1].close();previous=self.folder/'client-before-rejoin';(self.folder/'client').rename(previous)
-  f=self.folder/'client';f.mkdir();(f/'steps').mkdir();shutil.copy2(self.a.exe,f/self.a.exe.name);shutil.copy2(previous/'card.raw',f/'card.raw');shutil.copy2(previous/'settings-netplay.ini',f/'settings-netplay.ini');(f/'input.txt').write_text('')
+  f=self.folder/'client';f.mkdir();(f/'steps').mkdir();shutil.copy2(previous/self.a.exe.name,f/self.a.exe.name);shutil.copy2(previous/'card.raw',f/'card.raw');shutil.copy2(previous/'settings-netplay.ini',f/'settings-netplay.ini');(f/'input.txt').write_text('')
   env={k:v for k,v in os.environ.items() if not k.startswith('SSNE_')};env.update(SSNE_TEST_HIDDEN='1',SSNE_PAD_SCRIPT_FILE=str(f/'input.txt'),SSNE_TEST_SCREENSHOT_DIR=str(f/'steps'),SSNE_PERF_LOG=str(f/'performance.jsonl'),SSNE_COOP_TEST_SKIP_DELAY_MS='1500',SSNE_TEST_SKIP_FIRST_VOTE='1',SSNE_COOP_CAMPAIGN_VERIFY='1')
   si=subprocess.STARTUPINFO();si.dwFlags|=subprocess.STARTF_USESHOWWINDOW;si.wShowWindow=0;stream=(f/'console.log').open('wb');self.streams.append(stream)
   self.processes['client']=subprocess.Popen(old.args,cwd=f,env=env,stdout=stream,stderr=stream,startupinfo=si,creationflags=subprocess.BELOW_NORMAL_PRIORITY_CLASS)

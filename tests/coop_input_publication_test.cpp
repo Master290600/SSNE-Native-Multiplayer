@@ -174,7 +174,7 @@ int main(){
     for(const auto slot:{local.slot,remote.slot})require(!(final_controls[slot].input.pressed&ssne::PAD_L) && !final_controls[slot].input.pad.trigger_l,"New epoch replayed a previous level jump edge");
     // Deterministic prediction contract: acknowledgements retire the matching pose delta.
     InputLookHistory prediction;prediction.reset(2);prediction.append(2,1,100000,-200000,0.);
-    require(prediction.pending(2,0,.01).yaw==.1 && prediction.pending(2,1,.01,1).yaw==0.,"Pose/input acknowledgement prediction contract changed");
+    require(prediction.pending(2,0,.01).yaw==.1 && prediction.pending(2,1,.01).yaw==0.,"Pose/input acknowledgement prediction contract changed");
     late.stop();client.stop();host.stop();
     std::cout<<"Real TCP input publication: immediate controls, immutable pose-bound acks, reuse/reference snapshots, forced resnapshot, event consumer, host/client short and unchanged-held jump events, flight/fire hold preservation, lifecycle edge sanitation, fire pulse, AFK, bots, late join and epoch readiness passed.\n";
 }
