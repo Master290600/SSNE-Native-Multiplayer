@@ -30,7 +30,7 @@ Play **Serious Sam: Next Encounter** (Nintendo GameCube, 2004) as a native progr
 no emulator. The game's own code is translated to C++ and compiled on your PC from **your own disc image**, then
 runs with a PC port that handles graphics (OpenGL), sound, keyboard, mouse and gamepads.
 
-SSNE-Native is a fork of [Silly ReEncounter](https://github.com/takoshero96/Silly-ReEncounter) by takoshero96,
+SSNE-Native-Multiplayer is a fork of [Silly ReEncounter](https://github.com/takoshero96/Silly-ReEncounter) by takoshero96,
 which made all of this possible. It adds a Linux version, fixes and PC-style controls (see
 [What SSNE-Native adds](#what-ssne-native-adds)). Its full name is **Serious Sam: Next Encounter Native**; the programs are
 `SSNE-RECOOP-Native` (the launcher) and `SSNE-Native-Game` (until 1.2 they kept the original names `SillyReEncounter` and
