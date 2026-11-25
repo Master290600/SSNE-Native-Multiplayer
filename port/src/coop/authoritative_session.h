@@ -7,6 +7,7 @@
 #include "lan_discovery.h"
 #include "custom_map_transfer.h"
 #include "ssne/input.h"
+#include "movement_command_stream.h"
 #include <memory>
 #include <functional>
 #include <string>
@@ -25,6 +26,7 @@ struct LocalControlSample {
     uint64_t epoch=0,sequence=0,jump_pressed=0,fire_pressed=0,fire_released=0;
     ControlInput input;
     double sampled_at=0.;
+    uint64_t reload_pressed=0;
 };
 struct PlayerControl {
     PlayerId id;
@@ -109,6 +111,8 @@ public:
     // Optional local-host AFK menu snapshot, captured before pressed edges
     // drain under the same lock. Ordinary/remote gameplay sanitation is unchanged.
     std::array<PlayerControl,max_players> take_controls(ControlInput* host_ui=nullptr);
+    ssne::NativeMovementStepDecision take_movement_step(unsigned slot,uint64_t spawn);
+    void complete_movement_step(unsigned slot,uint64_t sequence);
     std::array<Participant,max_players> participants() const;
     // Keep this guest-thread lease alive over the whole runtime transaction.
     // It freezes membership, commands and votes while nested calls remain legal.
@@ -170,6 +174,9 @@ public:
     void lobby_ready(bool);
     void submit_input(ControlInput);
     LocalControlSample local_control() const;
+    std::vector<ssne::NativeMovementCommand> movement_commands(MovementStreamIdentity,uint64_t completed,double now,float yaw);
+    // Guest-thread commit watermark, never the socket's newer un-applied world.
+    void acknowledge_movement_checkpoint(MovementStreamIdentity,uint64_t completed);
     void set_afk(bool);
     void set_spectator(bool);
     void vote_skip(uint64_t cutscene);

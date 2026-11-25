@@ -26,6 +26,7 @@ bool reuse_network_snapshot(){static const bool enabled=[] {const auto value=std
 bool use_network_world_view(){static const bool enabled=[] {const auto value=std::getenv("SSNE_NET_WORLD_VIEW");return !value||std::strcmp(value,"0");}();return enabled;}
 
 uint64_t milliseconds(){return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count());}
+double movement_seconds(){return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();}
 bool initialize_network(){static const bool ok=[](){WSADATA data{};return WSAStartup(MAKEWORD(2,2),&data)==0;}();return ok;}
 bool pin_valid(const std::string& s){return s.size()==6 && std::all_of(s.begin(),s.end(),[](char c){return c>='0' && c<='9';});}
 bool nonblocking(SOCKET s){u_long mode=1;return ioctlsocket(s,FIONBIO,&mode)==0;}
@@ -144,6 +145,11 @@ bool transfer_active(CustomMapTransferPhase phase){return phase==CustomMapTransf
 
 struct AuthoritativeServer::Impl {
     struct InputState { ControlInput input;uint64_t sequence=0,received=0,ack=0,fire_pressed=0; };
+    std::array<MovementCommandFIFO,max_players> movement_commands;
+    std::array<MovementStepClock,max_players> movement_clocks;
+    std::array<PlayerId,max_players> movement_owners{};
+    std::array<uint64_t,max_players> movement_spawns{};
+    uint64_t movement_serial=0;
     // Every transmitted baseline retains its immutable body and its own event
     // overlay. Acknowledging another revision must not rebind old peer cursors.
     struct PeerSnapshot {
@@ -386,6 +392,27 @@ struct AuthoritativeServer::Impl {
             if(epoch<body->epoch)return true;if(epoch!=body->epoch)return false;
             auto& old=controls[peer.id.slot];if(sequence<=old.sequence)return true;
             old.sequence=sequence;old.received=milliseconds();old.fire_pressed=fire_pressed;merge_input(old.input,input);return true;
+        }
+        case wire::Message::MovementSteps: {
+            const MovementStreamIdentity identity{r.u64(),r.u64(),r.u64()};
+            const auto count=r.u32();if(!count || count>movement_batch_limit)return false;
+            std::vector<ssne::NativeMovementCommand> batch;batch.reserve(count);
+            for(unsigned i=0;i<count;++i){
+                ssne::NativeMovementCommand command;command.sequence=r.u64();
+                command.stick_x=int8_t(r.u8());command.stick_y=int8_t(r.u8());
+                const auto jump=r.u8();command.jump_pressed=jump!=0;
+                command.yaw=std::bit_cast<float>(r.u32());
+                if(jump>1 || !valid_movement_command(command))return false;
+                batch.push_back(command);
+            }
+            if(!r.done())return false;
+            auto& queue=movement_commands[peer.id.slot];
+            // Loading, respawning and movement-mode switches can leave ordered
+            // old-stream bytes in flight. They cannot enter a new character.
+            if(identity!=queue.identity() || movement_owners[peer.id.slot]!=peer.id)return true;
+            const auto* player=authority.participant(peer.id);
+            if(!player || !player->ready || player->afk || player->spectator)return true;
+            return queue.append(batch);
         }
         case wire::Message::Ready: {
             auto epoch=r.u64();if(!r.done())return false;
@@ -669,10 +696,11 @@ bool AuthoritativeServer::start(uint16_t port,const std::string& pin,uint64_t fi
     auto& p=*impl_;if(p.worker.joinable() || p.authority.connected_count() || !initialize_network() || !pin_valid(pin) || !chat_name_valid(name) || !valid_skin_choice(skin))return false;
     const auto session_id=new_lan_secret();if(session_id.empty())return false;
     p.listener=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);if(p.listener==INVALID_SOCKET)return false;
-    // Hidden native regression fixtures only use same-PC peers. Avoid opening
-    // a LAN listener (and a fresh Windows Firewall prompt) for every test EXE.
+    // Local test pairs only need a loopback listener, including when their
+    // game windows are visible for a manual side-by-side comparison.
     const auto hidden=std::getenv("SSNE_TEST_HIDDEN");
-    const bool local_test=hidden && std::strcmp(hidden,"1")==0;
+    const auto loopback=std::getenv("SSNE_COOP_LOOPBACK_ONLY");
+    const bool local_test=(hidden && std::strcmp(hidden,"1")==0) || (loopback && std::strcmp(loopback,"1")==0);
     sockaddr_in address{};address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(local_test?INADDR_LOOPBACK:INADDR_ANY);address.sin_port=htons(port);
     if(bind(p.listener,reinterpret_cast<sockaddr*>(&address),sizeof(address)) || listen(p.listener,8) || !nonblocking(p.listener)){close_socket(p.listener);return false;}
     int length=sizeof(address);getsockname(p.listener,reinterpret_cast<sockaddr*>(&address),&length);
@@ -769,7 +797,31 @@ bool AuthoritativeServer::publish_impl(WorldState world,std::string& error,bool 
         // setup as well, so that intermediate token cannot confirm a new map.
         else if(menu && (world.epoch!=p.body->epoch || (p.lobby_open && lobby_setup_changed(p.body->mission,world.mission))))p.reset_lobby_votes();
     }
-    for(unsigned i=0;i<max_players;++i)world.input_ack[i]=p.controls[i].ack;
+    const bool walking_game=phase!=world.mission.end() && phase->second==Property(std::string("gameplay")) &&
+        !reset && !presentation && !world.vote.cutscene;
+    for(auto& [id,entity]:world.entities)if(entity.kind==EntityKind::Player){
+        entity.properties.erase("movement_stream");entity.properties.erase("movement_ack");
+    }
+    for(unsigned i=0;i<max_players;++i){
+        world.input_ack[i]=p.controls[i].ack;
+        const auto& player=world.players[i];auto& queue=p.movement_commands[i];
+        auto entity=world.entities.find(player.character);
+        const auto spawn=entity==world.entities.end()?0:movement_unsigned(entity->second.properties,"movement_spawn");
+        const bool eligible=walking_game && player.connected && player.ready && !player.afk && !player.spectator &&
+            player.id!=p.state.player && p.bots[i]!=player.id && entity!=world.entities.end() &&
+            entity->second.kind==EntityKind::Player && entity->second.owner==player.id && spawn &&
+            entity->second.properties.contains("movement_checkpoint") &&
+            decode_movement_checkpoint(entity->second.properties.at("movement_checkpoint")).has_value();
+        if(!eligible){queue.bind({});p.movement_clocks[i].reset();p.movement_owners[i]={};p.movement_spawns[i]=0;continue;}
+        if(queue.identity().epoch!=world.epoch || queue.identity().entity!=player.character ||
+           p.movement_owners[i]!=player.id || p.movement_spawns[i]!=spawn){
+            queue.bind({world.epoch,player.character,++p.movement_serial});
+            p.movement_clocks[i].reset(movement_seconds());
+            p.movement_owners[i]=player.id;p.movement_spawns[i]=spawn;
+        }
+        entity->second.properties["movement_stream"]=int64_t(queue.identity().token);
+        entity->second.properties["movement_ack"]=int64_t(queue.acknowledged());
+    }
     p.local_ping_view.reset();if(reset || world.level!=p.body->level)p.tactical_pings.clear(world.epoch);
     auto unpublished=std::make_shared<WorldState>(std::move(world));p.body=unpublished;p.rebuild(owned&&reuse_world_copies()?std::move(unpublished):nullptr);return true;
 }
@@ -831,6 +883,37 @@ std::array<PlayerControl,max_players> AuthoritativeServer::take_controls(Control
     // captured after simulation. rebuild() deliberately retains the old pose's
     // input_ack, so an input-only rebuild creates only a redundant revision.
     if(changed && !reuse_input_ack())p.rebuild();return result;
+}
+ssne::NativeMovementStepDecision AuthoritativeServer::take_movement_step(unsigned slot,uint64_t spawn){
+    auto& p=*impl_;std::lock_guard lock(p.mutex);
+    if(slot>=max_players || p.stopping || !p.state.connected)return {};
+    const auto& player=p.authority.participants()[slot];
+    auto& queue=p.movement_commands[slot];
+    if(!player.connected || !player.ready || player.afk || player.spectator ||
+       player.id==p.state.player || p.bots[slot]==player.id || p.movement_owners[slot]!=player.id ||
+       p.movement_spawns[slot]!=spawn || queue.identity().epoch!=p.body->epoch ||
+       queue.identity().entity!=player.character)return {};
+    auto& clock=p.movement_clocks[slot];
+    const auto now=movement_seconds();
+    if(!queue.acknowledged() && !queue.size()){
+        // At a swim-to-walk handoff the client first has to receive the
+        // new stream identity. Keep the original held input active until
+        // there is a command to play, including through the first dry step.
+        // These legacy ticks have already advanced PAL physics.
+        clock.reset(now);
+        return {};
+    }
+    clock.update(now);
+    if(clock.available())if(const auto command=queue.reserve())
+        return {ssne::NativeMovementStepAction::Execute,*command,queue.size()>1 && clock.available()>=2};
+    return {ssne::NativeMovementStepAction::Wait,{}};
+}
+void AuthoritativeServer::complete_movement_step(unsigned slot,uint64_t sequence){
+    auto& p=*impl_;std::lock_guard lock(p.mutex);
+    if(slot>=max_players || p.stopping || !p.state.connected)return;
+    const auto& player=p.authority.participants()[slot];
+    if(player.connected && player.id==p.movement_owners[slot] && player.character==p.movement_commands[slot].identity().entity)
+        if(p.movement_commands[slot].complete(sequence))p.movement_clocks[slot].complete();
 }
 uint64_t AuthoritativeServer::begin_cutscene(bool presentation){auto& p=*impl_;std::lock_guard lock(p.mutex);auto id=p.authority.begin_cutscene(presentation);p.rebuild();return id;}
 std::array<Participant,max_players> AuthoritativeServer::participants() const{std::lock_guard lock(impl_->mutex);return impl_->effective_participants();}
@@ -926,6 +1009,27 @@ struct AuthoritativeClient::Impl {
     std::map<uint64_t,std::shared_ptr<const WorldState>> history;
     std::thread worker;std::atomic<bool> stopping{false};
     ControlInput pending;uint64_t input_sequence=0,command_sequence=0,sent_input=0;
+    MovementCommandHistory movement_history;
+    uint64_t sent_movement=0;
+    double movement_render_at=0;float movement_yaw=0;
+    void movement_input_heartbeat(double now){
+        const auto identity=movement_history.identity();
+        if(!identity || !movement_render_at || now-movement_render_at<=.05 ||
+           !state.connected || state.player.slot>=max_players || identity.epoch!=world->epoch)return;
+        const auto& player=world->players[state.player.slot];
+        const auto entity=world->entities.find(identity.entity);
+        if(player.id!=state.player || !player.ready || player.afk || player.spectator ||
+           player.character!=identity.entity || entity==world->entities.end() ||
+           movement_unsigned(entity->second.properties,"movement_stream")!=identity.token)return;
+        // Local information/pause overlays need not render the player's eye.
+        // Keep supplying time to the host, so gravity and contacts still run.
+        // Only the guest's applied checkpoint retires replay history. The
+        // socket may already hold a newer ACK than the frame being rendered.
+        ssne::NativeMovementCommand command;command.yaw=movement_yaw;
+        command.stick_x=int8_t(int(local_control.input.pad.stick_x)-128);
+        command.stick_y=int8_t(int(local_control.input.pad.stick_y)-128);
+        movement_history.advance(now,command,local_control.jump_pressed);
+    }
     std::deque<std::vector<uint8_t>> commands,chat_outgoing;
     std::deque<ChatMessage> chat;
     ChatRateLimit chat_rate;
@@ -987,7 +1091,7 @@ struct AuthoritativeClient::Impl {
             }
             // Never relabel movement/fire accumulated during decode in the old
             // world as new input. Framed old-epoch commands remain rejectable.
-            if(next->epoch!=world->epoch){pending={};sent_input=input_sequence;retired_history.swap(history);retired_motion.swap(motion_history);look_history.reset(next->epoch);local_control={};tactical_pings.clear();last_tactical_ping=0;tactical_ping_sent=false;}
+            if(next->epoch!=world->epoch){pending={};sent_input=input_sequence;movement_history.reset();sent_movement=0;retired_history.swap(history);retired_motion.swap(motion_history);look_history.reset(next->epoch);local_control={};tactical_pings.clear();last_tactical_ping=0;tactical_ping_sent=false;}
             else if(world->revision)history[world->revision]=world;
             if(next->level!=world->level || !tactical_ping_gameplay(*next))tactical_pings.clear();
             while(history.size()>64){retired.push_back(std::move(history.begin()->second));history.erase(history.begin());}
@@ -1114,6 +1218,29 @@ struct AuthoritativeClient::Impl {
                     stream.last_progress=milliseconds();
                     sent_input=input_sequence;drain_transients(pending);
                 }
+                if(state.connected && movement_history.identity()){
+                    const auto identity=movement_history.identity();
+                    const auto player=state.player.slot<max_players?world->players[state.player.slot]:Participant{};
+                    const auto entity=world->entities.find(identity.entity);
+                    if(identity.epoch==world->epoch && player.id==state.player && player.character==identity.entity &&
+                       player.ready && !player.afk && !player.spectator && entity!=world->entities.end() &&
+                       movement_unsigned(entity->second.properties,"movement_stream")==identity.token){
+                        auto batch=movement_history.after(sent_movement);
+                        if(batch.size()>movement_batch_limit)batch.resize(movement_batch_limit);
+                        if(!batch.empty()){
+                            std::vector<uint8_t> data;put64(data,identity.epoch);put64(data,identity.entity);
+                            put64(data,identity.token);put32(data,uint32_t(batch.size()));
+                            for(const auto& command:batch){
+                                put64(data,command.sequence);data.push_back(uint8_t(command.stick_x));
+                                data.push_back(uint8_t(command.stick_y));data.push_back(command.jump_pressed);
+                                put32(data,std::bit_cast<uint32_t>(command.yaw));
+                            }
+                            const auto frame=packet(wire::Message::MovementSteps,std::move(data));
+                            stream.transmit.insert(stream.transmit.end(),frame.begin(),frame.end());
+                            stream.last_progress=milliseconds();sent_movement=batch.back().sequence;
+                        }
+                    }else {movement_history.reset();sent_movement=0;}
+                }
                 if(state.connected && !chat_outgoing.empty()){
                     const auto& chat_frame=chat_outgoing.front();
                     stream.transmit.insert(stream.transmit.end(),chat_frame.begin(),chat_frame.end());chat_outgoing.pop_front();
@@ -1168,6 +1295,7 @@ bool AuthoritativeClient::start(const std::string& address,uint16_t port,const s
 bool AuthoritativeClient::start_lan(const std::string& address,uint16_t port,const std::string& ticket,uint64_t fingerprint,const std::string& name,unsigned skin){return start_connection(address,port,ticket,fingerprint,name,skin,true);}
 bool AuthoritativeClient::start_connection(const std::string& address,uint16_t port,const std::string& pin,uint64_t fingerprint,const std::string& name,unsigned skin,bool lan) {
     auto& p=*impl_;if(p.worker.joinable() || !initialize_network() || !port || !(lan?valid_lan_secret(pin):pin_valid(pin)) || !chat_name_valid(name) || !valid_skin_choice(skin))return false;
+    p.movement_history.reset();p.sent_movement=0;p.movement_render_at=0;p.movement_yaw=0;
     p.skin=uint8_t(skin);p.address=address;p.port=port;p.pin=pin;p.fingerprint=fingerprint;p.name=name;p.state={};p.world=std::make_shared<WorldState>();p.history.clear();p.motion_history.clear();p.look_history.reset(1);p.local_control={};p.world_received=0;p.commands.clear();p.chat_outgoing.clear();p.chat.clear();p.chat_rate.clear();p.chat_sequence=0;p.tactical_pings.clear();p.latencies={};p.last_tactical_ping=p.ping_token=0;p.tactical_ping_sent=false;p.pending={};p.input_sequence=p.command_sequence=p.sent_input=0;p.state.port=port;p.state.connecting=true;p.state.message="Connecting to authoritative host.";p.stopping=false;p.custom_map_receiver=CustomMapReceiver{};p.custom_map_serial=p.custom_map_progress=0;
     p.worker=std::thread([&p]{p.run();});return true;
 }
@@ -1198,16 +1326,50 @@ void AuthoritativeClient::submit_input(ControlInput input){
     if(!local.fire_released && !fire)local.fire_released=sequence;
     if((fire && !previous_fire) || (input.pressed&ssne::PAD_R))local.fire_pressed=sequence;
     if(previous_fire && !fire)local.fire_released=sequence;
+    if(((input.pad.buttons&ssne::PAD_B) && !(local.input.pad.buttons&ssne::PAD_B)) ||
+       (input.pressed&ssne::PAD_B))local.reload_pressed=sequence;
     if(((input.pad.buttons&ssne::PAD_L) && !(local.input.pad.buttons&ssne::PAD_L)) ||
        (input.pressed&ssne::PAD_L))local.jump_pressed=sequence;
     local.epoch=epoch;
     local.sequence=sequence;
     local.input=input;
     local.sampled_at=std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    p.movement_input_heartbeat(local.sampled_at);
 }
 LocalControlSample AuthoritativeClient::local_control() const{
     std::lock_guard lock(impl_->mutex);
     return impl_->local_control;
+}
+std::vector<ssne::NativeMovementCommand> AuthoritativeClient::movement_commands(
+        MovementStreamIdentity identity,uint64_t completed,double now,float yaw){
+    auto& p=*impl_;std::lock_guard lock(p.mutex);
+    if(!p.state.connected || p.stopping || !identity || identity.epoch!=p.world->epoch ||
+       p.state.player.slot>=max_players || !std::isfinite(yaw))return {};
+    const auto& player=p.world->players[p.state.player.slot];
+    const auto entity=p.world->entities.find(identity.entity);
+    if(player.id!=p.state.player || !player.connected || !player.ready || player.afk || player.spectator ||
+       player.character!=identity.entity || entity==p.world->entities.end() ||
+       movement_unsigned(entity->second.properties,"movement_stream")!=identity.token)return {};
+    if(p.movement_history.identity()!=identity){
+        p.movement_history.bind(identity,completed,now,p.local_control.jump_pressed);p.sent_movement=completed;
+    }
+    p.movement_history.acknowledge(completed);
+    p.movement_render_at=now;p.movement_yaw=yaw;
+    ssne::NativeMovementCommand command;command.yaw=yaw;
+    if(p.local_control.epoch==identity.epoch && now-p.local_control.sampled_at<=.25){
+        command.stick_x=int8_t(int(p.local_control.input.pad.stick_x)-128);
+        command.stick_y=int8_t(int(p.local_control.input.pad.stick_y)-128);
+    }
+    p.movement_history.advance(now,command,p.local_control.jump_pressed);
+    return p.movement_history.after(completed);
+}
+void AuthoritativeClient::acknowledge_movement_checkpoint(MovementStreamIdentity identity,uint64_t completed){
+    auto& p=*impl_;std::lock_guard lock(p.mutex);
+    if(!p.state.connected || identity!=p.movement_history.identity() || identity.epoch!=p.world->epoch)return;
+    const auto entity=p.world->entities.find(identity.entity);
+    if(entity==p.world->entities.end() || movement_unsigned(entity->second.properties,"movement_stream")!=identity.token ||
+       completed>movement_unsigned(entity->second.properties,"movement_ack"))return;
+    p.movement_history.acknowledge(completed);
 }
 void AuthoritativeClient::set_afk(bool value){std::lock_guard lock(impl_->mutex);std::vector<uint8_t> bytes;put64(bytes,impl_->world->epoch);put64(bytes,++impl_->command_sequence);bytes.push_back(value);impl_->enqueue(wire::Message::Afk,std::move(bytes));}
 void AuthoritativeClient::set_spectator(bool value){std::lock_guard lock(impl_->mutex);std::vector<uint8_t> bytes;put64(bytes,impl_->world->epoch);put64(bytes,++impl_->command_sequence);bytes.push_back(value);impl_->enqueue(wire::Message::Spectator,std::move(bytes));}

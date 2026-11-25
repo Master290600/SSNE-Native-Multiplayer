@@ -47,7 +47,7 @@ void cancel_native_mouse(){g_presentation_mouse_buttons=0;g_presentation_click[0
 void sync_native_mouse_mode(){
     const auto snapshot=port::native_menu_mouse_snapshot();
     const bool focused=(getenv("SSNE_TEST_HIDDEN") || g_focused) && g_pointer_fixture_focused;
-    const bool available=g_pointer_image.valid() && focused && !port::menu_open() && !port::mod_menu_open() && !g_chat.active();
+    const bool available=g_pointer_image.valid() && focused && !port::menu_open() && !g_chat.active();
     const bool active=snapshot.active && available;
     // Credits and movies have no native GUI root. Keep their ordinary pad
     // Continue/Back path, without treating a disabled menu as a blank screen.
@@ -62,7 +62,7 @@ void sync_native_mouse_mode(){
     }
     g_native_pointer_active=active;g_presentation_pointer_active=presentation;
     g_local_roster_pointer_available.store(active && !ImGui::GetIO().WantCaptureMouse,std::memory_order_release);
-    if(!mode && g_pointer_restore_capture && focused && (ssne::player_control_active() || g_coop_spectating.load(std::memory_order_acquire)) && !snapshot.active && !ssne::native_results_presenting() && !port::menu_open() && !port::mod_menu_open() && !g_chat.active() && g_set.mouse_look){
+    if(!mode && g_pointer_restore_capture && focused && (ssne::player_control_active() || g_coop_spectating.load(std::memory_order_acquire)) && !snapshot.active && !ssne::native_results_presenting() && !port::menu_open() && !g_chat.active() && g_set.mouse_look){
         g_pointer_restore_capture=false;g_mouse_captured=true;g_mouse_dx=g_mouse_dy=0;
         if(!getenv("SSNE_TEST_HIDDEN")){g_capture_click|=SDL_GetMouseState(nullptr,nullptr);SDL_SetRelativeMouseMode(SDL_TRUE);}
     }
@@ -72,7 +72,7 @@ void sync_native_mouse_mode(){
 bool route_native_mouse_pointer(port::NativeMenuPointerEvent::Kind kind,float x,float y,uint8_t button=0,float wheel_x=0,float wheel_y=0){
     using Kind=port::NativeMenuPointerEvent::Kind;
     if(kind==Kind::Cancel){cancel_native_mouse();return true;}
-    if(port::menu_open() || port::mod_menu_open() || ImGui::GetIO().WantCaptureMouse){cancel_native_mouse();return false;}
+    if(port::menu_open() || ImGui::GetIO().WantCaptureMouse){cancel_native_mouse();return false;}
     if(g_native_pointer_active){post_native_mouse(kind,x,y,button,wheel_x,wheel_y);return true;}
     if(!g_presentation_pointer_active)return false;
     const auto point=port::point_in_game_view(g_pointer_image,x+g_pointer_origin_x,y+g_pointer_origin_y);
@@ -96,7 +96,7 @@ bool handle_native_mouse_event(const SDL_Event& event){
     const bool pointer=event.type==SDL_MOUSEMOTION || event.type==SDL_MOUSEBUTTONDOWN || event.type==SDL_MOUSEBUTTONUP || event.type==SDL_MOUSEWHEEL;
     if(pointer && getenv("SSNE_TEST_HIDDEN"))return true; // Hidden fixtures use only the shared file adapter.
     if(!pointer || (!g_native_pointer_active && !g_presentation_pointer_active))return false;
-    if(port::menu_open() || port::mod_menu_open()){cancel_native_mouse();return false;}
+    if(port::menu_open()){cancel_native_mouse();return false;}
     if(ImGui::GetIO().WantCaptureMouse){cancel_native_mouse();return false;}
     // Mouse events for other SDL windows must not hit this game's retained image.
     const auto* viewport=ImGui::GetMainViewport();
@@ -223,7 +223,7 @@ void native_mouse_test_command(){
     else valid=false;
     if(!valid || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(dx) || !std::isfinite(dy))return;
     g_pointer_accepted_sequence=sequence;
-    if(getenv("SSNE_TEST_CROSSHAIR")&&(port::menu_open()||port::mod_menu_open()))
+    if(getenv("SSNE_TEST_CROSSHAIR")&&(port::menu_open()))
         g_crosshair_test_imgui.push_back({kind,x,y,dx,dy,button});
     else route_native_mouse_pointer(kind,x,y,uint8_t(button),dx,dy);
 }

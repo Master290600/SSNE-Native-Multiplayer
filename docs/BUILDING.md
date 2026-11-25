@@ -27,6 +27,7 @@ player's PC, so everything runs on Windows 7 SP1 / 8.1 / 10 / 11 without the UCR
 ```sh
 tools/make_public_release.sh <out_dir> /opt/llvm-mingw
 ```
+Set `SSNE_MESA_ARCHIVE` to the local pinned Mesa archive to include Vulkan in this base package.
 
 ## Linux
 Everything builds natively (launcher, port, tools, tests). SDL2 is fetched and linked statically (2.32.10 on Linux,
@@ -93,6 +94,8 @@ Build `ssne-launcher` with CMake as above. The Windows 1.2.8.4-beta.1 package pa
 For a complete distribution base, use the Windows x64 asset from the [1.2.8.4-beta.1 release](https://github.com/Master290600/SSNE-Native-Multiplayer/releases/tag/v1.2.8.4-beta.1). Its `Extras/PS2/` directory contains the content payload. The matching installer source and checksums are in `data/release/ps2/` in this checkout. The game is compiled from the player's European GameCube disc. Build Game also restores the shared GameCube resources used by the additional maps from that disc.
 
 `tools/package_native_launcher.py` assembles historical multiplayer kits up to build 229. `tools/make_public_release.sh` assembles the standard build kit. The Windows 1.2.8.4-beta.1 release asset includes the multiplayer kit and content pack needed for a fresh install.
+
+For a new integrated Windows release with the F12 Vulkan renderer, stage the rebuilt multiplayer kit and run `python tools/stage_vulkan.py <mesa-archive> <distribution-stage> --release-manifest` before assembling the ZIP. Use the MSVC archive from the [pinned Mesa Windows release](https://github.com/pal1000/mesa-dist-win/releases/tag/26.3.0). Extraction requires Windows tar or bsdtar on Linux. The script verifies the archive and registers both driver DLLs and their notices. Include every file in the new runtime descriptor. Kits that link the separate `imgui_sdl_gl.cpp.obj` must place it before `libimgui.a` in the link arguments.
 
 ## Public fork release identity
 

@@ -13,7 +13,8 @@ struct RuntimeKitFile {
 struct RuntimeKit {
     std::string project_dir,kit_dir,data_dir;
     std::string descriptor_sha256,sidecar_sha256,fingerprint;
-    std::string ps2_content_sha256;   // required PAL add-on recipe, when present in the launcher kit
+    std::string ps2_content_sha256;   // PAL add-on recipe, when available in this kit
+    bool include_ps2_content=true;
     std::string recipe,recipe_sha256,symbols,symbols_sha256;
     std::string compiler,compiler_sha256,recompiler,recompiler_sha256,dol_sha256;
     int build=0,protocol=0;
@@ -26,7 +27,7 @@ struct RuntimeKit {
 // Updater package checks may set verify_disc=false before disc installation;
 // build and launch keep the default true and always verify the owned PAL data.
 bool load_runtime_kit(const std::string& project_dir,const std::string& data_dir,
-                      RuntimeKit&,std::string& error,bool verify_disc=true);
+                      RuntimeKit&,std::string& error,bool verify_disc=true,bool include_ps2_content=true);
 bool verify_runtime_kit(const RuntimeKit&,bool require_compiler,std::string& error);
 std::string runtime_file_sha256(const std::filesystem::path&,std::string& error);
 std::string runtime_text_sha256(const std::string&);

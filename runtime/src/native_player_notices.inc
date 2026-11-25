@@ -2,7 +2,38 @@ struct PickupNoticeState {uint32_t actor=0;NativePickupNotice notice;};
 std::array<PickupNoticeState,8> pickup_notices{};uint64_t pickup_notice_serial=0;
 PPCFunc original_popup=nullptr,original_step_once=nullptr,original_step_priority=nullptr;
 thread_local uint32_t step_controller=0;
-template<uint32_t Address>void step_owner_hook(PPCContext& c){const auto previous=step_controller;step_controller=c.r[3];struct Restore{uint32_t value;~Restore(){step_controller=value;}}restore{previous};ssne_call_original(c,Address,Address==0x800B7CB4u?original_step_once:original_step_priority);}
+thread_local bool player_death_voice=false;
+template<uint32_t Address>void step_owner_hook(PPCContext& c){
+    struct Restore{
+        uint32_t controller=step_controller;
+        bool death=player_death_voice;
+        ~Restore(){step_controller=controller;player_death_voice=death;}
+    } restore;
+    step_controller=c.r[3];
+    // PAL's normal death and drowning paths have priority ten and use the
+    // current skin's regular, submerged, or drowning death cue.
+    player_death_voice=Address==0x800B7CDCu && c.r[5]==10 &&
+        ((c.lr==0x800B7B0Cu && (c.r[4]==0 || c.r[4]==4)) ||
+         (c.lr==0x800B7BB0u && c.r[4]==31));
+    ssne_call_original(c,Address,Address==0x800B7CB4u?original_step_once:original_step_priority);
+}
+bool is_player_death_cue(const NativeFeedbackEvent& event){
+    if(event.kind!=10 || event.variant>=native_party_capacity())return false;
+    const auto actor=mem_read32(native_party_registry()+event.variant*4);
+    if(!combo_feedback_slot(actor))return false;
+    const auto controller=mem_read32(actor+0x174);
+    const auto cues=readable(controller,8)?mem_read32(controller+4):0;
+    return readable(cues,32*4) &&
+        (event.code==mem_read32(cues) || event.code==mem_read32(cues+4*4) ||
+         event.code==mem_read32(cues+31*4));
+}
+void trace_player_death_voice(const char* peer,const NativeFeedbackEvent& e,uint32_t handle,bool positional){
+    if(!getenv("SSNE_TEST_HIDDEN") || !getenv("SSNE_COOP_TRACE_LIFETIMES"))return;
+    track_shot_voice(handle,0x200000000ull+e.sequence);
+    log_message(std::string("[coop-player-death-voice-")+peer+"] sequence="+std::to_string(e.sequence)+
+                " slot="+std::to_string(e.variant)+" code="+std::to_string(e.code)+
+                " handle="+std::to_string(int32_t(handle))+" positional="+std::to_string(positional));
+}
 std::optional<unsigned> native_notice_owner(uint32_t object,unsigned actor_offset){
     for(unsigned slot=0;slot<native_party_capacity();++slot){const auto actor=mem_read32(native_party_registry()+slot*4);
         if(!readable(actor,0x790) || mem_read32(actor+0x48)!=0x802121E8u)continue;

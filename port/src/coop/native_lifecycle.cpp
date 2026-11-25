@@ -18,11 +18,15 @@
 #include "ssne/native_survival.h"
 #include "ssne/replica_simulation.h"
 #include <cmath>
+#include <chrono>
 #include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <array>
 #include <cstring>
+#include <deque>
+#include "ssne/audio.h"
+#include "ssne/native_results.h"
 namespace port::coop {
 namespace {
 bool readable(uint32_t p,unsigned n){return p>=0x80000000u && n<=ssne::guest_ram_size() && p<=ssne::guest_ram_end()-n;}
@@ -184,6 +188,7 @@ bool activate_native_brush(PPCContext& context,uint32_t object,std::string& erro
     StackScratch scratch(context);PPCContext call=context;call.msr&=~0x8000u;call.r[1]-=0x100;mem_write32(call.r[1],context.r[1]);call.r[3]=object;ssne_call(call,0x8007F9C0);return true;
 }
 #include "native_model_states.inc"
+#include "native_brush_audio.inc"
 #include "native_vehicle.inc"
 std::array<uint8_t,8> capture_native_preferences(uint32_t actor){
     std::array<uint8_t,8> result{255,255,255,255,255,255,255,255};
@@ -325,6 +330,8 @@ bool validate_native_brush_geometry(uint32_t object,int64_t resource,int64_t seg
     const auto manager=mem_read32(level+0x298),vt=readable(manager,0x18)?mem_read32(manager):0;
     if(vt!=0x8021E660u || !readable(manager,0x18) || mem_read32(manager+0x14)>65536 || resource>=mem_read32(manager+0x14) || !readable(mem_read32(manager+0x10),mem_read32(manager+0x14)*80u))return fail("Native geometry manager unavailable");
     if(mem_read32(vt+0x7C)!=0x8013368Cu || mem_read32(vt+0x84)!=0x801337C8u || !ssne_find_func(0x8013368C) || !ssne_find_func(0x801337C8) || mem_read32(0x8013368C)!=0x9421FFF0u || mem_read32(0x801337C8)!=0x9421FF90u)return fail("Native moving-brush geometry setters unavailable");
+    if(!ssne_find_func(0x801339A8u) || mem_read32(0x801339A8u)!=0x9421FF80u ||
+       !ssne_find_func(0x80138D08u) || mem_read32(0x80138D08u)!=0x9421FFF0u)return fail("Native moving-brush pose evaluation unavailable");
     const auto entry=mem_read32(manager+0x10)+uint32_t(resource)*80;
     if(!readable(mem_read32(entry),0xC0))return fail("Native moving-brush model unavailable");
     const auto path=mem_read32(entry+8);
@@ -338,6 +345,14 @@ bool validate_native_brush_geometry(uint32_t object,int64_t resource,int64_t seg
     if(geometry_node!=first || geometry_nodes.empty() || uint64_t(segment)>=geometry_nodes.size())return fail("Invalid native geometry keyframe ring");
     return true;
 }
+static void publish_brush_matrix(PPCContext& call,uint32_t manager,unsigned resource){
+    const auto entry=mem_read32(manager+0x10)+resource*80;
+    call.r[3]=manager;call.r[4]=resource;ssne_call(call,0x801339A8u);
+    const auto matrix=call.r[3],model=mem_read32(entry);
+    if(std::memcmp(ssne::host_ptr(matrix),ssne::host_ptr(model+0x34),48)!=0){
+        call.r[3]=entry;call.r[4]=matrix;ssne_call(call,0x80138D08u);
+    }
+}
 bool apply_native_brush_geometry(PPCContext& context,uint32_t object,int64_t resource,int64_t segment,float progress,std::string& error) {
     if(!context_ok(context) || !validate_native_brush_geometry(object,resource,segment,progress,error))return false;
     const auto manager=mem_read32(mem_read32(0x802DACC0)+0x298);
@@ -346,7 +361,21 @@ bool apply_native_brush_geometry(PPCContext& context,uint32_t object,int64_t res
     StackScratch scratch(context);PPCContext call=context;call.msr&=~0x8000u;call.r[1]-=0x100;mem_write32(call.r[1],context.r[1]);
     call.r[3]=manager;call.r[4]=uint32_t(resource);call.r[5]=uint32_t(segment);ssne_call(call,0x8013368C);
     call.r[3]=manager;call.r[4]=uint32_t(resource);call.ps0[1]=call.ps1[1]=progress;ssne_call(call,0x801337C8);
+    // The keyframe setters only mark the new pose dirty. A replica borrows
+    // the model matrix for each interpolated draw and then restores it.
+    // Publish the confirmed matrix before movement sweeps query the brush.
+    publish_brush_matrix(call,manager,uint32_t(resource));
     mem_write32(object+0xC8,uint32_t(segment));mem_write32(object+0xC0,f2u(progress));return true;
+}
+void set_local_brush_collision_progress(PPCContext& context,uint32_t manager,unsigned resource,float progress){
+    // Called in pairs for an already validated, active path segment. Keep the
+    // logical brush and its carrying velocity at the last confirmed sample.
+    const auto entry=mem_read32(manager+0x10)+resource*80;
+    const auto velocity_dirty=mem_read32(entry+0x4C);
+    mem_write32(entry+0x10,f2u(progress));mem_write32(entry+0x48,1);mem_write32(entry+0x4C,0);
+    StackScratch scratch(context);auto call=context;call.msr&=~0x8000u;call.r[1]-=0x100;mem_write32(call.r[1],context.r[1]);
+    publish_brush_matrix(call,manager,resource);
+    mem_write32(entry+0x4C,velocity_dirty);
 }
 bool validate_native_weapon_selection(uint32_t actor,unsigned weapon,std::string& error) {
     if(weapon>=12 || !readable(actor,0x790) || mem_read32(actor+0x48)!=ssne::game_address(0x80212268u) || mem_read32(actor+0x5DC)>=12){error="Invalid native weapon selection";return false;}
@@ -636,8 +665,9 @@ bool local_weapon_muzzle_position(PPCContext& call,uint32_t instance,uint32_t ac
 }
 }
 
-LocalWeaponStatus capture_native_local_weapon(PPCContext& context,uint32_t actor,unsigned* pistol_rearm){
+LocalWeaponStatus capture_native_local_weapon(PPCContext& context,uint32_t actor,unsigned* pistol_rearm,LocalPistolState* pistol){
     if(pistol_rearm)*pistol_rearm=0;
+    if(pistol)*pistol={};
     if(!readable(actor,0x790))return {};
     const auto weapon=mem_read32(actor+0x5DC);
     if(weapon>=12)return {};
@@ -657,6 +687,12 @@ LocalWeaponStatus capture_native_local_weapon(PPCContext& context,uint32_t actor
         const auto clip=mem_read32(instance+0x10);
         const bool animating=mem_read32(instance+0x24) && !mem_read32(instance+0x20);
         const auto phase=mem_read32(instance+0x1B4);
+        if(pistol && weapon==1 && mem_read16(instance+0xA) && readable(instance,0x24C)){
+            // Both native reload paths at 80056098 accept idle or firing hands.
+            if(phase==0 || phase==3)pistol->reloadable|=bit;
+            if(phase==1)pistol->reloading|=bit;
+            if(mem_read32(instance+0x228)==11)pistol->last_round|=bit;
+        }
         const bool continuous=weapon==2 || weapon==4;
         const bool fire_pose=weapon==1?clip==2 || clip==4:clip==(weapon==5?13u:12u);
         if(!continuous && animating && fire_pose)status.firing|=bit;
@@ -675,11 +711,21 @@ LocalWeaponStatus capture_native_local_weapon(PPCContext& context,uint32_t actor
                          !(u2f(mem_read32(instance+0x228))<=1.f/60.f)))continue;
         if(weapon==1){
             if(mode!=0 || !readable(instance,0x24C) || mem_read32(instance+0x220) ||
-               mem_read32(instance+0x228)>=11 ||
+               mem_read32(instance+0x228)>=12 ||
                !(u2f(mem_read32(instance+0x1F8))<=u2f(mem_read32(instance+0x1B8))))continue;
             // On a new trigger PAL writes 2.0 to +1E8 and zero to +1FC
             // before updating both pistols (800C56E4/800C56FC). The +220
             // hand lock, magazine and reload animation still apply.
+            // Older clients do not predict the transition from clip 4 to
+            // reload. Publish that final round separately for newer clients.
+            if(mem_read32(instance+0x228)==11){
+                if(pistol){
+                    if(2.f>=1.f/divisor)pistol->last_rearm|=bit;
+                    if(!pistol_held && u2f(mem_read32(instance+0x1FC))<=0.f && rate>=1.f/divisor)
+                        pistol->last_ready|=bit;
+                }
+                continue;
+            }
             if(pistol_rearm && 2.f>=1.f/divisor)*pistol_rearm|=bit;
             if(pistol_held || !(u2f(mem_read32(instance+0x1FC))<=0.f))continue;
         }else if(!local_feedback_ammunition(instance,cfg))continue;
@@ -716,6 +762,15 @@ std::optional<NativeLocalWeaponCapacity> capture_native_local_weapon_capacity(
         rounds=local_feedback_ammunition(instance,cfg);
     }
     return NativeLocalWeaponCapacity{std::min(rounds,255u),1.f/divisor,rounds==1};
+}
+
+std::optional<NativeMinigunTiming> native_local_minigun_timing(uint32_t actor,unsigned hand){
+    const auto instance=local_feedback_weapon(actor,4,hand);
+    const auto mode=instance?local_feedback_mode(instance,mem_read32(instance+0x1E0)):0;
+    if(!mode)return {};
+    const auto charge=u2f(mem_read32(mode+0x24)),rate=u2f(mem_read32(mode+0x1C));
+    if(!(charge>0.f && charge<=4.f && rate>=1.f && rate<=120.f))return {};
+    return NativeMinigunTiming{charge,rate};
 }
 
 bool play_native_local_weapon_flash(PPCContext& context,uint32_t actor,unsigned weapon,unsigned hand){
@@ -757,6 +812,10 @@ bool play_native_local_weapon_flash(PPCContext& context,uint32_t actor,unsigned 
     }else{
         call.r[3]=instance;
         ssne_call(call,method);
+        // PAL clears the Minigun's radial glint on its next controller tick.
+        // Its constructor does not initialize the timer used by the replica.
+        if(weapon==4 && readable(instance+0x250,16) && mem_read32(instance+0x25C))
+            mem_write32(instance+0x258,0);
     }
     return mem_read32(owner+12)!=0;
 }
@@ -1408,6 +1467,48 @@ uint32_t create_native_projectile(PPCContext& context,const EntityState& e,uint3
     }
     return object;
 }
+namespace {
+bool present_reptiloid_cloud(PPCContext& call,uint32_t object,uint16_t model,std::string& error){
+    // On a replica this field belongs to presentation. The original flight
+    // tick uses it to emit every other tick. Cap that cadence independently
+    // of the snapshot rate and of the display rate of short-lived replays.
+    const auto now=uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    if(now-mem_read32(object+0x188)<33u)return true;
+    mem_write32(object+0x188,now);
+    const auto manager=mem_read32(0x802ABAB8u);
+    constexpr uint32_t factory=0x800CE060u,configure=0x800E6AF8u,table=0x80216D48u;
+    if(!readable(manager,0x20) || !ssne_find_func(factory) || !ssne_find_func(configure) ||
+       mem_read16(table+0x48)!=0 || mem_read32(table+0x4C)!=configure){
+        error="Original Reptiloid projectile cloud is unavailable";
+        return false;
+    }
+    call.r[3]=manager;
+    call.r[4]=0x40;
+    call.r[5]=object+0x20;
+    call.r[6]=0;
+    ssne_call(call,factory);
+    const auto cloud=call.r[3];
+    if(!cloud)return true;
+    if(!readable(cloud,0x48) || mem_read32(cloud+0x1C)!=table){
+        error="Invalid Reptiloid projectile cloud";
+        return false;
+    }
+    const auto params=call.r[1]+0x68;
+    mem_write32(params,f2u(u2f(mem_read32(0x801FE654u))*u2f(mem_read32(object+0x6C))));
+    mem_write32(params+4,mem_read32(0x801FE650u));
+    mem_write32(params+8,mem_read32(0x801FE658u));
+    mem_write32(params+12,model==139?1u:2u);
+    call.r[3]=cloud;
+    for(unsigned i=0;i<4;++i)call.r[4+i]=params+i*4;
+    ssne_call(call,configure);
+    if(getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_COOP_TRACE_REPTILOID")){
+        ssne::log_message("[reptiloid-cloud-client] model="+std::to_string(model)+
+            " projectile="+std::to_string(object)+" cloud="+std::to_string(cloud));
+    }
+    return true;
+}
+}
 bool present_native_projectile(PPCContext& context,uint32_t object,std::string& error){
     if(readable(object,0x4C) && mem_read32(object+0x48)==0x802022E0)return present_native_rocket(context,object,error);
     if(readable(object,0x4C) && mem_read32(object+0x48)==0x802009D8){
@@ -1497,7 +1598,16 @@ bool present_native_projectile(PPCContext& context,uint32_t object,std::string& 
     for(unsigned i=0;i<6;++i)mem_write32(call.r[1]+0x40+i*4,mem_read32(object+0x20+i*4));mem_write32(call.r[1]+0x58,0);
     call.r[3]=object;call.r[4]=call.r[1]+0x40;ssne_call(call,0x8009B160);
     if(type->trail)if(const auto trail=mem_read32(object+type->trail)){call.r[3]=trail;call.r[4]=object+0x20;ssne_call(call,0x800EEF8C);}
-    if(type->definition==10)if(const auto particles=mem_read32(object+0x15C)){call.r[3]=particles;call.r[4]=object+0x20;ssne_call(call,0x800EF830);}
+    if(type->definition==10){
+        const auto model=mem_read16(object+0xD4);
+        const bool reptiloid=model==139 || model==140;
+        if(const auto particles=mem_read32(object+0x15C)){
+            call.r[3]=particles;
+            call.r[4]=object+0x20;
+            ssne_call(call,reptiloid?0x800EF784u:0x800EF830u);
+        }
+        if(reptiloid && mem_read32(object+type->trail) && !present_reptiloid_cloud(call,object,model,error))return false;
+    }
     if(type->definition==3 || type->definition==4 || type->definition==5 || type->definition==8 || type->definition==10 || type->definition==13 || type->definition==14 || type->definition==15 || type->definition==16 || type->definition>=18){
         // Original virtual +15C contains only model matrix construction for
         // these classes. Their AI, movement and collision ticks stay disabled.

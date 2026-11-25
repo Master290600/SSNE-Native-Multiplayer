@@ -17,6 +17,19 @@ std::array<uint32_t,19> saved_view{};
 thread_local bool approved=false;
 bool readable(uint32_t p,unsigned n){return p>=0x80000000u && n<=guest_ram_size() && p<=guest_ram_end()-n;}
 bool valid(uint32_t object){return readable(object,0x178) && mem_read32(object+0x48)==0x80203078u;}
+bool authored_border(uint32_t object,float& border){
+    // PAL STARTCUTSCENE (80078478-80078538) applies the authored flag and
+    // CutSceneBorderSize to the shared camera's upper/lower view coordinates.
+    // These settings are loaded locally even when replica mission events are
+    // gated, so the replica can use the original layout without running them.
+    const auto config=mem_read32(object+0x54);
+    if(!readable(config,0x14))return false;
+    border=0.f;if(!mem_read32(config+0x10))return true;
+    const auto setting=mem_read32(object+0x134);
+    if(!readable(setting,0x28))return false;
+    border=u2f(mem_read32(setting+0x24));
+    return std::isfinite(border) && border>=0.f && border<=1024.f;
+}
 void initialize_gate(PPCContext& ctx){
     if(replica_simulation())return;const auto object=ctx.r[3];ssne_call_original(ctx,0x80078184,initialize_original);
     if(valid(object) && mem_read32(object+0x60)){
@@ -75,6 +88,14 @@ unsigned native_cutscene_camera_differences(const std::array<float,14>& camera){
     if(!valid(presentation_object) || !readable(presentation_view,76))return 16;
     unsigned differences=0;for(unsigned i=0;i<14;++i)differences+=mem_read32(presentation_object+0x140+i*4)!=f2u(camera[i]);
     differences+=mem_read32(presentation_view)!=presentation_object+0x13C;
+    float border=0.f;
+    if(!authored_border(presentation_object,border))++differences;
+    differences+=mem_read32(presentation_view+4)!=0;
+    differences+=mem_read32(presentation_view+8)!=f2u(border);
+    differences+=mem_read32(presentation_view+0xC)!=0;
+    differences+=mem_read32(presentation_view+0x10)!=f2u(border>0.f?-border:0.f);
+    differences+=mem_read32(presentation_view+0x14)!=0;
+    differences+=mem_read32(presentation_view+0x18)!=3;
     differences+=mem_read32(presentation_view+0x30)!=1;return differences;
 }
 void clear_native_cutscene_presentation(){
@@ -89,6 +110,7 @@ bool present_native_cutscene(PPCContext& context,uint32_t object,const std::arra
     if(!replica_simulation() || !valid(object) || mem_read32(object+0x13C)!=0x80203320u){error="Replica native camera entity unavailable";return false;}
     for(auto value:camera)if(!std::isfinite(value) || std::abs(value)>1000000.f){error="Invalid replica camera values";return false;}
     if(camera[12]<=0 || camera[12]>=180 || camera[13]<0 || camera[13]>1024){error="Invalid replica camera projection";return false;}
+    float border=0.f;if(!authored_border(object,border)){error="Replica native cinematic border settings unavailable";return false;}
     const auto engine=mem_read32(0x802ABAA0),slot=native_party_extended()?24u:4u;
     if(!readable(engine,0x600)){error="Replica native camera engine unavailable";return false;}
     const auto view=native_party_view_engine(engine)+0xDC+slot*76;
@@ -96,12 +118,13 @@ bool present_native_cutscene(PPCContext& context,uint32_t object,const std::arra
     if(presentation_object!=object || presentation_engine!=engine){
         clear_native_cutscene_presentation();presentation_object=object;presentation_engine=engine;presentation_view=view;
         saved_mask=mem_read32(0x802ABAD0);for(unsigned i=0;i<saved_view.size();++i)saved_view[i]=mem_read32(view+i*4);
-        log_message("[coop-client-cutscene-camera-bound] level_ref="+std::to_string(mem_read32(object+0x50))+" view="+std::to_string(slot));
+        log_message("[coop-client-cutscene-camera-bound] level_ref="+std::to_string(mem_read32(object+0x50))+" view="+std::to_string(slot)+" border="+std::to_string(border));
     }
     for(unsigned i=0;i<camera.size();++i)mem_write32(object+0x140+i*4,f2u(camera[i]));
-    // Verified native view fields: camera, full-screen rectangle, world model
-    // mask, active. The replica does not execute STARTCUTSCENE mission events.
-    mem_write32(view,object+0x13C);for(unsigned i=4;i<=0x10;i+=4)mem_write32(view+i,0);
+    // Preserve the same native letterboxed rectangle as STARTCUTSCENE. A
+    // full-screen replica rectangle loses the host's top and bottom borders.
+    mem_write32(view,object+0x13C);mem_write32(view+4,0);mem_write32(view+8,f2u(border));
+    mem_write32(view+0xC,0);mem_write32(view+0x10,f2u(border>0.f?-border:0.f));
     mem_write32(view+0x14,0);mem_write32(view+0x18,3);mem_write32(view+0x1C,0x80000000u);mem_write32(view+0x30,1);
     mem_write32(0x802ABAD0,0x10);return true;
 }

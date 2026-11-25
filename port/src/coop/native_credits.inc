@@ -67,11 +67,25 @@ void credits_update(PPCContext& ctx){
     }
 }
 }
+void deactivate_native_credits(){
+    if(!credits_installed)return;
+    // Returning to single-player restores the original scrolling and skip input.
+    if(*ssne_hook_slot(0x80164400)==credits_init)ssne_install_hook(0x80164400,nullptr);
+    if(*ssne_hook_slot(0x80164B60)==credits_update)ssne_install_hook(0x80164B60,nullptr);
+    credits_installed=false;
+    credits_authority=false;
+    credits_active=false;
+    credits_skip_requested=false;
+    credits_step=credits_target=credits_expected_hash=credits_exit_step=0;
+    credits_logged=~uint64_t(0);
+}
 bool install_native_credits(bool authority,std::string& error){
-    if(credits_installed){if(credits_authority!=authority){error="Native credits role changed";return false;}return true;}
+    if(credits_installed && credits_authority==authority)return true;
+    deactivate_native_credits();
     for(auto [address,expected]:{std::pair{0x80164400u,0x2b643315afb51678ull},std::pair{0x80164B60u,0xccb5c3ee58ca9da6ull}}){
         uint64_t hash=14695981039346656037ull;for(unsigned i=0;i<32;++i){hash^=mem_read8(address+i);hash*=1099511628211ull;}
         if(mem_read32(0x80000000)!=0x47334250u || hash!=expected || !ssne_find_func(address)){error="Native credits revision differs";return false;}
+        if(*ssne_hook_slot(address)){error="Native credits hooks are in use";return false;}
     }
     credits_authority=authority;credits_init_original=ssne_find_func(0x80164400)->func;credits_update_original=ssne_find_func(0x80164B60)->func;
     ssne_install_hook(0x80164400,credits_init);ssne_install_hook(0x80164B60,credits_update);credits_installed=true;return true;

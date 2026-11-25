@@ -11,6 +11,9 @@ int main() try {
     static_assert(port::ACT_WEAPON9-port::ACT_WEAPON1==8);
     const auto path=(std::filesystem::current_path()/"settings-roundtrip-private.ini").string();
     port::Settings original;
+    original.renderer="vulkan";
+    original.graphics_preset(2);
+    require(original.renderer=="vulkan","graphics preset changed the selected renderer");
     using port::Bind;using port::MultiplayerBindConflict;
     require(!original.team_hud,"Team HUD must be opt-in");
     require(original.multiplayer[port::MP_CHAT][0]==Bind::key(SDL_SCANCODE_T),"Chat default changed");
@@ -52,6 +55,10 @@ int main() try {
     require(loaded.cheat_jump==275 && loaded.cheat_damage==350,"Upstream settings fields lost");
     require(loaded.team_hud,"Team HUD choice lost");
     for(int a=0;a<port::MP_COUNT;++a)for(int k=0;k<port::Settings::kMpSlots;++k)require(loaded.multiplayer[a][k]==original.multiplayer[a][k],"Multiplayer keyboard/mouse slot lost");
+    port::Settings renderer_reload;
+    require(port::load_settings(renderer_reload,path) && renderer_reload.renderer=="vulkan","Lost the Vulkan renderer preference across a save and reload");
+    renderer_reload.fps_limit=120;
+    require(port::save_settings(renderer_reload,path) && port::load_settings(renderer_reload,path) && renderer_reload.renderer=="vulkan","Changing the FPS cap lost the Vulkan preference");
     std::ofstream(path)<<"settings_version=5\n[graphics]\nrenderer=dx11\nscale=-1\naspect=3\nfps_limit=1\n";
     port::Settings legacy;require(port::load_settings(legacy,path),"Legacy settings rejected");
     require(legacy.renderer=="gpu" && legacy.scale==-1 && legacy.aspect==3 && legacy.fps_limit==port::kMinFpsLimit,"Legacy input revives unsupported renderer or invalid limits");

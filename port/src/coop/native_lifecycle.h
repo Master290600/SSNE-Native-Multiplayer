@@ -3,6 +3,7 @@
 #include "ssne/ppc_context.h"
 #include <chrono>
 #include <optional>
+#include <span>
 namespace port::coop {
 // Guest-thread settings for the native mode-1 Survival integration. Original
 // PAL getters remain in use in every other mode and after Survival is disabled.
@@ -68,7 +69,8 @@ bool apply_native_weapon_flash(PPCContext&,uint32_t actor,unsigned weapon,unsign
 bool apply_native_body_flash(PPCContext&,uint32_t actor,unsigned hand,const std::vector<float>&,uint32_t mask,std::string& error);
 bool update_native_muzzle_flashes(PPCContext&,float seconds,std::string& error);
 struct LocalWeaponStatus;
-LocalWeaponStatus capture_native_local_weapon(PPCContext&,uint32_t actor,unsigned* pistol_rearm=nullptr);
+struct LocalPistolState;
+LocalWeaponStatus capture_native_local_weapon(PPCContext&,uint32_t actor,unsigned* pistol_rearm=nullptr,LocalPistolState* pistol=nullptr);
 struct NativeLocalWeaponCapacity {
     unsigned rounds;
     float interval;
@@ -76,16 +78,26 @@ struct NativeLocalWeaponCapacity {
 };
 std::optional<NativeLocalWeaponCapacity> capture_native_local_weapon_capacity(
     uint32_t actor,unsigned weapon,unsigned hand);
+struct NativeMinigunTiming {
+    float charge, rounds_per_second;
+};
+std::optional<NativeMinigunTiming> native_local_minigun_timing(uint32_t actor,unsigned hand);
 bool play_native_local_weapon_flash(PPCContext&,uint32_t actor,unsigned weapon,unsigned hand);
 bool refresh_native_actor_pose(PPCContext&,uint32_t actor,EntityKind,std::string& error);
 bool validate_native_corpse_creation(const EntityState&,std::string& error);
 bool apply_native_corpse_lifecycle(PPCContext&,uint32_t,const EntityState&,std::string& error);
+bool advance_native_corpse_dissolves(PPCContext&,std::span<const uint32_t>,float seconds,std::string& error);
 bool capture_native_corpse_visual(PPCContext&,uint32_t,EntityState&,std::string& error);
 uint32_t create_native_corpse(PPCContext&,const EntityState&,std::string& error);
 bool set_native_script_enabled(PPCContext&,uint32_t object,bool enabled,std::string& error);
 bool activate_native_brush(PPCContext&,uint32_t object,std::string& error);
+bool capture_native_brush_audio(uint32_t object,EntityState&,std::string& error);
+bool validate_native_brush_audio(uint32_t object,const EntityState&,std::string& error);
+bool apply_native_brush_audio(PPCContext&,uint64_t epoch,uint32_t object,const EntityState&,std::string& error,bool fresh_world=false);
+bool stop_native_brush_audio(PPCContext&,std::string& error);
 bool validate_native_brush_geometry(uint32_t object,int64_t resource,int64_t segment,float progress,std::string& error);
 bool apply_native_brush_geometry(PPCContext&,uint32_t object,int64_t resource,int64_t segment,float progress,std::string& error);
+void set_local_brush_collision_progress(PPCContext&,uint32_t manager,unsigned resource,float progress);
 bool validate_native_weapon_selection(uint32_t actor,unsigned weapon,std::string& error);
 bool apply_native_weapon_selection(PPCContext&,uint32_t actor,unsigned weapon,bool available,std::string& error);
 // Committed fire/ammo modes, one per native hand; -1 denotes no instance.

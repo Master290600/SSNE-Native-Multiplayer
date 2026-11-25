@@ -418,6 +418,23 @@ void native_write(const fs::path& path,const std::string& bytes){
     out.write(bytes.data(),std::streamsize(bytes.size()));out.flush();native_need(bool(out),"cannot write "+S(pending));out.close();native_replace(pending,path);
 }
 void native_write_json(const fs::path& p,const NativeJSON& v){native_write(p,launcher::write_json(v,true));}
+bool native_ps2_removal_needed(const launcher::RuntimeKit& kit,const fs::path& destination){
+    const auto project=P(kit.project_dir);
+    if(fs::exists(project/"game_data/files/ps2-skin-content.txt"))return true;
+    const bool has_originals=fs::is_directory(project/".ssne-ps2-import-237/originals");
+    if(has_originals && fs::exists(destination/".ps2-content-pending"))return true;
+    // A rejected first import leaves only the pending marker, with no content to undo.
+    // Completed base-only builds keep the backups for future repairs.
+    try{
+        if(fs::is_regular_file(destination/"native-build.json")){
+            const auto receipt=native_read_json(destination/"native-build.json");
+            if(receipt.find("ps2_content_sha256"))return true;
+            const auto* fingerprint=native_string(receipt,"fingerprint");
+            if(fingerprint && *fingerprint==kit.fingerprint)return false;
+        }
+    }catch(const std::exception&){ /* Recover interrupted imports from their verified backups. */ }
+    return has_originals;
+}
 struct NativeBuildLock {
 #ifdef _WIN32
     HANDLE handle=INVALID_HANDLE_VALUE;
@@ -478,7 +495,8 @@ void native_publish(const launcher::RuntimeKit& kit,const fs::path& candidate,co
     m["acceptance"]="Locally rebuilt from the owned PAL disc; native gameplay verification is separate from build success.";
     m["project_executable"]=launcher::native_project_exe;
     NativeJSON receipt=NativeJSON::Object{{"schema",1},{"project_executable",launcher::native_project_exe},{"fingerprint",kit.fingerprint},{"exe_sha256",hash},{"descriptor_sha256",kit.descriptor_sha256},{"build",kit.build},{"protocol",kit.protocol}};
-    if (!kit.ps2_content_sha256.empty()) (*receipt.object())["ps2_content_sha256"]=kit.ps2_content_sha256;
+    if (kit.include_ps2_content && !kit.ps2_content_sha256.empty())
+        (*receipt.object())["ps2_content_sha256"]=kit.ps2_content_sha256;
     bool journal_written=false;
     try{
         for(const auto* name:{launcher::native_project_exe,launcher::native_legacy_exe,launcher::native_legacy_alias}){native_need(!cancel,"cancelled");fs::copy_file(candidate,stage/"new"/name);}
@@ -514,7 +532,7 @@ std::string BuildKit::play_exe(const std::string& project) const{
 }
 std::string BuildKit::working_directory(const std::string& project) const{return target==BuildTarget::NativeMultiplayer?S(P(runtime.project_dir)/"Multiplayer"):project;}
 std::string BuildKit::target_fingerprint() const{return target==BuildTarget::NativeMultiplayer?runtime.fingerprint:"standard:"+version;}
-bool select_build_target(const BuildKit& base,const std::string& project,const std::string& data,BuildKit& selected,std::string& error){
+bool select_build_target(const BuildKit& base,const std::string& project,const std::string& data,BuildKit& selected,std::string& error,bool include_ps2_content){
     selected=base;selected.target=BuildTarget::Standard;selected.runtime={};
 #ifndef _WIN32
     // The verified native kit is a Windows PAL target; upstream Linux keeps
@@ -524,7 +542,7 @@ bool select_build_target(const BuildKit& base,const std::string& project,const s
     std::ifstream boot(P(data)/"sys/boot.bin",std::ios::binary);char id[6]{};
     if(!boot){std::error_code ec;const bool installed=fs::exists(P(data)/"sys/main.dol",ec);if(installed||ec){error="installed boot.bin is missing or unreadable; reinstall the disc data";return false;}error.clear();return true;}
     if(!boot.read(id,6)){error="installed boot.bin is incomplete";return false;}if(std::string(id,6)!="G3BP9G"){error.clear();return true;}
-    launcher::RuntimeKit native;if(!launcher::load_runtime_kit(project,data,native,error))return false;selected.target=BuildTarget::NativeMultiplayer;selected.runtime=std::move(native);return true;
+    launcher::RuntimeKit native;if(!launcher::load_runtime_kit(project,data,native,error,true,include_ps2_content))return false;selected.target=BuildTarget::NativeMultiplayer;selected.runtime=std::move(native);return true;
 #endif
 }
 bool game_build_ready(const BuildKit& kit,const std::string& output,std::string& error,bool force){
@@ -600,22 +618,26 @@ bool GameBuilder::build_native(const BuildKit& kit,const std::string& data,const
         report("Verifying the native game",.9);
         native_need(launcher::verify_runtime_kit(native,true,error),error);
         const auto content_pending=destination/".ps2-content-pending";
-        if (!native.ps2_content_sha256.empty()) {
+        if (!native.ps2_content_sha256.empty() &&
+            (native.include_ps2_content || native_ps2_removal_needed(native,destination))) {
             native_need(!cancel,"cancelled");
-            report("Installing PS2 maps and characters",.95);
+            report(native.include_ps2_content?"Installing PS2 maps and characters":"Restoring original GameCube content",.95);
             const auto ps2=P(native.project_dir)/"Extras/PS2";
+            if(!native.include_ps2_content)
+                native_need(native_hash(ps2/"checksums.json")==native.ps2_content_sha256,"PS2 content inventory differs; restore the bundled installer before removing content");
             const auto import_log=work/"logs/ps2-import.log";
             // A stopped or failed repair must not leave an old game receipt
             // claiming its partially restored files are ready to play.
             native_write(content_pending,native.ps2_content_sha256+"\n");
             native_write(import_log,"");
-            if (!run({S(ps2/"runtime/python.exe"),"-I","-B","-u",S(ps2/"import_ps2.py"),"--game",native.project_dir},
-                     native.project_dir,S(import_log),cancel,error)) {
+            std::vector<std::string> args={S(ps2/"runtime/python.exe"),"-I","-B","-u",S(ps2/"import_ps2.py"),"--game",native.project_dir};
+            if(!native.include_ps2_content)args.push_back("--remove");
+            if (!run(args,native.project_dir,S(import_log),cancel,error)) {
                 if (cancel) throw std::runtime_error("cancelled");
                 std::ifstream messages(import_log);
                 std::string line;
                 while (std::getline(messages,line)) if (!line.empty()) error=line;
-                throw std::runtime_error("PS2 content installation failed: "+error);
+                throw std::runtime_error(std::string(native.include_ps2_content?"PS2 content installation failed: ":"Restoring GameCube content failed: ")+error);
             }
         }
         report("Publishing the native game",.99);

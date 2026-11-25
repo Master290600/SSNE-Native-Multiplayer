@@ -41,7 +41,8 @@ std::string built_kit_version(const BuildKit& kit);
 // Select after extraction from the actual installed boot/DOL, never launcher.ini.
 // Missing data/non-PAL retains Standard; supported PAL requires the native kit.
 bool select_build_target(const BuildKit& base,const std::string& project_dir,
-                         const std::string& data_dir,BuildKit& selected,std::string& error);
+                         const std::string& data_dir,BuildKit& selected,std::string& error,
+                         bool include_ps2_content=true);
 bool game_build_ready(const BuildKit&,const std::string& output_exe,
                       std::string& error,bool force_verify=false);
 

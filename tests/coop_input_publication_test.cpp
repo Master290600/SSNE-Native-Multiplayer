@@ -172,9 +172,12 @@ int main(){
     wait_for([&]{const auto c=host.take_controls();return c[remote.slot].ready && c[late_id.slot].ready;},"Epoch readiness no longer rebuilds");
     const auto final_controls=host.take_controls();require(final_controls[bot->slot].ready && final_controls[bot->slot].afk,"Epoch reset bot automation");
     for(const auto slot:{local.slot,remote.slot})require(!(final_controls[slot].input.pressed&ssne::PAD_L) && !final_controls[slot].input.pad.trigger_l,"New epoch replayed a previous level jump edge");
-    // Deterministic prediction contract: acknowledgements retire the matching pose delta.
-    InputLookHistory prediction;prediction.reset(2);prediction.append(2,1,100000,-200000,0.);
-    require(prediction.pending(2,0,.01).yaw==.1 && prediction.pending(2,1,.01).yaw==0.,"Pose/input acknowledgement prediction contract changed");
+    // Acknowledging the matching camera pose retires its local look delta.
+    InputLookHistory prediction;prediction.reset(2);prediction.append(2,1,100000,-200000);
+    const auto pending_look=prediction.sample(2,0,.01,{0,0,0},-1,1);
+    require(std::abs(pending_look.yaw-.1)<1e-8 && std::abs(pending_look.pitch+.2)<1e-8,"Local input no longer leads the unacknowledged camera pose");
+    const auto confirmed_look=prediction.sample(2,1,.02,{.1f,.2f,0},-1,1);
+    require(confirmed_look.yaw==0. && confirmed_look.pitch==0.,"Matching pose/input acknowledgement retained a local look delta");
     late.stop();client.stop();host.stop();
     std::cout<<"Real TCP input publication: immediate controls, immutable pose-bound acks, reuse/reference snapshots, forced resnapshot, event consumer, host/client short and unchanged-held jump events, flight/fire hold preservation, lifecycle edge sanitation, fire pulse, AFK, bots, late join and epoch readiness passed.\n";
 }

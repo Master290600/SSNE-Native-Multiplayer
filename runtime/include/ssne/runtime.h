@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <string>
 #include <functional>
@@ -160,6 +161,7 @@ struct Cheats {
     bool authoritative_host = false;  // local movement/damage only; shared cheats use ModOptions
 };
 void set_cheats(const Cheats& c);
+std::array<float, 2> cheat_movement_factors();  // speed and jump currently set on the host
 void set_cheat_host(bool enabled);  // session role changes, before the next guest update
 bool cheats_available();  // the game's cheat code was found (USA Rev 1)
 bool cheats_active();     // a cheat is in effect right now

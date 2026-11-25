@@ -27,6 +27,7 @@ bool activate_native_sound_holder(PPCContext&,uint32_t object,std::string& error
 bool queue_native_offline_menu(PPCContext&,std::string& error);
 bool queue_native_coop_presentation(PPCContext&,uint32_t scene,std::string& error);
 bool install_native_credits(bool authority,std::string& error);
+void deactivate_native_credits();
 void publish_native_credits(Properties&);
 bool receive_native_credits(const Properties&,std::string& error);
 bool native_credits_finishing();

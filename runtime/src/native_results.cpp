@@ -240,7 +240,7 @@ void install_native_results_observer() {
     results_original=f->func;ssne_install_hook(f->address,begin_host_results);
     subscription=observe_native_entities([](const NativeEntityNotice& n){if(n.event==NativeEntityNotice::Event::LevelExit){abandon_result_save();result.reset();gui=0;host_results_open=false;results_countdown.reset();replica_results_open=false;replica_results_gui=0;}});
 }
-std::optional<NativeResults> native_results(){if(!result)return {};auto next=*result;for(unsigned i=0;i<13;++i){next.coefficients[i*2]=u2f(mem_read32(0x8023A8C0+i*28+12));next.coefficients[i*2+1]=u2f(mem_read32(0x8023A8C0+i*28+16));}next.active=readable(gui,0x90) && !mem_read32(gui+0x14) && mem_read32(gui+0x6C)!=0;if(save_host)host_results_open=next.active;const auto high=mem_read32(0x8023A8C0+8*28+0x18);next.high_score=readable(high,8)?mem_read32(high+4):next.score;return next;}
+std::optional<NativeResults> native_results(){if(!result)return {};auto next=*result;for(unsigned i=0;i<13;++i){next.coefficients[i*2]=u2f(mem_read32(0x8023A8C0+i*28+12));next.coefficients[i*2+1]=u2f(mem_read32(0x8023A8C0+i*28+16));}next.active=readable(gui,0x90) && !mem_read32(gui+0x14) && mem_read32(gui+0x6C)!=0;if(save_host)host_results_open=next.active;const auto high=mem_read32(0x8023A8C0+8*28+0x18);next.high_score=readable(high,8)?mem_read32(high):next.score;return next;}
 bool native_replica_results_presenting(){return replica_results_open.load();}
 bool native_results_presenting(){return host_results_open.load() || replica_results_open.load();}
 bool take_native_results_save_failure(){return result_save_failure_notice.exchange(false);}
@@ -325,10 +325,13 @@ bool apply_native_replica_results(PPCContext& context,const NativeResults& desir
     struct TitleScope{bool saved=creating_replica_result_title;int owner=native_party_owner();TitleScope(){creating_replica_result_title=true;native_party_owner_set(-1);}~TitleScope(){creating_replica_result_title=saved;native_party_owner_set(owner);}};
     {TitleScope title;call.r[3]=menu;call.r[4]=0x8021A014;call.r[5]=0x8021A01C;call.r[6]=0x8021A02C;call.r[7]=0;ssne_call(call,0x800F79BC);
     call.r[3]=menu;call.r[4]=0x8021A014;ssne_call(call,0x800F7DAC);}
-    // The final/high score records use integer animation targets through
-    // +18, unlike the first seven float statistics. Do not recalculate them
-    // from this client's campaign profile.
-    for(unsigned index:{7u,8u}){const auto number=mem_read32(0x8023A8C0+index*28+0x18);if(!readable(number,8)){error="Original result total-score variable unavailable";replica_results_open=false;return false;}const auto total=index==7?desired.score:std::max(desired.score,desired.high_score);mem_write32(number,total);mem_write32(number+4,total);call.r[3]=menu;call.r[4]=index;ssne_call(call,0x80109D34);}
+    // Keep the original integer-animation baselines created by 80109020
+    // from the authoritative values/coefficients above. Total record7 starts
+    // at current0, target=raw level points; 801098A8 transfers the three bonus
+    // records into that target as they count down. Preloading the final score
+    // would add those same bonuses a second time. Record8 retains the host
+    // profile's previous high score and rises naturally with the total.
+    for(unsigned index:{7u,8u}){const auto number=mem_read32(0x8023A8C0+index*28+0x18);if(!readable(number,8)){error="Original result total-score variable unavailable";replica_results_open=false;return false;}}
     call.r[3]=menu;call.r[4]=desired.score;ssne_call(call,0x80109970);
     // Original result sparkle effect, with normal menu cleanup.
     if(!mem_read32(context.r[13]-0x75E8u)){

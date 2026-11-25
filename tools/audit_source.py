@@ -33,7 +33,7 @@ def vendor_source(name):
 def inspect(name,data):
     p=Path(name);issues=[]
     if p.is_absolute() or '..' in p.parts or '\\' in name or ':' in name:issues.append('unsafe path')
-    metadata=name in {'data/kit/kit.ini','data/kit/kit-linux.ini.in','data/pgo/runtime.proftext','data/release/SSNE-INTERNET.example'}
+    metadata=name in {'data/kit/kit.ini','data/kit/kit-linux.ini.in','data/pgo/runtime.proftext','data/release/SSNE-INTERNET.example','licenses/vulkan/Mesa-notices.rst'}
     if name == 'port/resources/game.ico':
         if hashlib.sha256(data).hexdigest() != '8dbc49c88151736b0a1a083d804df099c7aaec2266b1b0882ecb7277e855d86f':
             issues.append('unexpected game icon')

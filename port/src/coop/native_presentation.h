@@ -4,6 +4,7 @@
 #include <optional>
 #include <cmath>
 namespace port::coop {
+inline constexpr char native_pickup_hover_key[]="Session.PickupHover";
 struct NativeRenderBinding {uint32_t model=0,matrix=0;};
 // Embedded original flash owners, never foreign process pointers. Original PAL
 // helpers: pistol5672C, Uzi61A48, shotgun5F1A4, Minigun584F4, sniper60684.

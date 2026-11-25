@@ -32,12 +32,12 @@ public:
                            const std::function<bool(const std::array<float,3>&)>& route_clear) {
         auto horizontal = [](const auto& a, const auto& b) { return std::hypot(a[0]-b[0], a[2]-b[2]); };
         auto reached = [&](const auto& point) {
-            return horizontal(follower,point)<.85f && std::abs(follower[1]-point[1])<.5f;
+            return horizontal(follower,point)<.42f && std::abs(follower[1]-point[1])<.38f;
         };
         if(grounded) {
             if(!trail_.empty() && (horizontal(trail_.back(),leader)>24.f || std::abs(trail_.back()[1]-leader[1])>12.f))
                 trail_.clear();
-            if(trail_.empty() || horizontal(trail_.back(),leader)>.9f || std::abs(trail_.back()[1]-leader[1])>.4f)
+            if(trail_.empty() || horizontal(trail_.back(),leader)>.48f || std::abs(trail_.back()[1]-leader[1])>.28f)
                 trail_.push_back(leader);
             if(trail_.size()>128)trail_.pop_front();
         }
@@ -51,12 +51,15 @@ public:
         }
         while(trail_.size()>1 && reached(trail_.front()))trail_.pop_front();
 
-        // A recent confirmed corner can skip obsolete breadcrumbs. Try at most
-        // one such shortcut before handing over to the bounded terrain search.
+        // Try the most recent nearby points on a reachable tread. A point
+        // several steps above or below us should not hide a clear next turn.
         if(trail_.size()>2) {
-            auto shortcut=std::prev(trail_.end(),2);
-            while(shortcut!=trail_.begin() && horizontal(follower,*shortcut)>10.f)--shortcut;
-            if(shortcut!=trail_.begin() && route_clear(*shortcut))trail_.erase(trail_.begin(),shortcut);
+            unsigned checks=0;
+            for(auto shortcut=std::prev(trail_.end(),2);shortcut!=trail_.begin() && checks<2;--shortcut){
+                if(horizontal(follower,*shortcut)>10.f || std::abs(follower[1]-(*shortcut)[1])>.85f)continue;
+                ++checks;
+                if(route_clear(*shortcut)){trail_.erase(trail_.begin(),shortcut);break;}
+            }
         }
         return {trail_.size()>1 ? trail_.front() : latest,false};
     }
@@ -143,7 +146,11 @@ public:
         }
         // Slow scraping against a wall is a stall too. Count only actual
         // movement requests; planning and standing near the human are idle.
-        if (moving_ && !escape_ && std::hypot(p[0]-previous_[0],p[2]-previous_[2])<.06f) stalled_+=decision_ticks;
+        // A native follow waypoint has its own terrain search and short-edge
+        // recovery. A large legacy sidestep can suppress it in a narrow hall.
+        const bool legacy_escape=!navigation_waypoint || autonomous;
+        if(!legacy_escape)escape_=0;
+        if (legacy_escape && moving_ && !escape_ && std::hypot(p[0]-previous_[0],p[2]-previous_[2])<.06f) stalled_+=decision_ticks;
         else stalled_=0;
         if (stalled_>32) { escape_=60; stalled_=0; }
         previous_=p;

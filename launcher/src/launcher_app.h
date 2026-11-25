@@ -38,7 +38,8 @@ private:
     void start_update();           // download and install update_, then restart
     void draw_update(ImVec2 p0, ImVec2 p1);  // the update prompt / progress over the window
 
-    enum Item { ITEM_PLAY, ITEM_DISC, ITEM_INSTALL, ITEM_FULLSCREEN, ITEM_CLOSE, ITEM_QUIT, ITEM_EDITOR, ITEM_COUNT };
+    enum Item { ITEM_PLAY, ITEM_DISC, ITEM_INSTALL, ITEM_FULLSCREEN, ITEM_CLOSE, ITEM_QUIT, ITEM_EDITOR,
+                ITEM_PS2, ITEM_SHORTCUT, ITEM_COUNT };
     bool item_enabled(int item) const;
     void activate(int item);
     void browse();

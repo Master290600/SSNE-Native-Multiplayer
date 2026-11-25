@@ -15,6 +15,7 @@
 
 #include "gc/disc.h"
 #include "platform.h"
+#include "desktop_shortcut.h"
 #include "theme.h"
 
 namespace fs = std::filesystem;
@@ -25,6 +26,21 @@ using theme::kGood; using theme::kWarn; using theme::kBad; using theme::kDim;
 bool acceptable(gc::VerifyStatus s) {
     return s == gc::VerifyStatus::Verified || s == gc::VerifyStatus::UnknownDump;
 }
+std::string playable_executable(const BuildKit& kit, const std::string& project) {
+    const auto game = kit.play_exe(project);
+    if (kit.target == BuildTarget::Standard && !platform::file_exists(game))
+        for (const auto& name : platform::legacy_port_exe_names()) {
+            const auto legacy = project + "/" + name;
+            if (platform::file_exists(legacy)) return legacy;
+        }
+    return game;
+}
+#ifdef _WIN32
+bool shortcut_for(const BuildKit& kit, const std::string& project, std::string& error) {
+    return launcher::create_desktop_shortcut(fs::u8path(playable_executable(kit, project)),
+                                             fs::u8path(kit.working_directory(project)), error);
+}
+#endif
 } // namespace
 
 LauncherApp::LauncherApp(bool updated) {
@@ -81,6 +97,15 @@ LauncherApp::LauncherApp(bool updated) {
         // A new build kit (engine update): rebuild the game right away, as Update Game would.
         if (cfg_.installed && kit_present_ && game_outdated()) start_install();
     }
+#ifdef _WIN32
+    if (cfg_.desktop_shortcut && game_ready()) {
+        std::string error;
+        if (!shortcut_for(kit_, base_dir_, error)) {
+            message_ = "Could not create the desktop shortcut. " + error;
+            message_is_error_ = true;
+        }
+    }
+#endif
     if (cfg_.check_updates && !getenv("SSNE_NO_UPDATE_CHECK"))
         update_check_ = std::thread([this] {
             std::string err;
@@ -169,7 +194,7 @@ void LauncherApp::start_verify() {
 
 void LauncherApp::refresh_target(bool force_verify) {
     target_error_.clear();
-    target_valid_ = select_build_target(base_kit_, base_dir_, data_dir_, kit_, target_error_);
+    target_valid_ = select_build_target(base_kit_, base_dir_, data_dir_, kit_, target_error_, cfg_.include_ps2_content);
     target_present_ = target_ready_ = false;
     if (target_valid_) {
         const auto play_exe=kit_.play_exe(base_dir_);
@@ -205,7 +230,8 @@ void LauncherApp::start_install(bool auto_launch) {
         build_step_.clear();
     }
     phase_ = extract ? Phase::Extracting : Phase::Building;
-    worker_ = std::thread([this, path, extract, auto_launch] {
+    worker_ = std::thread([this, path, extract, auto_launch, include_ps2 = cfg_.include_ps2_content,
+                           shortcut = cfg_.desktop_shortcut] {
         std::string err;
         bool ok = true;
         if (extract) {
@@ -217,9 +243,9 @@ void LauncherApp::start_install(bool auto_launch) {
                 });
             if (ok) installed_pending_ = true;
         }
+        BuildKit selected;
         if (ok && kit_present_) {
-            BuildKit selected;
-            ok = select_build_target(base_kit_, base_dir_, data_dir_, selected, err);
+            ok = select_build_target(base_kit_, base_dir_, data_dir_, selected, err, include_ps2);
             if (ok) {
                 phase_ = Phase::Building;
                 prog_done_ = 0; prog_total_ = 1000;
@@ -232,10 +258,16 @@ void LauncherApp::start_install(bool auto_launch) {
                     }, cancel_, err);
             }
         }
+        std::string shortcut_error;
+#ifdef _WIN32
+        if (ok && shortcut) shortcut_for(selected, base_dir_, shortcut_error);
+#endif
         {
             std::lock_guard<std::mutex> lk(mu_);
-            message_ = ok ? "The game is ready. Singleplayer and multiplayer are available in the game menu."
+            message_ = ok ? "The game is ready."
                           : (cancel_ ? "Build cancelled. The previous game was kept." : "Building the game failed: " + err);
+            if (!shortcut_error.empty())
+                message_ += " The desktop shortcut could not be created. " + shortcut_error;
             message_is_error_ = !ok && !cancel_;
         }
         refresh_pending_ = true;
@@ -254,10 +286,7 @@ void LauncherApp::launch_game() {
         message_is_error_ = true;
         return;
     }
-    std::string exe = kit_.play_exe(base_dir_);
-    if (kit_.target == BuildTarget::Standard)
-        for (auto& old : platform::legacy_port_exe_names())
-            if (!platform::file_exists(exe)) exe = base_dir_ + "/" + old;
+    std::string exe = playable_executable(kit_, base_dir_);
     std::vector<std::string> args{"--data", data_dir_};
     if (cfg_.fullscreen) args.push_back("--fullscreen");
     if (kit_.target == BuildTarget::NativeMultiplayer) {
@@ -306,6 +335,13 @@ void LauncherApp::launch_game() {
 bool LauncherApp::item_enabled(int item) const {
     bool idle = phase_ == Phase::Idle;
     switch (item) {
+#ifdef _WIN32
+    case ITEM_PS2:
+        return idle && kit_present_ && (cfg_.game_id.empty() || cfg_.game_id == "G3BP9G" || kit_.target == BuildTarget::NativeMultiplayer);
+    case ITEM_SHORTCUT: return idle;
+#else
+    case ITEM_PS2: case ITEM_SHORTCUT: return false;
+#endif
     case ITEM_EDITOR: return idle && cfg_.installed && platform::file_exists(data_dir_ + "/files/Levels/Rlevel1_1.ssw");
     case ITEM_PLAY: return idle && cfg_.installed && (kit_present_ || game_built());
     case ITEM_DISC: return idle;
@@ -329,6 +365,24 @@ void LauncherApp::activate(int item) {
     case ITEM_PLAY: launch_game(); break;
     case ITEM_DISC: browse(); break;
     case ITEM_INSTALL: start_install(); break;
+#ifdef _WIN32
+    case ITEM_PS2:
+        cfg_.include_ps2_content = !cfg_.include_ps2_content;
+        cfg_.save(config_path_);
+        refresh_target();
+        break;
+    case ITEM_SHORTCUT:
+        cfg_.desktop_shortcut = !cfg_.desktop_shortcut;
+        cfg_.save(config_path_);
+        if (cfg_.desktop_shortcut && game_ready()) {
+            std::string error;
+            const bool created = shortcut_for(kit_, base_dir_, error);
+            std::lock_guard<std::mutex> lk(mu_);
+            message_is_error_ = !created;
+            message_ = created ? "Desktop shortcut ready." : "Could not create the desktop shortcut. " + error;
+        }
+        break;
+#endif
     case ITEM_FULLSCREEN: cfg_.fullscreen = !cfg_.fullscreen; cfg_.save(config_path_); break;
     case ITEM_CLOSE: cfg_.close_on_launch = !cfg_.close_on_launch; cfg_.save(config_path_); break;
     case ITEM_QUIT: quit_ = true; break;
@@ -496,7 +550,7 @@ void LauncherApp::draw_menu(ImVec2 p0, ImVec2 p1) {
     float big = std::clamp(h * 0.090f, 26.0f, 50.0f), small = big * 0.72f;
     bool installed = cfg_.installed;
     struct Row { int item; const char* label; float size; const char* value; };
-    Row rows[ITEM_COUNT] = {
+    Row rows[] = {
         {ITEM_PLAY, "Play", big * 1.12f, nullptr},
         {ITEM_DISC, "Select Disc", big, nullptr},
         {ITEM_INSTALL, !installed ? "Install Game" : game_outdated() ? "Update Game" : (kit_present_ && !game_ready()) ? "Build Game" : kit_.target == BuildTarget::NativeMultiplayer ? "Rebuild Game" : "Reinstall", big, nullptr},
@@ -615,6 +669,29 @@ void LauncherApp::draw_panel(ImVec2 p0, ImVec2 p1) {
 
     ImGui::Dummy(ImVec2(0, 10));
     heading("Game");
+#ifdef _WIN32
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5, 4));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10, 4));
+    auto option = [&](Item item, int row, const char* title, bool value) {
+        const bool enabled = item_enabled(item);
+        ImGui::BeginDisabled(!enabled);
+        if (selected_ == item) ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
+        const bool clicked = ImGui::Checkbox(title, &value);
+        if (selected_ == item) ImGui::PopStyleColor();
+        if (clicked) { selected_ = item; activate(item); }
+        test_rows_.push_back({row, title, enabled, ImGui::GetItemRectMin(), ImGui::GetItemRectMax()});
+        if (selected_ == item && !ImGui::IsItemVisible()) ImGui::SetScrollHereY();
+        ImGui::EndDisabled();
+    };
+    const bool pal_options = cfg_.game_id.empty() || cfg_.game_id == "G3BP9G" || kit_.target == BuildTarget::NativeMultiplayer;
+    if (pal_options && kit_present_) {
+        option(ITEM_PS2, 101, "Include PS2 maps and skins", cfg_.include_ps2_content);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+            ImGui::SetTooltip("For online play, choose the same content as the host.");
+    }
+    option(ITEM_SHORTCUT, 102, "Create desktop shortcut to game", cfg_.desktop_shortcut);
+    ImGui::PopStyleVar(2);
+#endif
     bool ok;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -640,8 +717,7 @@ void LauncherApp::draw_panel(ImVec2 p0, ImVec2 p1) {
         ImGui::TextColored(kDim, ready ? "and built on this PC. Ready to play." : "in game_data next to the launcher.");
     } else if (cfg_.installed && game_outdated()) {
         ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
-        ImGui::TextWrapped("This launcher has an updated game engine (performance improvements). Choose Update Game to "
-                           "rebuild the game on this PC. Play also builds the current game before starting it.");
+        ImGui::TextWrapped("Choose Update Game to apply the current build and content selection.");
         ImGui::PopStyleColor();
     } else if (cfg_.installed) {
         ImGui::PushStyleColor(ImGuiCol_Text, kWarn);
@@ -681,7 +757,10 @@ void LauncherApp::draw_panel(ImVec2 p0, ImVec2 p1) {
     bool done[3] = {ok || cfg_.installed, cfg_.installed, built};
     float avail = ImGui::GetContentRegionAvail().x, ph = 34, gap = 10;
     float pw = (avail - gap * 2) / 3;
-    ImVec2 base(ImGui::GetWindowPos().x, ImGui::GetWindowPos().y + ImGui::GetWindowHeight() - ph - 2);
+    ImVec2 base = ImGui::GetCursorScreenPos();
+    base.y = std::max(base.y, ImGui::GetWindowPos().y + ImGui::GetWindowHeight() - ph - 2 - ImGui::GetScrollY());
+    ImGui::SetCursorScreenPos(base);
+    ImGui::Dummy(ImVec2(avail, ph));
     for (int i = 0; i < 3; i++) {
         ImVec2 a(base.x + i * (pw + gap), base.y), b(a.x + pw, a.y + ph);
         bool next = !done[i] && (i == 0 || done[i - 1]);
@@ -729,6 +808,8 @@ void LauncherApp::save_test_state(const std::string& path, uint64_t sequence, ui
         {"target",kit_.target == BuildTarget::NativeMultiplayer ? "multiplayer" : "standard"},
         {"output_exe",kit_.play_exe(base_dir_)},{"build_output_exe",kit_.output_exe(base_dir_)},{"working_directory",kit_.working_directory(base_dir_)}});
     (*state.object())["editor_open"]=editor_open_;
+    (*state.object())["include_ps2_content"]=cfg_.include_ps2_content;
+    (*state.object())["desktop_shortcut"]=cfg_.desktop_shortcut;
     if (auto* window = SDL_GL_GetCurrentWindow()) {
         int width = 0, height = 0, x = 0, y = 0;
         SDL_GetWindowSize(window, &width, &height);

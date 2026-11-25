@@ -2,6 +2,7 @@
 
 #include "local_shot_feedback.h"
 #include "local_weapon_gait.h"
+#include "native_lifecycle.h"
 #include "native_local_weapon_clip.h"
 #include "ssne/replica_simulation.h"
 #include <algorithm>
@@ -53,8 +54,15 @@ class LocalNativeWeaponPresentation {
         ssne::NativeLocalWeaponClip clip;
         uint32_t frame;
     };
+    struct Reload {
+        Event event;
+        uint64_t input, fire_press, after_shot;
+        double begin;
+        bool started, confirmed;
+    };
     struct Hand {
         std::optional<Playing> active;
+        std::optional<Reload> reload;
         std::optional<RenderedKey> previous;
         std::vector<float> terminal;
         double touched=0.;
@@ -69,13 +77,21 @@ class LocalNativeWeaponPresentation {
         uint64_t press;
         double expires;
     };
+    struct MinigunBarrel {
+        double updated=0.;
+        double charge_fraction=0.;
+        double degrees=0.;
+        bool spinning=false;
+    };
 
     uint64_t epoch_=0;
     PlayerId owner_{};
     EntityId actor_=0;
     unsigned weapon_=12;
+    uint64_t reload_seen_=0;
     LocalWeaponGait gait_;
     std::array<Hand,2> hands_{};
+    std::array<MinigunBarrel,2> minigun_{};
     std::deque<Receipt> receipts_;
 
 public:
@@ -93,10 +109,30 @@ public:
         }
         if(weapon_!=weapon){
             hands_={};
+            minigun_={};
             gait_={};
             weapon_=weapon;
         }
         while(!receipts_.empty() && receipts_.front().expires<=now)receipts_.pop_front();
+    }
+
+    bool spin_minigun(unsigned hand,bool held,double now,NativeMinigunTiming timing){
+        auto& barrel=minigun_[hand];
+        if(barrel.updated){
+            // PAL integrates its angular velocity during charge, fire and
+            // spin-down (8005746C, 800576B4 and 80057C5C).
+            const double dt=std::clamp(now-barrel.updated,0.,.1);
+            const double remaining=barrel.spinning?1.-barrel.charge_fraction:barrel.charge_fraction;
+            const double ramp=std::min(dt,remaining*timing.charge);
+            const double next=std::clamp(barrel.charge_fraction+(barrel.spinning?1.:-1.)*
+                                         ramp/timing.charge,0.,1.);
+            const double turns=(barrel.charge_fraction+next)*.5*ramp+next*(dt-ramp);
+            barrel.degrees=std::fmod(barrel.degrees+turns*timing.rounds_per_second*60.,360.);
+            barrel.charge_fraction=next;
+        }
+        barrel.spinning=held;
+        barrel.updated=now;
+        return barrel.charge_fraction>=1.;
     }
 
     bool start(uint32_t actor,const EntityState& own,unsigned weapon,unsigned hand,Event event,
@@ -118,9 +154,52 @@ public:
             }
         }
         track.active=Playing{*clip,spec->playback,now};
+        if(event!=Event::reload_single_pistol && event!=Event::reload_dual_pistol)track.reload.reset();
         track.latest_press=std::max(track.latest_press,press);
         track.touched=now;
         if(predicted)receipts_.push_back({weapon,hand,event,press,now+12.});
+        return true;
+    }
+
+    unsigned reloading_pistols(double now) const {
+        unsigned blocked=0;
+        for(unsigned hand=0;hand<2;++hand){
+            const auto& track=hands_[hand];
+            if(track.reload && (!track.reload->started ||
+                    (track.active && track.active->elapsed(now)<track.active->clip.duration)))blocked|=1u<<hand;
+        }
+        return blocked;
+    }
+
+    bool predict_pistol_reload(uint32_t actor,const EntityState& own,unsigned hands,unsigned hand,
+                               uint64_t input,uint64_t fire_press,uint64_t shot_floor,double now,bool after_shot){
+        if(weapon_!=1 || !input || hand>=2 || !(hands&(1u<<hand)) || (reloading_pistols(now)&(1u<<hand)))return false;
+        const auto event=hands==3?Event::reload_dual_pistol:Event::reload_single_pistol;
+        if(!after_shot && !start(actor,own,1,hand,event,input,now,false))return false;
+        // The final bullet selects clip 4. On the next PAL controller tick
+        // the empty hand requests its regular reload, including while held.
+        hands_[hand].reload=Reload{event,input,fire_press,shot_floor,now+(after_shot?.01:0.),!after_shot,false};
+        return true;
+    }
+
+    unsigned manual_pistol_reload(uint32_t actor,const EntityState& own,LocalWeaponStatus weapon,
+                                  LocalPistolState pistol,uint64_t input,uint64_t fire_press,
+                                  uint64_t acknowledged,uint64_t shot_floor,double now){
+        if(!input || input<=reload_seen_)return 0;
+        reload_seen_=input;
+        if(weapon.weapon!=1 || acknowledged>=input)return 0;
+        unsigned started=0;
+        for(unsigned hand=0;hand<2;++hand)if((pistol.reloadable&(1u<<hand)) &&
+            predict_pistol_reload(actor,own,weapon.available,hand,input,fire_press,shot_floor,now,false))started|=1u<<hand;
+        return started;
+    }
+
+    bool confirm_pistol_reload(unsigned hand,Event event,uint64_t fire_press,uint64_t sequence,uint64_t acknowledged){
+        if(hand>=2)return false;
+        auto& reload=hands_[hand].reload;
+        if(!reload || reload->confirmed || reload->event!=event || sequence<=reload->after_shot ||
+           fire_press!=reload->fire_press || acknowledged<reload->input)return false;
+        reload->confirmed=true;
         return true;
     }
 
@@ -174,7 +253,8 @@ public:
     }
 
     void draw(PPCContext& context,uint32_t actor,const EntityState& latest,
-              EntityState& visible,LocalWeaponStatus status,double now,std::optional<WeaponGaitInput> gait_input){
+              EntityState& visible,LocalWeaponStatus status,double now,std::optional<WeaponGaitInput> gait_input,
+              LocalPistolState pistol={},uint64_t acknowledged=0){
         if(!actor || latest.id!=actor_ || visible.id!=actor_ || status.weapon!=weapon_)return;
         const auto selected=visible.properties.find("weapon_model_slot");
         const auto* slot=selected==visible.properties.end()?nullptr:std::get_if<int64_t>(&selected->second);
@@ -186,6 +266,8 @@ public:
         else gait_={};
         for(unsigned hand=0;hand<hands_.size();++hand){
             if(!(status.available&(1u<<hand)))continue;
+            if(weapon_==4 && minigun_[hand].updated)
+                visible.properties["weapon_model"+std::to_string(hand)+"_local_spin"]=float(minigun_[hand].degrees);
             if(offset){
                 const auto prefix="weapon_model"+std::to_string(hand)+"_row";
                 PresentationMatrix root;
@@ -195,6 +277,11 @@ public:
                 }
             }
             auto& track=hands_[hand];
+            if(track.reload && !track.reload->started && now>=track.reload->begin){
+                const auto pending=*track.reload;
+                if(start(actor,latest,1,hand,pending.event,pending.input,pending.begin,false))track.reload->started=true;
+                else track.reload.reset();
+            }
             const auto key="weapon_model"+std::to_string(hand)+"_bone_matrices";
             const auto found=visible.properties.find(key);
             auto* output=found==visible.properties.end()?nullptr:std::get_if<std::vector<float>>(&found->second);
@@ -213,15 +300,27 @@ public:
                     if(age>=duration)track.active.reset();
                     continue;
                 }
+                // The draw hook can temporarily lack a usable guest stack.
+                // Keep the local clock running and retry at the current time.
+                if(weapon_==1 && (current.clip.logical==3 || current.clip.logical==5) && age<duration){
+                    if(track.terminal.size()==output->size())*output=track.terminal;
+                    continue;
+                }
                 track.active.reset();
                 track.previous.reset();
                 track.terminal.clear();
             }
             if(track.terminal.size()!=output->size() || now-track.touched>=12.){
+                track.reload.reset();
                 track.previous.reset();
                 continue;
             }
-            if((status.firing&(1u<<hand)) || track.held_press){
+            // After local completion the host can still be showing an earlier
+            // frame of this same reload. Keep the final native pose through it.
+            const bool wait_reload=track.reload && (acknowledged<track.reload->input ||
+                                                    (pistol.reloading&(1u<<hand)));
+            if(track.reload && track.reload->confirmed && !wait_reload)track.reload.reset();
+            if(wait_reload || (status.firing&(1u<<hand)) || track.held_press){
                 *output=track.terminal;
             }else{
                 // Avoid sampling an older buffered firing pose once the host

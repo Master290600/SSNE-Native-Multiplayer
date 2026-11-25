@@ -20,7 +20,7 @@
 #include <vector>
 using namespace port::coop;
 namespace {
-unsigned checks=0,calls=0,starts=0,stops=0,ticks=0;
+unsigned checks=0,calls=0,starts=0,stops=0,ticks=0,sparkle_ticks=0;
 bool replica=true;
 std::vector<SSNEFuncEntry> entries;
 std::map<int64_t,uint32_t> references;
@@ -103,6 +103,13 @@ void ssne_call(PPCContext&c,uint32_t address){
     mem_write32(mem_read32(c.r[3]+0x60)+0x20,active);
     return;
   }
+  if(address==0x800D20E8){
+    ++sparkle_ticks;
+    check(mem_read32(c.r[3]+0x2D4)==1 && u2f(mem_read32(c.r[3]+0x20))==11.f,
+          "Sparkle regression did not update a disabled emitter older than ten seconds");
+    check(c.ps0[1]==c.ps1[1]&&c.ps0[1]==double(.02f),"Wrong ambient sparkle dt");
+    return;
+  }
   for(unsigned kind=1;kind<=5;++kind)
     if(address==native_particle_class(kind)->update){
       ++ticks;
@@ -110,6 +117,33 @@ void ssne_call(PPCContext&c,uint32_t address){
       return;
     }
   throw std::runtime_error("Unexpected native call, mission dispatch or damage");
+}
+static void disabled_sparkle_clock(PPCContext& c,uint32_t emitter){
+  constexpr uint32_t manager=0x80700000,node=0x80700100,mesh=0x80700200,vertices=0x80700300;
+  mem_write32(0x802ABAB8,manager);mem_write32(manager,node);mem_write32(manager+4,1);
+  mem_write32(node,emitter);mem_write32(node+4,0);mem_write32(node+8,0);
+  mem_write32(emitter+0x2C,mesh);mem_write32(emitter+0x2D4,1);
+  mem_write32(mesh,0x8021DEC8);mem_write32(mesh+0x3C,1);mem_write32(mesh+0x60,vertices);
+  signature(0x800CE920,0x9421FF08);
+  signature(0x801BA380,0);signature(0x801BA334,0);
+  for(auto [address,value]:{std::pair{0x80214EF8u,0x3F4CCCCDu},{0x80214F0Cu,0x3F19999Au},
+                          {0x80214EFCu,0x3F800000u},{0x80214F00u,0x3F000000u},
+                          {0x80214F04u,0x3CF5C28Fu},{0x80214F08u,0u}})
+    mem_write32(address,value);
+  std::string error;
+  mem_write32(emitter+0x20,f2u(11.f));
+  const auto before=calls;
+  check(ssne::update_native_pickup_ambient(c,.02f,error),"Legal disabled sparkle clock above ten seconds rejected");
+  check(calls==before+1&&sparkle_ticks==1,"Ambient update did not tick exactly one disabled sparkle");
+  for(float invalid:{std::numeric_limits<float>::quiet_NaN(),-1.f}){
+    mem_write32(emitter+0x20,f2u(invalid));
+    check(!ssne::update_native_pickup_ambient(c,.02f,error)&&calls==before+1,
+          "Invalid sparkle clock reached a partial native update");
+  }
+  mem_write32(emitter+0x20,f2u(11.f));mem_write32(mesh+0x60,0);
+  check(!ssne::update_native_pickup_ambient(c,.02f,error)&&calls==before+1,
+        "Invalid sparkle mesh reached a partial native update");
+  mem_write32(0x802ABAB8,0);
 }
 int main(){
   try{
@@ -184,6 +218,7 @@ int main(){
           "Null guest RAM reached native particle update");
     ssne::g_ram=ram.get();
     check(starts==7&&stops==7,"Enable/Disable count differs from flag changes");
+    disabled_sparkle_clock(c,mem_read32(objects[0]+0x60));
     std::cout<<"PASS checks="<<checks<<" starts="<<starts<<" stops="<<stops
              <<" visual_ticks="<<ticks<<" no_mission_or_damage_calls=true\n";
     return 0;

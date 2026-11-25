@@ -103,7 +103,7 @@ uint64_t lobby_copy_sequence=0;
 NativeInvitationCopyState lobby_copy_state=NativeInvitationCopyState::Idle;
 std::chrono::steady_clock::time_point lobby_copy_feedback_until{};
 std::mutex text_mutex;std::deque<std::pair<unsigned,std::string>> text_events;
-std::string pending_custom_level_error;std::atomic<bool> custom_level_error_pending{false};
+std::string pending_session_error;std::atomic<bool> session_error_pending{false};
 std::mutex custom_map_mutex;NativeCustomMapProgress custom_map_progress;
 std::atomic<NativeCustomMapPhase> custom_map_phase{NativeCustomMapPhase::None};
 std::atomic<bool> custom_map_cancel{false};
@@ -530,7 +530,7 @@ void release_transfer_pause(PPCContext& c){
     else{call(c,0x800F643C,owner);mem_write32(c.r[13]-0x765c,mem_read32(c.r[13]-0x765c)&~(1u<<slot));in_pause=false;}
 }
 void show_custom_map_progress(PPCContext& c){
-    if(host() || !custom_map_busy() || page==Page::Connecting || custom_level_error_pending)return;
+    if(host() || !custom_map_busy() || page==Page::Connecting || session_error_pending)return;
     const auto scene=mem_read32(0x802DB7E8);
     if(scene==4){
         // The frontend GUI may already have been freed when the host changes
@@ -638,7 +638,7 @@ void configure_invitation_host(PPCContext& c){
     }
     setup_seen=false;main_idle_frames=0;handoff_release=true;close(c,0);
 }
-FrontText failure(){if(error=="invalid-invite")return FrontText::InviteInvalid;if(error=="host failed")return FrontText::HostFailed;if(error.starts_with("invite:"))return FrontText::InviteFailed;if(error.starts_with("custom-level:"))return FrontText::CustomLevelUnavailable;if(error=="lan-expired")return FrontText::LanExpired;if(error=="invalid-address")return FrontText::InvalidAddress;if(error=="invalid-pin")return FrontText::InvalidPin;if(error=="invalid-port")return FrontText::InvalidPort;if(error=="lost:timeout")return FrontText::ConnectionTimeout;if(error=="lost")return FrontText::Lost;if(error.find("differs")!=std::string::npos || error.find("PIN")!=std::string::npos)return FrontText::Version;if(error.find("full")!=std::string::npos)return FrontText::Full;if(error=="invalid")return FrontText::Invalid;return FrontText::Failed;}
+FrontText failure(){if(error=="invalid-invite")return FrontText::InviteInvalid;if(error=="host failed")return FrontText::HostFailed;if(error.starts_with("invite:"))return FrontText::InviteFailed;if(error.starts_with("custom-level:"))return FrontText::CustomLevelUnavailable;if(error.starts_with("native-setup:"))return FrontText::NativeSetupFailed;if(error=="lan-expired")return FrontText::LanExpired;if(error=="invalid-address")return FrontText::InvalidAddress;if(error=="invalid-pin")return FrontText::InvalidPin;if(error=="invalid-port")return FrontText::InvalidPort;if(error=="lost:timeout")return FrontText::ConnectionTimeout;if(error=="lost")return FrontText::Lost;if(error.find("differs")!=std::string::npos || error.find("PIN")!=std::string::npos)return FrontText::Version;if(error.find("full")!=std::string::npos)return FrontText::Full;if(error=="invalid")return FrontText::Invalid;return FrontText::Failed;}
 std::shared_ptr<const ssne::CustomCrosshairImage> online_icon_image(){
     // Optional artwork is extracted locally from the user's PS2 disc. The
     // executable/source package contains no original game pixels.
@@ -829,7 +829,7 @@ bool native_frontend_text_active(){return editing!=Edit::None;}
 bool native_frontend_pending_actions(){
     if(visible.load() || paused.load() || page!=Page::Closed || editing.load()!=Edit::None ||
        hotkey.load() || action!=99 || return_main_requested.load() ||
-       handoff_release.load() || changing || notify_error || result_overlay || custom_level_error_pending.load() || custom_map_phase.load()!=NativeCustomMapPhase::None)return true;
+       handoff_release.load() || changing || notify_error || result_overlay || session_error_pending.load() || custom_map_phase.load()!=NativeCustomMapPhase::None)return true;
     std::lock_guard lock(text_mutex);return !text_events.empty();
 }
 void native_frontend_return_main(){waiting_for_host_world=false;transfer_lobby_gui=0;return_main_requested=true;next_back={};}
@@ -840,13 +840,21 @@ void native_frontend_finish_join(PPCContext& c){
 void native_frontend_disconnected(const std::string& reason){
     waiting_for_host_world=false;
     transfer_lobby_gui=0;
-    if(custom_level_error_pending.load() || error.starts_with("custom-level:") || error=="cancelled")return;
+    if(session_error_pending.load() || error.starts_with("custom-level:") || error.starts_with("native-setup:") || error=="cancelled")return;
     native_frontend_custom_map_progress({});
     error=reason.starts_with("No cooperative data received") || reason.starts_with("No cooperative send progress")
         ? "lost:timeout" : "lost";
     notify_error=true;
 }
-void native_frontend_custom_level_error(std::string message){transfer_lobby_gui=0;std::lock_guard lock(text_mutex);pending_custom_level_error=message.substr(0,256);custom_level_error_pending=true;}
+static void queue_session_error(std::string reason){
+    transfer_lobby_gui=0;
+    std::lock_guard lock(text_mutex);
+    if(session_error_pending)return;
+    pending_session_error=std::move(reason);
+    session_error_pending=true;
+}
+void native_frontend_custom_level_error(std::string message){queue_session_error("custom-level:"+message.substr(0,256));}
+void native_frontend_bootstrap_error(const std::string& message){queue_session_error("native-setup:"+message.substr(0,256));}
 void native_frontend_custom_map_progress(NativeCustomMapProgress progress){
     std::lock_guard lock(custom_map_mutex);
     if(progress.phase==NativeCustomMapPhase::None)custom_map_cancel=false;
@@ -947,11 +955,12 @@ bool native_frontend_mouse_event(PPCContext& c,uint32_t owner,uint32_t,uint16_t 
 }
 void native_frontend_prepare_results_close(PPCContext& c){retire_result_overlay(c,true);}
 void native_frontend_frame(PPCContext& c){
-    if(custom_level_error_pending.exchange(false)){
-        std::string message;{std::lock_guard lock(text_mutex);message.swap(pending_custom_level_error);}
+    if(session_error_pending.load()){
+        std::string reason;{std::lock_guard lock(text_mutex);reason.swap(pending_session_error);session_error_pending=false;}
         native_frontend_custom_map_progress({});release_transfer_pause(c);
         if(active() && services.stop)services.stop();
-        error="custom-level:"+message;notify_error=true;ssne::log_message("[custom-level-error] "+message);
+        error=std::move(reason);notify_error=true;
+        if(error.starts_with("custom-level:"))ssne::log_message("[custom-level-error] "+error.substr(13));
     }
     custom_level_menu_frame(c);
     show_custom_map_progress(c);

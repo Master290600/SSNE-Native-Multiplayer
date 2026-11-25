@@ -6,6 +6,7 @@
 #include "custom_map_session.h"
 #include "native_boss_hud_mission.h"
 #include "native_lifecycle.h"
+#include "native_campaign_verification.h"
 #include "native_vehicle.h"
 #include "native_presentation.h"
 #include "native_lobby.h"
@@ -196,6 +197,15 @@ bool test_native_lifetime_checkpoint(const NativeWorld& source,const NativeWorld
 NativeSession::NativeSession(AuthoritativeServer& server,unsigned capacity,std::string level,Log log):server_(&server),log_(std::move(log)),capacity_(capacity),level_(std::move(level)) {
     ssne::set_native_results_save_host(true);observe_auto_aim_lifetimes();
     ssne::native_party_set_camera_update_gate(this,[this]{return connected_camera_updates_safe();});
+    ssne::native_party_set_movement_steps(this,[this](const ssne::NativeMovementStepInfo& step){
+        const auto published=server_->latest_world();
+        if(!published || published->epoch!=native_.current_epoch() || step.slot>=max_players)return ssne::NativeMovementStepDecision{};
+        const auto& player=published->players[step.slot];
+        if(!player.character || native_.local_address(player.character)!=step.actor)return ssne::NativeMovementStepDecision{};
+        return server_->take_movement_step(step.slot,ssne::native_party_spawn_revision(step.actor)+1);
+    },[this](const ssne::NativeMovementStepInfo& step,const ssne::NativeMovementCommand& command){
+        server_->complete_movement_step(step.slot,command.sequence);
+    });
     ssne::set_host_frame_pipeline_gate(this,[this]{return host_frame_pipeline_safe();});
     ssne::set_native_movie_vote_gate(true);
     for(unsigned slot=0;slot<std::min(capacity,4u);++slot){setup_["GameSetup.Player"+std::to_string(slot+1)+".Profile"]=int64_t(slot);setup_["GameSetup.Player"+std::to_string(slot+1)+".Pos"]=int64_t(slot);}
@@ -207,7 +217,9 @@ NativeSession::NativeSession(AuthoritativeServer& server,unsigned capacity,std::
 }
 NativeSession::NativeSession(AuthoritativeClient& client,Log log):client_(&client),log_(std::move(log)){ssne::set_native_results_save_host(false);observe_auto_aim_lifetimes();}
 NativeSession::~NativeSession(){
+    ssne::native_party_clear_movement_steps(this);
     cancel_save_identity_.store(true,std::memory_order_relaxed);
+    deactivate_native_credits();
     ssne::forget_native_boss_hud();clear_auto_aim_overrides();if(auto_aim_subscription_)ssne::stop_observing_native_entities(auto_aim_subscription_);ssne::clear_host_frame_pipeline_gate(this);ssne::native_party_clear_camera_update_gate(this);ssne::set_native_movie_vote_gate(false);clear_native_afk_manual_aim();ssne::disable_native_rocket_effect_capture();
 }
 void NativeSession::clear_auto_aim_overrides(){
@@ -216,6 +228,7 @@ void NativeSession::clear_auto_aim_overrides(){
     clear_native_afk_manual_aim();
 }
 void NativeSession::clear_level_controls(PPCContext* context){
+    command_movement_.reset();command_movement_stream_={};
     if(context)ssne::forget_network_pause_panel(*context);
     // LevelExit runs before the original actor/pool teardown. Retire leases
     // there, while their owners still exist; never restore old camera/menu
@@ -439,8 +452,13 @@ bool NativeSession::initialize(PPCContext& ctx,const NativeBootstrapRequest& req
     ssne::native_party_configure(request.mode==1?capacity_:4);
     std::string error;if(capacity_>2)ssne::native_party_prepare_lobby(ctx);
     if(server_ && !apply_native_lobby_skin_choices(ctx,error)){report(error);return false;}
-    if(!install_native_credits(server_!=nullptr,error)){report(error);return false;}
-    if(!ssne::install_native_rocket_effect_capture(server_!=nullptr,error)){report(error);return false;}
+    if(!install_native_credits(server_!=nullptr,error) || !ssne::install_native_rocket_effect_capture(server_!=nullptr,error)){
+        // Failed native hook checks are permanent for this executable.
+        // Leave on the next frontend frame, after this session callback returns.
+        report(error);
+        native_frontend_bootstrap_error(error);
+        return false;
+    }
     if(server_)ssne::set_native_hit_identity_resolver(native_.hit_identity_resolver());
     if(presentation_scene){
         if(presentation_scene==3)mem_write32(ctx.r[13]-0x69d4,0);
@@ -703,7 +721,7 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
         // the first returning input can precede the client's non-AFK snapshot.
         if(client_afk_auto_aim_.actor)preferences[0]=uint8_t(client_afk_auto_aim_.saved_mode);
         for(unsigned i=0;i<preferences.size();++i)preference_bits|=uint64_t(preferences[i])<<(i*8);local_preferences_.store(preference_bits);
-        if(!status.connected || !state->revision || state->level.empty()){weapon_sounds_.clear();ssne::clear_native_cutscene_presentation();replica_cutscene_id_=0;std::string why;ssne::stop_native_replica_speech(ctx,why);ssne::stop_native_weapon_loops(ctx,why);stop_native_vehicle_audio(ctx,why);return;}
+        if(!status.connected || !state->revision || state->level.empty()){weapon_sounds_.clear();ssne::clear_native_cutscene_presentation();replica_cutscene_id_=0;std::string why;ssne::stop_native_replica_speech(ctx,why);ssne::stop_native_weapon_loops(ctx,why);stop_native_vehicle_audio(ctx,why);stop_native_brush_audio(ctx,why);return;}
         if(!custom_content_ok(ctx,*state))return;
         capacity_=status.capacity;if(!configure_survival_session(state->mission))return;
         if(auto flags=state->mission.find("Session.Mods.Flags");flags!=state->mission.end())if(auto value=std::get_if<int64_t>(&flags->second)){const auto rate=state->mission.find("Session.Mods.FireMultiplier");if(rate!=state->mission.end())if(auto multiplier=std::get_if<float>(&rate->second))ssne::mod_shared_options(uint32_t(*value),*multiplier);}
@@ -741,7 +759,7 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
                 std::string error;
                 end_native_auto_aim_override(client_afk_auto_aim_);
                 native_frontend_prepare_results_close(ctx);
-                if(!ssne::clear_native_replica_results(ctx,error) || !ssne::stop_native_weapon_loops(ctx,error) || !stop_native_vehicle_audio(ctx,error)){report(error);return;}
+                if(!ssne::clear_native_replica_results(ctx,error) || !ssne::stop_native_weapon_loops(ctx,error) || !stop_native_vehicle_audio(ctx,error) || !stop_native_brush_audio(ctx,error)){report(error);return;}
                 weapon_sounds_.clear();weapon_sound_order_=0;replica_effect_time_={};replica_hud_clock_={};
                 if(!ssne::stop_native_replica_speech(ctx,error)){report(error);return;}
                 ssne::clear_native_cutscene_presentation();replica_cutscene_id_=0;
@@ -767,7 +785,7 @@ void NativeSession::tick(PPCContext& ctx,uint64_t tick) {
                 // Scene==4 can remain visible while its original loader frees
                 // the old scene. Stop presentation BEFORE queuing that loader.
                 if(!level_loading_) {
-                    if(!ssne::stop_native_weapon_loops(ctx,error) || !stop_native_vehicle_audio(ctx,error)){report(error);return;}
+                    if(!ssne::stop_native_weapon_loops(ctx,error) || !stop_native_vehicle_audio(ctx,error) || !stop_native_brush_audio(ctx,error)){report(error);return;}
                     weapon_sounds_.clear();weapon_sound_order_=0;replica_effect_time_={};replica_hud_clock_={};
                 }
                 end_native_auto_aim_override(client_afk_auto_aim_);
@@ -973,26 +991,45 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
         auto walk_sweep=[&](const BotPoint& from,const BotPoint& to,float radius,ssne::NativeSphereResult& result,std::string& why){
             if(!ssne::native_world_sphere(context,from,to,radius,result,why))return false;
             if(bot_distance(result.position,to)<.15f)return true;
-            const float rise=to[1]-from[1],limit=std::min(.6f,radius-.3f);
-            if(rise<=.03f || rise>limit+.02f)return true; // retain a native slide for the caller to assess
-            auto raised=from;raised[1]=to[1];ssne::NativeSphereResult lift,landing;
-            if(!ssne::native_world_sphere(context,from,raised,radius,lift,why) || bot_distance(lift.position,raised)>.1f)return true;
-            if(!ssne::native_world_sphere(context,raised,to,radius,landing,why) || bot_distance(landing.position,to)>.15f)return true;
-            result=std::move(landing);return true;
+            const float limit=walking_step_limit(radius);
+            const float rise=to[1]-from[1];
+            // The path search can check many edges in one decision. Use the
+            // original step limit with checked headroom and landing, without
+            // replaying several physics ticks for every candidate edge.
+            if(rise>.03f && rise<=limit+.02f){
+                auto raised=from;raised[1]=to[1];ssne::NativeSphereResult lift,landing;
+                if(ssne::native_world_sphere(context,from,raised,radius,lift,why) && bot_distance(lift.position,raised)<=.1f &&
+                   ssne::native_world_sphere(context,raised,to,radius,landing,why) && bot_distance(landing.position,to)<=.15f){
+                    result=std::move(landing);return true;
+                }
+                if(!why.empty())return false;
+            }else if(rise<-.03f && rise>=-limit-.02f){
+                // The native player walks over a riser before settling.
+                // Sweeping diagonally downward can instead hit the old tread.
+                auto rim=to;rim[1]=from[1];ssne::NativeSphereResult across,landing;
+                if(ssne::native_world_sphere(context,from,rim,radius,across,why) && bot_distance(across.position,rim)<=.1f &&
+                   ssne::native_world_sphere(context,rim,to,radius,landing,why) && bot_distance(landing.position,to)<=.15f){
+                    result=std::move(landing);return true;
+                }
+                if(!why.empty())return false;
+            }
+            return true; // retain a native slide for the caller to assess
         };
         auto route_clear=[&](const std::array<float,3>& goal){
             const float distance=std::hypot(goal[0]-p[0],goal[2]-p[2]);
-            if(distance<.15f || distance>((server_->bot_mask()&(1u<<slot))?65.f:12.f) || std::abs(goal[1]-p[1])>.6f)return false;
+            if(distance<.15f || distance>((server_->bot_mask()&(1u<<slot))?65.f:12.f))return false;
             const auto radius=ssne::native_player_collision_radius(world.client.id);if(!radius)return false;
+            const float limit=walking_step_limit(*radius);
+            if(std::abs(goal[1]-p[1])>limit)return false;
             ssne::NativeSphereResult path;std::string why;
-            if(!ssne::native_world_sphere(context,p,goal,*radius,path,why) || std::hypot(path.position[0]-goal[0],path.position[2]-goal[2])>.15f || std::abs(path.position[1]-goal[1])>.3f)return false;
+            if(!walk_sweep(p,goal,*radius,path,why) || std::hypot(path.position[0]-goal[0],path.position[2]-goal[2])>.15f || std::abs(path.position[1]-goal[1])>.3f)return false;
             const unsigned steps=unsigned(std::ceil(distance/1.25f));float previous_floor=0;
             for(unsigned step=0;step<=steps;++step){
                 const float t=float(step)/steps;std::array<float,3> above,below;
                 for(unsigned i=0;i<3;++i)above[i]=p[i]+t*(goal[i]-p[i]);
                 below=above;above[1]+=.5f;below[1]-=2.f;
                 std::optional<ssne::NativeSegmentHit> floor;
-                if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.7f || above[1]-.5f-floor->position[1]>*radius+.5f || (step && std::abs(floor->position[1]-previous_floor)>.5f))return false;
+                if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.7f || above[1]-.5f-floor->position[1]>*radius+limit || (step && std::abs(floor->position[1]-previous_floor)>limit))return false;
                 previous_floor=floor->position[1];
             }
             if(log_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES"))log_("[coop-afk-route-shortcut] slot="+std::to_string(slot)+" distance="+std::to_string(distance)+" supported_samples="+std::to_string(steps+1));
@@ -1080,26 +1117,59 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
         }
         if(!swimming && (input.pad.stick_x!=128 || input.pad.stick_y!=128)){
             const float right=(int(input.pad.stick_x)-128)/128.f,forward=(int(input.pad.stick_y)-128)/128.f;
-            auto next=p;next[0]+=.8f*(right*std::cos(world.yaw)+forward*std::sin(world.yaw));next[2]+=.8f*(-right*std::sin(world.yaw)+forward*std::cos(world.yaw));
+            const bool precise_follow=human_route.has_value() && !automated;
+            float distance=.8f;
+            if(precise_follow && movement_waypoint){
+                const float remaining=std::hypot((*movement_waypoint)[0]-p[0],(*movement_waypoint)[2]-p[2]);
+                distance=std::clamp(remaining/.8f,.25f,distance);
+            }
+            auto next=p;next[0]+=distance*(right*std::cos(world.yaw)+forward*std::sin(world.yaw));next[2]+=distance*(-right*std::sin(world.yaw)+forward*std::cos(world.yaw));
             std::optional<ssne::NativeSegmentHit> floor;ssne::NativeSphereResult path;std::string why;const auto radius=ssne::native_player_collision_radius(world.client.id);
             auto ground_above=p,ground_below=p;ground_above[1]+=.5f;ground_below[1]-=2.f;std::optional<ssne::NativeSegmentHit> ground;
-            const bool supported=radius && ssne::native_world_segment(context,ground_above,ground_below,ground,why) && ground && ground->normal[1]>=.7f && p[1]-ground->position[1]<=*radius+.5f;
+            const float step_limit=radius?walking_step_limit(*radius):0.f;
+            const bool floor_supported=radius && ssne::native_world_segment(context,ground_above,ground_below,ground,why) && ground && ground->normal[1]>=.7f && p[1]-ground->position[1]<=*radius+step_limit;
+            const bool native_supported=radius && mem_read32(native_actor+0x340)==1 &&
+                (mem_read32(native_actor+0x6D0) || u2f(mem_read32(native_actor+0x708))>0.f);
+            const bool supported=floor_supported || native_supported;
+            const float ground_height=floor_supported?ground->position[1]:p[1]-radius.value_or(0.f);
             auto resolve=[&](const std::array<float,3>& wanted,std::array<float,3>& accepted){
                 if(!supported)return false;
                 auto target=wanted,above=wanted,below=wanted;above[1]+=1.5f;below[1]-=2.f;
-                if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.725f || floor->position[1]<ground->position[1]-.5f || floor->position[1]>ground->position[1]+std::min(.6f,*radius-.3f))return false;
+                if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.725f || floor->position[1]<ground_height-step_limit || floor->position[1]>ground_height+step_limit)return false;
                 const float centre_y=floor->position[1]+*radius/std::max(.725f,floor->normal[1])+.02f;if(centre_y>p[1])target[1]=centre_y;
                 if(!walk_sweep(p,target,*radius,path,why))return false;
                 const float dx=path.position[0]-p[0],dz=path.position[2]-p[2],wx=wanted[0]-p[0],wz=wanted[2]-p[2];
-                const auto travel=std::hypot(dx,dz);
+                const auto travel=std::hypot(dx,dz),wanted_travel=std::hypot(wx,wz);
                 // Native collision correction may slide along a wall. Follow
                 // that resolved direction using ordinary input, never teleport.
-                if(travel<.05f || travel>std::hypot(wx,wz)+.05f || dx*wx+dz*wz<.02f || std::abs(path.position[1]-p[1])>.6f)return false;
+                const float minimum_progress=precise_follow?.035f*wanted_travel:.02f;
+                if(travel<.05f || travel>wanted_travel+.05f || dx*wx+dz*wz<minimum_progress || std::abs(path.position[1]-p[1])>step_limit+.02f)return false;
                 above=below=path.position;above[1]+=1.5f;below[1]-=2.f;
-                if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.7f || floor->position[1]<ground->position[1]-.5f || floor->position[1]>ground->position[1]+.6f)return false;
+                if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.7f || floor->position[1]<ground_height-step_limit || floor->position[1]>ground_height+step_limit)return false;
                 accepted=path.position;return true;
             };
-            std::array<float,3> accepted{};bool safe=resolve(next,accepted);
+            std::array<float,3> accepted{};
+            bool safe=false;
+            if(native_recovery){
+                const float dx=(*native_recovery)[0]-p[0],dz=(*native_recovery)[2]-p[2];
+                // A teammate or combat input can steer away from the tested
+                // path. Only reuse the preview when input still follows it.
+                if(dx*(next[0]-p[0])+dz*(next[2]-p[2])>.01f){
+                    accepted=*native_recovery;
+                    safe=true;
+                }
+            }
+            if(!safe)safe=resolve(next,accepted);
+            if(!safe && precise_follow){
+                // The long lookahead can hit the far side of a sharp corner
+                // while a short movement still reaches its clear approach.
+                for(float fraction:{.6f,.35f}){
+                    auto shorter=p;
+                    shorter[0]+=(next[0]-p[0])*fraction;
+                    shorter[2]+=(next[2]-p[2])*fraction;
+                    if(resolve(shorter,accepted)){safe=true;break;}
+                }
+            }
             if(!safe){
                 const float dx=next[0]-p[0],dz=next[2]-p[2],side=slot%2?1.f:-1.f;
                 // Bounded local avoidance around a blocked step. Every option
@@ -1111,13 +1181,14 @@ void NativeSession::update_afk_controls(PPCContext& context,uint64_t tick,const 
             }
             if(safe){
                 const float dx=accepted[0]-p[0],dz=accepted[2]-p[2];
-                // Keep an ordinary walking-speed input along the safe resolved
-                // direction. Scaling by a tiny collision correction can fall
-                // below the game's stick dead zone and prevent native stepping.
-                const float scale=102.f/std::max(.01f,std::hypot(dx,dz));
+                // Slow down for a short checked edge. Retain a usable input
+                // above the original controller dead zone for the last step.
+                const float distance=std::hypot(dx,dz);
+                const float speed=precise_follow?std::clamp(distance*(102.f/.52f),48.f,102.f):102.f;
+                const float scale=speed/distance;
                 input.pad.stick_x=uint8_t(std::clamp(128+int((dx*std::cos(world.yaw)-dz*std::sin(world.yaw))*scale),0,255));
                 input.pad.stick_y=uint8_t(std::clamp(128+int((dx*std::sin(world.yaw)+dz*std::cos(world.yaw))*scale),0,255));
-                if(env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES") && log_ && std::hypot(accepted[0]-next[0],accepted[2]-next[2])>.05f)log_("[coop-afk-native-detour] slot="+std::to_string(slot)+" from="+std::to_string(p[0])+","+std::to_string(p[1])+","+std::to_string(p[2])+" resolved="+std::to_string(accepted[0])+","+std::to_string(accepted[1])+","+std::to_string(accepted[2])+" floor_y="+std::to_string(floor->position[1]));
+                if(floor && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LIFETIMES") && log_ && std::hypot(accepted[0]-next[0],accepted[2]-next[2])>.05f)log_("[coop-afk-native-detour] slot="+std::to_string(slot)+" from="+std::to_string(p[0])+","+std::to_string(p[1])+","+std::to_string(p[2])+" resolved="+std::to_string(accepted[0])+","+std::to_string(accepted[1])+","+std::to_string(accepted[2])+" floor_y="+std::to_string(floor->position[1]));
                 if(input.pad.trigger_l){auto above=p;above[1]+=1.4f;ssne::NativeSphereResult clearance;
                     if(!ssne::native_world_sphere(context,p,above,*radius,clearance,why) || clearance.position[1]-p[1]<1.2f){input.pad.buttons&=~ssne::PAD_L;input.pad.trigger_l=0;}
                 }
@@ -1152,15 +1223,28 @@ void NativeSession::update_local_shot_feedback(PPCContext& context,double now){
         !ssne::native_cutscene_presenting() && !ssne::native_movie_presenting() && !ssne::native_replica_results_presenting();
     if(!can_present)weapon={};
     local_native_weapon_motion_.bind(state.epoch,player,own->id,weapon.weapon,now);
+    const auto pistol=weapon.weapon==1?LocalPistolState::read(state.mission,player.slot):LocalPistolState{};
+    const auto manual=local_native_weapon_motion_.manual_pistol_reload(actor,*own,weapon,pistol,
+        sample.reload_pressed,sample.fire_pressed,state.input_ack[player.slot],replica_shot_sequence_,now);
+    if(manual && log_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LOCAL_WEAPON"))
+        log_("[coop-local-weapon-reload] weapon=1 input="+std::to_string(sample.reload_pressed)+
+             " hands="+std::to_string(manual)+" automatic=0");
     const auto& position=std::get<std::array<float,3>>(own->properties.at("position"));
     auto flash_native=[&](uint32_t character,unsigned type,unsigned hand,double pulse_time){
         local_native_weapon_motion_.automatic_pulse(character,*own,type,hand,sample.fire_pressed,pulse_time);
         return replica_.play_local_weapon_flash(context,character,type,hand);
     };
-    const bool loop_started=local_weapon_loop_feedback_.update(context,now,state.epoch,player,own->id,actor,position,sample,
-                                          weapon.weapon,weapon.ready|weapon.firing,can_present,flash_native);
     const bool held=can_present && sample.fire_pressed>sample.fire_released &&
         ((sample.input.pad.buttons&ssne::PAD_R) || sample.input.pad.trigger_r>=128);
+    std::array<std::optional<NativeMinigunTiming>,2> minigun{};
+    unsigned minigun_spooled=0;
+    if(weapon.weapon==4)for(unsigned hand=0;hand<2;++hand){
+        minigun[hand]=native_local_minigun_timing(actor,hand);
+        if(minigun[hand] && local_native_weapon_motion_.spin_minigun(hand,
+               held && ((weapon.ready|weapon.firing)&(1u<<hand)),now,*minigun[hand]))minigun_spooled|=1u<<hand;
+    }
+    const bool loop_started=local_weapon_loop_feedback_.update(context,now,state.epoch,player,own->id,actor,position,sample,
+                                          weapon.weapon,weapon.ready|weapon.firing,can_present,minigun,minigun_spooled,flash_native);
     if(loop_started && (weapon.weapon==0 || weapon.weapon==9))
         for(unsigned hand=0;hand<2;++hand)if((weapon.ready|weapon.firing)&(1u<<hand))
             local_native_weapon_motion_.begin_sustained(actor,*own,weapon.weapon,hand,sample.fire_pressed,now);
@@ -1172,10 +1256,16 @@ void NativeSession::update_local_shot_feedback(PPCContext& context,double now){
     if(released && log_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LOCAL_WEAPON"))
         log_("[coop-local-weapon-release] weapon="+std::to_string(weapon.weapon)+" input="+
              std::to_string(sample.fire_pressed)+" release="+std::to_string(sample.fire_released));
-    const auto repeat=local_native_weapon_motion_.pump_finished(now)?local_weapon_repeat(state.mission,player.slot):LocalWeaponRepeat{};
+    auto repeat=local_native_weapon_motion_.pump_finished(now)?local_weapon_repeat(state.mission,player.slot):LocalWeaponRepeat{};
+    if(weapon.weapon==1){
+        const unsigned blocked=local_native_weapon_motion_.reloading_pistols(now);
+        weapon.ready=(weapon.ready|pistol.last_ready)&~blocked;
+        weapon.firing&=~blocked;
+        repeat.pistol_rearm=(repeat.pistol_rearm|pistol.last_rearm)&~blocked;
+    }
     const auto hands=local_shot_feedback_.observe(state.epoch,player,own->id,state.input_ack[player.slot],
                            sample.fire_pressed,sample.fire_released,replica_shot_sequence_,weapon,now,repeat,
-                           weapon.weapon==6);
+                           weapon.weapon==6,weapon.weapon==1 && state.mission.contains(local_pistol_state_key));
     if(!hands)return;
     const auto cue=local_weapon_cue(weapon.weapon);
     if(!cue)return;
@@ -1189,6 +1279,9 @@ void NativeSession::update_local_shot_feedback(PPCContext& context,double now){
         shot.cue_flags=cue->flags;
         shot.input_press=sample.fire_pressed;
         shot.hand=hand;
+        shot.last_round=weapon.weapon==1 && ((pistol.last_round&(1u<<hand)) ||
+            (weapon.available==1 && state.mission.contains(local_pistol_state_key) &&
+             local_shot_feedback_.final_pistol_round(hand,repeat.rounds,state.input_ack[player.slot],sample.fire_pressed)));
         // A local sound has its own voice identity until the host confirms it.
         shot.sequence=local_weapon_shot_sequence(sample.fire_pressed,hand);
         shot.position=position;
@@ -1197,8 +1290,14 @@ void NativeSession::update_local_shot_feedback(PPCContext& context,double now){
         if(!(visual_hands&(1u<<hand)))continue;
         if(replica_.play_local_weapon_flash(context,actor,weapon.weapon,hand))flash|=1u<<hand;
         if(const auto motion=native_confirmed_weapon_clip_event(shot))
-            if(local_native_weapon_motion_.start(actor,*own,weapon.weapon,hand,*motion,sample.fire_pressed,now,true))
+            if(local_native_weapon_motion_.start(actor,*own,weapon.weapon,hand,*motion,sample.fire_pressed,now,true)){
                 motion_hands|=1u<<hand;
+                if(shot.last_round && local_native_weapon_motion_.predict_pistol_reload(actor,*own,weapon.available,
+                        hand,sample.fire_pressed,sample.fire_pressed,replica_shot_sequence_,now,true) &&
+                   log_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LOCAL_WEAPON"))
+                    log_("[coop-local-weapon-reload] weapon=1 input="+std::to_string(sample.fire_pressed)+
+                         " hands="+std::to_string(1u<<hand)+" automatic=1");
+            }
     }
     local_shot_feedback_.set_played(sound,flash);
     if(log_ && env_requested("SSNE_TEST_HIDDEN") && env_requested("SSNE_COOP_TRACE_LOCAL_WEAPON"))
@@ -1266,15 +1365,20 @@ void NativeSession::render_begin(PPCContext& render_context) {
                                                     now,*host_angles,low,high,ssne::mouse_look_scale(actor));
                     follow_local_camera(found->second,*own,pending,low,high);
                     const auto controls=client_->local_control();
-                    auto gait=render_local_movement(render_context,local_movement_,*presentation_applied_,*own,
-                                      found->second,actor,controls,now,float((*host_angles)[0]+pending.yaw),
-                                      std::clamp(float((*host_angles)[1]-pending.pitch),low,high));
+                    std::optional<WeaponGaitInput> gait;
+                    replica_.with_local_collision_brushes(render_context,now,status.ping_ms*.001,[&]{
+                        gait=render_local_movement(render_context,local_movement_,command_movement_,command_movement_stream_,*client_,*presentation_applied_,*own,
+                                         found->second,actor,controls,now,float((*host_angles)[0]+pending.yaw),
+                                         std::clamp(float((*host_angles)[1]-pending.pitch),low,high));
+                    });
                     if(local_weapon_view_active(*own,player,actor) &&
                        local_weapon_controls_active(controls,presentation_applied_->epoch)){
                         const auto weapon=local_weapon_status(presentation_applied_->mission,status.player.slot);
                         if(weapon.weapon==8 && presentation_applied_->mission.contains("Session.SniperScope."+std::to_string(status.player.slot)))
                             gait.reset();
-                        local_native_weapon_motion_.draw(render_context,actor,*own,found->second,weapon,now,gait);
+                        const auto pistol=weapon.weapon==1?LocalPistolState::read(presentation_applied_->mission,status.player.slot):LocalPistolState{};
+                        local_native_weapon_motion_.draw(render_context,actor,*own,found->second,weapon,now,gait,
+                                                         pistol,presentation_applied_->input_ack[status.player.slot]);
                     }
                 }
             }
@@ -1339,6 +1443,29 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         ssne::perf::set_context(std::move(diagnostic));
     }
     NativeStageTimer timing("frame",log_);
+    // Session phase changes must run before cosmetic updaters. An expired or
+    // malformed ambient emitter must not keep a replica in the previous level
+    // while the authority is already displaying its results.
+    if(client_){
+        auto results_state=client_->latest_world();
+        if(queued_ && !level_loading_ && mem_read32(ssne::game_address(0x802DB0E0))==4){
+            std::string why;
+            if(results_state->mission.contains("Session.Results.Active")){
+                ssne::NativeResults desired;desired.sequence=uint64_t(std::get<int64_t>(results_state->mission.at("Session.Results.Sequence")));desired.score=uint32_t(std::get<int64_t>(results_state->mission.at("Session.Results.Score")));
+                desired.high_score=uint32_t(std::get<int64_t>(results_state->mission.at("Session.Results.HighScore")));
+                const auto& values=std::get<std::vector<float>>(results_state->mission.at("Session.Results.Values"));if(values.size()!=13){report("Invalid original result values");return;}std::copy(values.begin(),values.end(),desired.values.begin());
+                const auto coefficients=results_state->mission.find("Session.Results.Coefficients");const auto* factors=coefficients==results_state->mission.end()?nullptr:std::get_if<std::vector<float>>(&coefficients->second);if(!factors || factors->size()!=26){report("Invalid original result coefficients");return;}std::copy(factors->begin(),factors->end(),desired.coefficients.begin());
+                const bool already_open=ssne::native_replica_results_presenting();
+                if(!ssne::apply_native_replica_results(context,desired,why)){report(why);return;}
+                if(!already_open){
+                    if(!ssne::stop_native_weapon_loops(context,why))report(why);
+                    if(!stop_native_vehicle_audio(context,why))report(why);
+                    if(!stop_native_brush_audio(context,why))report(why);
+                }
+            }else if(!ssne::clear_native_replica_results(context,why)){report(why);return;}
+        }
+        if(frame%60==0 && log_ && results_state->mission.contains("Session.Results.Active"))log_("[coop-client-results] sequence="+std::to_string(std::get<int64_t>(results_state->mission.at("Session.Results.Sequence")))+" score="+std::to_string(std::get<int64_t>(results_state->mission.at("Session.Results.Score")))+" elapsed_seconds="+std::to_string(std::get<std::vector<float>>(results_state->mission.at("Session.Results.Values"))[1]*60.f));
+    }
     struct FeatureHudFinish{std::function<void()> action;~FeatureHudFinish(){action();}} feature_hud{[&]{update_feature_hud(context);}};
     if(queued_ && !level_loading_ && (server_ || client_) && mem_read32(ssne::game_address(0x802DB0E0))==4 && mem_read32(context.r[13]-0x69d4)==1){
         const auto slot=ssne::netplay_local_player();
@@ -1346,31 +1473,38 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             std::string why;if(!ssne::update_native_combo_music(context,player.actor,why))report(why);break;
         }
     }
-    if(client_ && queued_ && !level_loading_ && mem_read32(ssne::game_address(0x802DB0E0))==4 && ssne::replica_simulation()) {
-        const auto now=std::chrono::steady_clock::now();const auto elapsed=replica_effect_time_.time_since_epoch().count()?std::chrono::duration<float>(now-replica_effect_time_).count():0.f;replica_effect_time_=now;
-        // Use the existing replica bindings even when no fresh snapshot is
-        // available. A separate clock retains full elapsed HUD time and makes
-        // repeated calls for one rendered frame harmless.
-        const auto hud_state=client_->latest_world();std::vector<uint32_t> hud_actors;
-        if(client_->status().connected && hud_state && hud_state->epoch==replica_feedback_epoch_){
-            for(const auto& [id,entity]:hud_state->entities)if(entity.kind==EntityKind::Player){const auto actor=replica_.local_address(id);if(actor)hud_actors.push_back(actor);}
-        }else replica_hud_clock_={};
-        std::string hud_error;if(!advance_native_player_huds(context,hud_actors,replica_hud_clock_,frame,now,hud_error)){report(hud_error);return;}
-        if(!ssne::advance_native_boss_hud(context,frame,now,hud_error)){
-            ssne::forget_native_boss_hud();
-            report(hud_error);
-        }
-        if(!replica_.advance_combo_huds(context,std::clamp(elapsed,0.f,60.f),hud_error)){report(hud_error);return;}
-        std::string why;bool effects_ok;{ssne::perf::Scope effects("effects");effects_ok=ssne::update_native_replica_effects(context,std::clamp(elapsed,0.f,.1f),why);}if(!effects_ok){report(why);return;}
-        if(!replica_.advance_particles(context,std::clamp(elapsed,0.f,.1f),why)){report(why);return;}
-        if(!ssne::update_native_weapon_loops(context,why)){report(why);return;}
-        if(presentation_applied_ && client_->status().connected && hud_state && presentation_applied_->epoch==hud_state->epoch && presentation_applied_->level==hud_state->level)
-            if(!update_native_vehicle_audio(context,presentation_applied_->mission,why))report(why);
-        if(!update_native_muzzle_flashes(context,std::clamp(elapsed,0.f,.1f),why)){report(why);return;}
-        update_local_shot_feedback(context,std::chrono::duration<double>(now.time_since_epoch()).count());
-        if(!replica_.advance_projectile_visuals(context,elapsed,why)){report(why);return;}
-        if(!drain_weapon_sounds(context))return;
-        if(frame%60==0 && log_)log_("[coop-rocket-effect-pool] active="+std::to_string(mem_read32(context.r[13]-0x5FB8))+" trails="+std::to_string(mem_read32(context.r[13]-0x5F38))+" particles="+std::to_string(mem_read32(context.r[13]-0x5F30)));
+    if(client_ && queued_ && !level_loading_ && mem_read32(ssne::game_address(0x802DB0E0))==4 && ssne::replica_simulation() && !ssne::native_replica_results_presenting()) {
+        // Presentation failures are reported locally. Snapshot validation and
+        // authoritative lifecycle processing below still have to advance.
+        const auto advance_presentation=[&]()->bool{
+            const auto now=std::chrono::steady_clock::now();const auto elapsed=replica_effect_time_.time_since_epoch().count()?std::chrono::duration<float>(now-replica_effect_time_).count():0.f;replica_effect_time_=now;
+            // Use the existing replica bindings even when no fresh snapshot is
+            // available. A separate clock retains full elapsed HUD time and makes
+            // repeated calls for one rendered frame harmless.
+            const auto hud_state=client_->latest_world();std::vector<uint32_t> hud_actors;
+            if(client_->status().connected && hud_state && hud_state->epoch==replica_feedback_epoch_){
+                for(const auto& [id,entity]:hud_state->entities)if(entity.kind==EntityKind::Player){const auto actor=replica_.local_address(id);if(actor)hud_actors.push_back(actor);}
+            }else replica_hud_clock_={};
+            std::string hud_error;if(!advance_native_player_huds(context,hud_actors,replica_hud_clock_,frame,now,hud_error)){report(hud_error);return false;}
+            if(!ssne::advance_native_boss_hud(context,frame,now,hud_error)){
+                ssne::forget_native_boss_hud();
+                report(hud_error);
+            }
+            if(!replica_.advance_combo_huds(context,std::clamp(elapsed,0.f,60.f),hud_error)){report(hud_error);return false;}
+            std::string why;bool effects_ok;{ssne::perf::Scope effects("effects");effects_ok=ssne::update_native_replica_effects(context,std::clamp(elapsed,0.f,.1f),why);}if(!effects_ok){report(why);return false;}
+            if(!replica_.advance_particles(context,std::clamp(elapsed,0.f,.1f),why)){report(why);return false;}
+            if(!replica_.advance_corpse_dissolves(context,std::clamp(elapsed,0.f,.1f),why)){report(why);return false;}
+            if(!ssne::update_native_weapon_loops(context,why)){report(why);return false;}
+            if(presentation_applied_ && client_->status().connected && hud_state && presentation_applied_->epoch==hud_state->epoch && presentation_applied_->level==hud_state->level)
+                if(!update_native_vehicle_audio(context,presentation_applied_->mission,why))report(why);
+            if(!update_native_muzzle_flashes(context,std::clamp(elapsed,0.f,.1f),why)){report(why);return false;}
+            update_local_shot_feedback(context,std::chrono::duration<double>(now.time_since_epoch()).count());
+            if(!replica_.advance_projectile_visuals(context,elapsed,why)){report(why);return false;}
+            if(!drain_weapon_sounds(context))return false;
+            if(frame%60==0 && log_)log_("[coop-rocket-effect-pool] active="+std::to_string(mem_read32(context.r[13]-0x5FB8))+" trails="+std::to_string(mem_read32(context.r[13]-0x5F38))+" particles="+std::to_string(mem_read32(context.r[13]-0x5F30)));
+            return true;
+        };
+        advance_presentation();
     }else{
         replica_hud_clock_={};
         if(client_)local_weapon_loop_feedback_.reset(context);
@@ -1799,6 +1933,9 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         WorldState state;state.epoch=epoch_;state.tick=frame;state.level=level_;state.mission=setup_;state.mission["Session.GameMode"]=int64_t(sample.mode);if(!move_capture)state.entities=sample.entities;
         state.mission["Session.Motion.Time"]=std::chrono::duration<float>(std::chrono::steady_clock::now()-motion_started_).count();
         const auto mods=ssne::mod_current_options();state.mission["Session.Mods.Flags"]=int64_t(unsigned(mods.god)|(unsigned(mods.ammo)<<1)|(unsigned(mods.weapons)<<2)|(unsigned(mods.no_enemies)<<3)|(unsigned(mods.rapid_fire)<<4));state.mission["Session.Mods.FireMultiplier"]=mods.fire_multiplier;
+        const auto [move_speed, jump_height] = ssne::cheat_movement_factors();
+        state.mission["Session.Mods.SpeedPercent"] = int64_t(std::lround(move_speed * 100.f));
+        state.mission["Session.Mods.JumpPercent"] = int64_t(std::lround(jump_height * 100.f));
         state.mission["Session.EnemyMultiplier"]=int64_t(ssne::enemy_multiplier());
         const auto ammo_rules=ssne::ammo_rules();
         state.mission["Session.AmmoCapacity"]=int64_t(ammo_rules.capacity);
@@ -1840,6 +1977,20 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             if(player.kind==EntityKind::Player && player.owner.slot<max_players)
                 capture_native_sniper_scope(native_.local_address(id),player.owner.slot,state.mission);
         if(!loading)capture_on_foot_motion(context,native_,sample,state.mission);
+        if(!loading && context.r[13]==0x802E22A0u){
+            const float phase=u2f(mem_read32(context.r[13]-0x7890u));
+            const float lift=u2f(mem_read32(context.r[13]-0x7898u));
+            if(std::isfinite(phase) && phase>=0.f && phase<=6.284f && std::isfinite(lift) && std::abs(lift)<=.201f){
+                std::vector<int64_t> hover{f2u(phase),f2u(lift)};
+                for(const auto& [id,entity]:sample.entities)if(entity.kind==EntityKind::Pickup){
+                    const auto object=native_.local_address(id);
+                    // Only pickups that have entered the native resting hover.
+                    if(presentation_readable(object,0x1D4) && mem_read32(object+0x120))
+                        hover.push_back(int64_t(id));
+                }
+                if(hover.size()>2)state.mission[native_pickup_hover_key]=std::move(hover);
+            }
+        }
         if(!loading){std::vector<int64_t> models;std::string why;if(!capture_native_model_states(models,why) || !capture_native_vehicles(state.mission,why)){report(why);return;}state.mission["Session.Geometry.Models"]=std::move(models);}
         if(loading){state.entities.clear();characters_={};host_ready_=false;}
         const bool presentation=sample.scene==5 || (sample.scene==3 && queued_);
@@ -1871,14 +2022,19 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             std::vector<int64_t> ids,styles;std::vector<float> values;
             for(const auto& effect:producer.rockets){if(!source_publish)break;ids.push_back(int64_t(effect.sequence));styles.push_back(effect.style);values.insert(values.end(),effect.values.begin(),effect.values.end());}
             state.mission["Session.RocketEffects.Ids"]=std::move(ids);state.mission["Session.RocketEffects.Styles"]=std::move(styles);state.mission["Session.RocketEffects.Values"]=std::move(values);
-            if(!mods.rapid_fire && !mods.ammo && !active_cutscene_vote_ && !ssne::native_results_presenting()){
-                std::vector<int64_t> weapons_ready(max_players),weapon_capacity(max_players);
+            if(!mods.rapid_fire && !active_cutscene_vote_ && !ssne::native_results_presenting()){
+                std::vector<int64_t> weapons_ready(max_players),weapon_capacity(max_players),pistols(max_players);
                 for(const auto& [id,player]:sample.entities)if(player.kind==EntityKind::Player && player.owner.slot<max_players){
                     auto hidden=player.properties.find("weapons_hidden");
                     if(hidden!=player.properties.end() && hidden->second!=Property(int64_t(0)))continue;
                     const auto actor=native_.local_address(id);
                     unsigned pistol_rearm=0;
-                    const auto weapon=capture_native_local_weapon(context,actor,&pistol_rearm);
+                    LocalPistolState pistol;
+                    const auto weapon=capture_native_local_weapon(context,actor,&pistol_rearm,&pistol);
+                    // Extra ammunition does not change the Minigun's charge,
+                    // barrel speed or cadence. Its local presentation is valid.
+                    if(mods.ammo && weapon.weapon!=4)continue;
+                    pistols[player.owner.slot]=pistol.encode();
                     weapons_ready[player.owner.slot]=weapon.encode();
                     if(weapon.weapon==1 && weapon.available==3)weapon_capacity[player.owner.slot]=pistol_rearm;
                     else if(weapon.available==1){
@@ -1889,6 +2045,7 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
                 }
                 state.mission[local_weapon_key]=std::move(weapons_ready);
                 state.mission[local_weapon_capacity_key]=std::move(weapon_capacity);
+                state.mission[local_pistol_state_key]=std::move(pistols);
             }
             // The rolling origins outlive producer acceptance. A later world
             // sample may overtake the journal batch carrying the actual cue.
@@ -2184,18 +2341,6 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
            mem_read32(ssne::game_address(0x802DB0E0))!=4 || ssne::native_results_presenting()) {
             std::string why;if(!ssne::clear_native_boss_hud(context,why))report(why);
         }
-        auto results_state=client_->latest_world();
-        if(queued_ && !level_loading_ && mem_read32(ssne::game_address(0x802DB0E0))==4){
-            std::string why;
-            if(results_state->mission.contains("Session.Results.Active")){
-                ssne::NativeResults desired;desired.sequence=uint64_t(std::get<int64_t>(results_state->mission.at("Session.Results.Sequence")));desired.score=uint32_t(std::get<int64_t>(results_state->mission.at("Session.Results.Score")));
-                desired.high_score=uint32_t(std::get<int64_t>(results_state->mission.at("Session.Results.HighScore")));
-                const auto& values=std::get<std::vector<float>>(results_state->mission.at("Session.Results.Values"));if(values.size()!=13){report("Invalid original result values");return;}std::copy(values.begin(),values.end(),desired.values.begin());
-                const auto coefficients=results_state->mission.find("Session.Results.Coefficients");const auto* factors=coefficients==results_state->mission.end()?nullptr:std::get_if<std::vector<float>>(&coefficients->second);if(!factors || factors->size()!=26){report("Invalid original result coefficients");return;}std::copy(factors->begin(),factors->end(),desired.coefficients.begin());
-                if(!ssne::apply_native_replica_results(context,desired,why)){report(why);return;}
-            }else if(!ssne::clear_native_replica_results(context,why)){report(why);return;}
-        }
-        if(frame%60==0 && log_ && results_state->mission.contains("Session.Results.Active"))log_("[coop-client-results] sequence="+std::to_string(std::get<int64_t>(results_state->mission.at("Session.Results.Sequence")))+" score="+std::to_string(std::get<int64_t>(results_state->mission.at("Session.Results.Score")))+" elapsed_seconds="+std::to_string(std::get<std::vector<float>>(results_state->mission.at("Session.Results.Values"))[1]*60.f));
         const auto received=client_->world_sample();auto state=received.world;if(!queued_ || !state->revision || state->entities.empty() || state->revision==last_revision_ || mem_read32(ssne::game_address(0x802DB0E0))!=4)return;
         if(!custom_content_ok(context,*state))return;
         if(level_loading_) {
@@ -2528,7 +2673,9 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
                     if(const auto motion=native_confirmed_weapon_clip_event(*shot,local_weapon.available)){
                         local_native_weapon_motion_.bind(state->epoch,shot_owner,shot_view->id,shot->weapon,shot_now);
                         const unsigned motion_hand=predicted_hand<2?predicted_hand:shot->hand;
-                        const bool existing=local_native_weapon_motion_.acknowledge(shot->weapon,motion_hand,*motion,shot->input_press);
+                        const bool existing=local_native_weapon_motion_.acknowledge(shot->weapon,motion_hand,*motion,shot->input_press) ||
+                            local_native_weapon_motion_.confirm_pistol_reload(shot->hand,*motion,shot->input_press,
+                                                                             shot->sequence,state->input_ack[shot_owner.slot]);
                         if(!existing)confirmed_motion=local_native_weapon_motion_.start(shot_actor,*shot_view,shot->weapon,
                             shot->hand,*motion,shot->input_press,shot_now,false);
                         if(own_flash && !flashed && (*motion==NativeLocalWeaponClipEvent::shot ||
@@ -2564,12 +2711,14 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
             std::map<uint32_t,const EntityState*> by_address;
             for(const auto& [id,e]:reconciled.entities)by_address[native_.local_address(id)]=&e;
             if(env_requested("SSNE_TEST_HIDDEN") && env_present("SSNE_COOP_CAMPAIGN_VERIFY")){
-                unsigned fields=0,differences=0,enemies=0,pickups=0,hidden_cached_glows=0;
+                unsigned fields=0,differences=0,enemies=0,pickups=0,hidden_cached_glows=0,audio_command_fields=0;
                 for(const auto& [id,e]:state->entities)if(e.kind==EntityKind::Enemy || e.kind==EntityKind::Pickup || e.kind==EntityKind::Mission || e.kind==EntityKind::Switch || e.kind==EntityKind::Destructible || e.kind==EntityKind::Door){
                     enemies+=e.kind==EntityKind::Enemy;pickups+=e.kind==EntityKind::Pickup;
                     const auto found=by_address.find(replica_.local_address(id));
                     for(const auto& [key,value]:e.properties){
-                        if(key=="spawn_position")continue;++fields;
+                        if(key=="spawn_position")continue;
+                        if(replica_detail::campaign_brush_audio_command(e.kind,key)){++audio_command_fields;continue;}
+                        ++fields;
                         bool mismatch=found==by_address.end() || !found->second->properties.contains(key) || found->second->properties.at(key)!=value;
                         // A collected pickup may retain an invisible local glow
                         // allocation for later reuse. The presentation adapter
@@ -2587,7 +2736,7 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
                         if(mismatch){++differences;static std::set<std::pair<unsigned,std::string>> reported;if(reported.emplace(e.definition,key).second)log_("[campaign-field-difference] definition="+std::to_string(e.definition)+" key="+key);}
                     }
                 }
-                log_("[campaign-verify] level="+state->level+" epoch="+std::to_string(state->epoch)+" revision="+std::to_string(state->revision)+" enemies="+std::to_string(enemies)+" pickups="+std::to_string(pickups)+" hidden_cached_glows="+std::to_string(hidden_cached_glows)+" fields="+std::to_string(fields)+" differences="+std::to_string(differences));
+                log_("[campaign-verify] level="+state->level+" epoch="+std::to_string(state->epoch)+" revision="+std::to_string(state->revision)+" enemies="+std::to_string(enemies)+" pickups="+std::to_string(pickups)+" hidden_cached_glows="+std::to_string(hidden_cached_glows)+" fields="+std::to_string(fields)+" differences="+std::to_string(differences)+" audio_command_fields="+std::to_string(audio_command_fields));
             }
             unsigned render_objects=0,render_differences=0,marker_objects=0,marker_differences=0;
             for(const auto& [id,e]:state->entities){
@@ -2674,6 +2823,12 @@ void NativeSession::frame(PPCContext& context,uint64_t frame) {
         if(!last_revision_ && log_)log_("[coop-client-first-apply] revision="+std::to_string(state->revision)+" objects="+std::to_string(result.objects));
         last_revision_=state->revision;
         presentation_applied_=state;
+        const auto movement_owner=client_->status().player;
+        if(const auto* movement_own=ClientPresentation::own(*state,movement_owner)){
+            const auto stream=movement_unsigned(movement_own->properties,"movement_stream");
+            if(stream)client_->acknowledge_movement_checkpoint({state->epoch,movement_own->id,stream},
+                movement_unsigned(movement_own->properties,"movement_ack"));
+        }
         bool reset_interpolation=false,reset_look=false;
         const auto presentation_owner=client_->status().player;
         for(const auto& sample:client_->motion_samples(presentation_revision_,state->revision)){

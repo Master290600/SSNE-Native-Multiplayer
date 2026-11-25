@@ -7,6 +7,7 @@
 
 #include <SDL.h>
 #include <SDL_opengl.h>
+#include "presentation_gl.h"
 #include <algorithm>
 #include <filesystem>
 #include <cmath>
@@ -50,7 +51,7 @@ void publish(bool enabled,int size,int opacity,bool native_color) {
 void release_preview() {
     // A replaced/destroyed context owns its old objects; never delete its numeric
     // texture ID in a different context, where it might name an unrelated object.
-    if(state.preview&&state.preview_context&&state.preview_context==SDL_GL_GetCurrentContext())glDeleteTextures(1,&state.preview);
+    if(state.preview&&state.preview_context&&state.preview_context==SDL_GL_GetCurrentContext())port::gl::DeleteTextures(1,&state.preview);
     state.preview=0;state.preview_context=nullptr;
 }
 void clear_image(int size,int opacity) {
@@ -63,20 +64,20 @@ struct UploadState {
     BindBuffer bind_buffer=nullptr;
     static constexpr GLenum names[4]={GL_UNPACK_ALIGNMENT,GL_UNPACK_ROW_LENGTH,GL_UNPACK_SKIP_ROWS,GL_UNPACK_SKIP_PIXELS};
     UploadState() {
-        glGetIntegerv(GL_TEXTURE_BINDING_2D,&texture);
-        for(unsigned i=0;i<4;++i)glGetIntegerv(names[i],&stores[i]);
-        glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING,&pbo);
+        port::gl::GetIntegerv(GL_TEXTURE_BINDING_2D,&texture);
+        for(unsigned i=0;i<4;++i)port::gl::GetIntegerv(names[i],&stores[i]);
+        port::gl::GetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING,&pbo);
         bind_buffer=reinterpret_cast<BindBuffer>(SDL_GL_GetProcAddress("glBindBuffer"));
     }
     bool prepare() {
         if(pbo&&!bind_buffer)return false;
         if(pbo)bind_buffer(GL_PIXEL_UNPACK_BUFFER,0);
-        glPixelStorei(GL_UNPACK_ALIGNMENT,1);glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
-        glPixelStorei(GL_UNPACK_SKIP_ROWS,0);glPixelStorei(GL_UNPACK_SKIP_PIXELS,0);return true;
+        port::gl::PixelStorei(GL_UNPACK_ALIGNMENT,1);port::gl::PixelStorei(GL_UNPACK_ROW_LENGTH,0);
+        port::gl::PixelStorei(GL_UNPACK_SKIP_ROWS,0);port::gl::PixelStorei(GL_UNPACK_SKIP_PIXELS,0);return true;
     }
     ~UploadState() {
-        glBindTexture(GL_TEXTURE_2D,GLuint(texture));
-        for(unsigned i=0;i<4;++i)glPixelStorei(names[i],stores[i]);
+        port::gl::BindTexture(GL_TEXTURE_2D,GLuint(texture));
+        for(unsigned i=0;i<4;++i)port::gl::PixelStorei(names[i],stores[i]);
         if(pbo&&bind_buffer)bind_buffer(GL_PIXEL_UNPACK_BUFFER,GLuint(pbo));
     }
 };
@@ -85,21 +86,21 @@ bool upload_preview() {
     if(!state.last_attempt_context) {state.preview_error="Crosshair preview is not ready.";return false;}
     if(!state.image)return false;
     // Isolate this upload from an earlier GL error without spinning indefinitely.
-    for(unsigned i=0;i<16&&glGetError()!=GL_NO_ERROR;++i){}
+    for(unsigned i=0;i<16&&port::gl::GetError()!=GL_NO_ERROR;++i){}
     GLuint texture=0;bool okay=false;
     {
         UploadState previous;
         if(!previous.prepare()){state.preview_error="Crosshair preview upload is not ready.";return false;}
-        glGenTextures(1,&texture);glBindTexture(GL_TEXTURE_2D,texture);
-        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,GLsizei(state.image->width),GLsizei(state.image->height),0,
+        port::gl::GenTextures(1,&texture);port::gl::BindTexture(GL_TEXTURE_2D,texture);
+        port::gl::TexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+        port::gl::TexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+        port::gl::TexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+        port::gl::TexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+        port::gl::TexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,GLsizei(state.image->width),GLsizei(state.image->height),0,
                      GL_RGBA,GL_UNSIGNED_BYTE,state.image->rgba.data());
-        okay=texture&&glGetError()==GL_NO_ERROR;
+        okay=texture&&port::gl::GetError()==GL_NO_ERROR;
     }
-    if(!okay) {if(texture)glDeleteTextures(1,&texture);state.preview_error="Cannot upload the crosshair preview; the original is kept.";return false;}
+    if(!okay) {if(texture)port::gl::DeleteTextures(1,&texture);state.preview_error="Cannot upload the crosshair preview; the original is kept.";return false;}
     state.preview=texture;state.preview_context=state.last_attempt_context;++state.preview_uploads;return true;
 }
 void scan_catalog() {

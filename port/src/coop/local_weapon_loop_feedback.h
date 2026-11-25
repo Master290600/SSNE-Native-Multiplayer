@@ -1,6 +1,7 @@
 #pragma once
 
 #include "authoritative_session.h"
+#include "native_lifecycle.h"
 #include "local_shot_feedback.h"
 #include "ssne/runtime.h"
 #include <deque>
@@ -27,7 +28,6 @@ class LocalWeaponLoopFeedback {
     PlayerId player_{};
     EntityId actor_=0;
     unsigned weapon_=12,attempted_=0,spin_attempted_=0;
-    double pressed_at_=0;
     std::array<Preview,2> playing_{};
     std::deque<Preview> completed_;
     std::deque<CuePreview> cues_;
@@ -99,6 +99,7 @@ public:
     bool update(PPCContext& context,double now,uint64_t epoch,PlayerId player,EntityId actor,
                 uint32_t native_actor,const std::array<float,3>& position,const LocalControlSample& sample,
                 unsigned weapon,unsigned ready_mask,bool can_present,
+                const std::array<std::optional<NativeMinigunTiming>,2>& minigun,unsigned minigun_spooled,
                 const std::function<bool(uint32_t,unsigned,unsigned,double)>& flash){
         if(epoch!=epoch_ || player!=player_ || actor!=actor_){
             reset(context);
@@ -124,7 +125,6 @@ public:
             for(auto& preview:playing_)stop(context,preview,now);
             stop_cues(context,now);
             press_=sample.fire_pressed;
-            pressed_at_=now;
             attempted_=spin_attempted_=held?0:3;
         }
         if(!held){
@@ -146,15 +146,11 @@ public:
             return started;
         }
         if(weapon!=2 && weapon!=4)return false;
-        const double charge=weapon==4?.8:0.;
-        // PAL clears the shot timer after firing. At the native 60 Hz update
-        // rate an Uzi's 1/8-second interval occupies eight ticks.
-        const double period=weapon==4?5./60.:8./60.;
         bool started=false;
         for(unsigned lane=0;lane<2;++lane){
             const unsigned bit=1u<<lane;
             auto& preview=playing_[lane];
-            if(!(ready_mask&bit)){
+            if(!(ready_mask&bit) || (weapon==4 && !minigun[lane])){
                 stop(context,preview,now);
                 stop_cues(context,now,bit);
                 continue;
@@ -163,11 +159,12 @@ public:
                 spin_attempted_|=bit;
                 started=start_cue(context,lane,409,1,position)||started;
             }
-            const bool starting=!(attempted_&bit) && now>=pressed_at_+charge;
-            // An authoritative loop may already own the voice when an Uzi is
+            const bool spooled=weapon==2 || (minigun_spooled&bit);
+            const bool starting=!(attempted_&bit) && spooled;
+            // An authoritative loop may already own the voice when a weapon is
             // equipped with fire held, or after a snapshot briefly clears
             // readiness. Its native first-person pulses still run locally.
-            if(starting || (weapon==2 && !preview.press)){
+            if(spooled && !preview.press){
                 preview.press=press_;
                 preview.origin=press_|(uint64_t(1)<<62);
                 preview.weapon=weapon;
@@ -190,6 +187,9 @@ public:
                 started=true;
             }
             if(!preview.press || now<preview.next_pulse)continue;
+            // PAL clears the shot timer after firing. The Uzi's 1/8-second
+            // interval therefore occupies eight native 60 Hz ticks.
+            const double period=weapon==4?std::ceil(60./minigun[lane]->rounds_per_second)/60.:8./60.;
             const auto pulse_time=std::max(preview.next_pulse,now-1./60.);
             preview.flash=flash(native_actor,weapon,lane,pulse_time)||preview.flash;
             preview.next_pulse+=period;

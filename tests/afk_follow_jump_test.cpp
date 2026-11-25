@@ -117,5 +117,55 @@ void perception_does_not_override_follow(){
     const auto regroup=watching.update(w,8,&eye,{},true,false,250.f,true);
     require(!watching.target() && !regroup.pad.trigger_r && regroup.pad.stick_y>128,"Distant threat displaced the human catch-up priority");
 }
+void use_short_native_waypoint_in_narrow_passage(){
+    CompanionBot bot;auto w=world({0,0,9});
+    auto checkpoint=bot.checkpoint();
+    checkpoint.moving=true;
+    checkpoint.stalled=32;
+    checkpoint.previous=w.client.position;
+    require(bot.restore_checkpoint(checkpoint),"Narrow follow checkpoint setup failed");
+    unsigned escape_checks=0;
+    const BotPoint waypoint{0,0,.3f};
+    const auto blocked_side=[&](const BotPoint&){++escape_checks;return false;};
+    const auto input=bot.update(w,8,nullptr,blocked_side,true,false,0.f,true,&waypoint);
+    require(input.pad.stick_y>128 && !input.pad.trigger_l && !escape_checks,
+            "Long stall escape blocked the short checked movement through a tight passage");
 }
-int main(){try{airborne_samples_are_not_routes();repeated_jump_corner_follow();supported_detour_survives_airborne_goal();perception_does_not_override_follow();std::cout<<"Grounded AFK follow, repeated jumps, corner/bridge detours, checkpoint retention and query bounds passed\n";return 0;}catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}}
+void skip_a_stale_corner_to_the_reachable_tread(){
+    CompanionBot bot;
+    const BotPoint follower{0,0,0},next_step{4,.65f,3.5f},landing{4,2.8f,5.8f};
+    const auto blocked=[](const BotPoint&){return false;};
+    for(const auto& step:std::array<BotPoint,6>{{{4,0,0},{4,0,2},next_step,{4,1.4f,4.1f},{4,2.1f,5},landing}})
+        bot.follow_goal(follower,step,true,blocked);
+    unsigned queries=0;
+    const auto result=bot.follow_goal(follower,landing,true,[&](const BotPoint& target){++queries;return target==next_step;});
+    require(result.position==next_step && !result.directly_reachable && queries<=3,
+            "A high breadcrumb hid the next accessible stair tread behind a stale corner");
+}
+void keep_the_first_step_around_a_tight_bend(){
+    BotNavigation nav;
+    const BotPoint start{0,0,0},first{.625f,0,0},second{.625f,0,.625f},goal{1.25f,0,1.25f};
+    auto probe=[&](const BotPoint& from,const BotPoint& to)->std::optional<BotPoint>{
+        if((from==start && to==first) || (from==first && to==second))return to;
+        return {};
+    };
+    const auto next=nav.step(start,goal,probe,54);
+    require(next==first,"A short corner waypoint was discarded before the follower took its first step");
+}
+}
+int main(){
+    try{
+        airborne_samples_are_not_routes();
+        repeated_jump_corner_follow();
+        supported_detour_survives_airborne_goal();
+        perception_does_not_override_follow();
+        use_short_native_waypoint_in_narrow_passage();
+        skip_a_stale_corner_to_the_reachable_tread();
+        keep_the_first_step_around_a_tight_bend();
+        std::cout<<"Grounded AFK follow, repeated jumps, corner/bridge detours, checkpoint retention and query bounds passed\n";
+        return 0;
+    }catch(const std::exception& error){
+        std::cerr<<error.what()<<'\n';
+        return 1;
+    }
+}

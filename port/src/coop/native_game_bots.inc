@@ -88,6 +88,7 @@ if(automated){
     brain.pickup=pickup;
 }
 std::optional<BotPoint> movement_waypoint;
+std::optional<BotPoint> native_recovery;
 if(automated || human_route){
     const bool following=human_route.has_value() && !pickup;
     const bool directly_reachable=following && human_route->directly_reachable;
@@ -108,13 +109,14 @@ if(automated || human_route){
         auto q=wanted;q[1]=floor->position[1]+*radius/std::max(.725f,floor->normal[1])+.02f;probe_rise=std::max(probe_rise,std::abs(q[1]-from[1]));
         const float distance=std::hypot(q[0]-from[0],q[2]-from[2]);
         ssne::NativeSphereResult sweep;
-        bool fast=std::abs(q[1]-from[1])<=.6f && ssne::native_world_sphere(context,from,q,*radius,sweep,why) && bot_distance(sweep.position,q)<=.3f;
+        const float step_limit=walking_step_limit(*radius);
+        bool fast=std::abs(q[1]-from[1])<=step_limit && ssne::native_world_sphere(context,from,q,*radius,sweep,why) && bot_distance(sweep.position,q)<=.3f;
         // Flat, clear edges keep their cheap sweep and support samples.
         if(fast){
             const unsigned steps=std::max(1u,unsigned(std::ceil(distance/.5f)));float previous=from[1]-*radius;
             for(unsigned step=1;step<=steps;++step){
                 const float t=float(step)/steps;for(unsigned i=0;i<3;++i)above[i]=from[i]+t*(q[i]-from[i]);below=above;above[1]+=.5f;below[1]-=2.f;
-                if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.725f || above[1]-.5f-floor->position[1]>*radius+.5f || floor->position[1]-previous>.6f || floor->position[1]-previous<-.5f){fast=false;break;}
+                if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.725f || above[1]-.5f-floor->position[1]>*radius+step_limit || std::abs(floor->position[1]-previous)>step_limit){fast=false;break;}
                 previous=floor->position[1];
             }
             if(fast){++probe_stats[5];return q;}
@@ -122,13 +124,12 @@ if(automated || human_route){
         // A coarse search edge may cross several original small stairs. Follow
         // their actual floor heights, with at most32 short segments per edge.
         const unsigned steps=std::max(1u,unsigned(std::ceil(distance/.25f)));auto current=from;
-        const float step_limit=std::min(.6f,*radius-.3f);
         for(unsigned step=1;step<=steps;++step){
             const float t=float(step)/steps;BotPoint next;
             for(unsigned i=0;i<3;++i)next[i]=from[i]+t*(q[i]-from[i]);above=below=next;above[1]+=.75f;below[1]-=2.f;
             if(!ssne::native_world_segment(context,above,below,floor,why) || !floor || floor->normal[1]<.725f){++probe_stats[1];return {};}
             next[1]=floor->position[1]+*radius/std::max(.725f,floor->normal[1])+.02f;const float rise=next[1]-current[1];
-            if(rise>step_limit+.02f || rise<-.5f){++probe_stats[2];return {};}
+            if(std::abs(rise)>step_limit+.02f){++probe_stats[2];return {};}
             const bool queried=walk_sweep(current,next,*radius,sweep,why);
             bool resolved_step=false;
             if(queried && bot_distance(sweep.position,next)>.15f){
@@ -137,7 +138,7 @@ if(automated || human_route){
                 if(travel>.025f && travel<=wanted_travel+.05f && dx*wx+dz*wz>0.f && std::abs(sweep.position[1]-current[1])<=step_limit){
                     auto support_above=sweep.position,support_below=sweep.position;support_above[1]+=.5f;support_below[1]-=2.f;
                     std::optional<ssne::NativeSegmentHit> support;
-                    resolved_step=ssne::native_world_segment(context,support_above,support_below,support,why) && support && support->normal[1]>=.725f && sweep.position[1]-support->position[1]>=*radius-.05f && sweep.position[1]-support->position[1]<=*radius+.6f;
+                    resolved_step=ssne::native_world_segment(context,support_above,support_below,support,why) && support && support->normal[1]>=.725f && sweep.position[1]-support->position[1]>=*radius-.05f && sweep.position[1]-support->position[1]<=*radius+step_limit;
                 }
             }
             if(!queried || (bot_distance(sweep.position,next)>.15f && !resolved_step)){
@@ -152,10 +153,83 @@ if(automated || human_route){
         }
         ++probe_stats[5];return current;
     };
-    if(goal==p || (goal_supported && (swimming || directly_reachable || route_clear(goal)))){
+    // The normal following distance can leave a companion parked precisely on
+    // a narrow stair or threshold. When the human walks toward that spot, use
+    // their current movement input even if contact has already stopped them.
+    if(following && radius && !swimming && std::abs(world.host.position[1]-p[1])<*radius &&
+       nearest<2.f*(*radius)+.65f){
+        const auto& pad=controls[follow].input.pad;
+        const float right=int(pad.stick_x)-128,forward=int(pad.stick_y)-128;
+        const float magnitude=std::hypot(right,forward);
+        if(magnitude>=32.f){
+            const float yaw=std::get<float>(leader->properties.at("yaw"));
+            const float x=(right*std::cos(yaw)+forward*std::sin(yaw))/magnitude;
+            const float z=(-right*std::sin(yaw)+forward*std::cos(yaw))/magnitude;
+            const float dx=p[0]-world.host.position[0],dz=p[2]-world.host.position[2];
+            const float lateral=dx*z-dz*x;
+            if(dx*x+dz*z>.1f && std::abs(lateral)<2.f*(*radius)+.1f){
+                const float side=lateral<0.f?-1.f:1.f;
+                // Make room beside the path first. A single-file passage may
+                // require backing away along it until there is space to pass.
+                const std::array<std::array<float,2>,4> offsets{{
+                    {0.f,side*.75f},{0.f,-side*.75f},{.55f,side*.55f},{.75f,0.f}
+                }};
+                for(const auto& [ahead,aside]:offsets){
+                    auto move=probe(p,{p[0]+x*ahead+z*aside,p[1],p[2]+z*ahead-x*aside});
+                    if(move && std::hypot((*move)[0]-p[0],(*move)[2]-p[2])>.27f){
+                        const float moved_x=(*move)[0]-p[0],moved_z=(*move)[2]-p[2];
+                        const float next_lateral=lateral+moved_x*z-moved_z*x;
+                        if(std::abs(next_lateral)>std::abs(lateral)+.2f || moved_x*x+moved_z*z>.25f){
+                            movement_waypoint=*move;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if(!movement_waypoint && following && radius && !directly_reachable && goal_supported && std::abs(goal[1]-p[1])>.3f){
+        // A whole staircase is higher than the limit for one step. Keep
+        // walking toward the next breadcrumb when the local tread is clear.
+        const float dx=goal[0]-p[0],dz=goal[2]-p[2],distance=std::hypot(dx,dz);
+        if(distance>.25f){
+            const float scale=std::min(1.f,.65f/distance);
+            const BotPoint wanted{p[0]+dx*scale,p[1],p[2]+dz*scale};
+            auto local=probe(p,wanted);
+            if(local && bot_distance(*local,goal)+.18f<bot_distance(p,goal))movement_waypoint=*local;
+            if(!movement_waypoint && !automated){
+                // At a stair rim a diagonal sphere sweep can be blocked by
+                // the old tread. Preview the original walking collision from
+                // the real actor's pending step, then check the landing floor.
+                const float limit=walking_step_limit(*radius);
+                ssne::NativeGroundMotionState pending;
+                for(unsigned i=0;i<pending.step.size();++i)pending.step[i]=u2f(mem_read32(native_actor+0x708u+i*4));
+                for(float angle:{0.f,.55f,-.55f}){
+                    const float x=(dx*std::cos(angle)-dz*std::sin(angle))*scale;
+                    const float z=(dx*std::sin(angle)+dz*std::cos(angle))*scale;
+                    auto preview=pending;
+                    ssne::NativeGroundMotionResult result;std::string why;
+                    if(!ssne::native_static_ground_motion(context,p,{p[0]+x,p[1],p[2]+z},*radius,.05f,preview,result,why))continue;
+                    const auto& at=result.position;
+                    const float mx=at[0]-p[0],mz=at[2]-p[2];
+                    const float progress=(mx*dx+mz*dz)/distance;
+                    if(progress<.12f || std::hypot(mx,mz)>.75f || std::abs(at[1]-p[1])>limit+.02f)continue;
+                    auto above=at,below=at;above[1]+=.2f;below[1]-=*radius+limit;
+                    std::optional<ssne::NativeSegmentHit> floor;
+                    if(ssne::native_world_segment(context,above,below,floor,why) && floor &&
+                       static_movement_contact(*floor) && floor->normal[1]>=.725f){
+                        native_recovery=at;
+                        movement_waypoint=at;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if(!movement_waypoint && (goal==p || (goal_supported && (swimming || directly_reachable || route_clear(goal))))){
         movement_waypoint=goal;
         if(brain.navigation.explored())brain.navigation={};
-    }else{
+    }else if(!movement_waypoint){
         movement_waypoint=brain.navigation.step(p,goal,probe,automated ? 48 : 24,goal_supported);
     }
     // The AFK player keeps aiming relative to the actual human and sees the

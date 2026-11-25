@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import struct
 import sys
+import tempfile
 import zipfile
 
 HERE = Path(__file__).resolve().parent
@@ -177,17 +178,57 @@ def generate(recipe, root, package, scratch):
     require(emitted==set(rows),"Incomplete staged add-on")
     return stage
 
+def remove_content(root, rows, scratch):
+    originals=local(scratch,"originals")
+    changes={}
+    for name,row in rows.items():
+        actual=current(root,name)
+        if actual==row["base"]:continue
+        require(actual is None or replaceable(row,actual),
+                f"Cannot remove modified content; no files were changed: {name}")
+        if row["base"] is not None:
+            require(current(originals,name)==row["base"],
+                    f"Missing or damaged original GameCube backup; no files were changed: {name}")
+        changes[name]=actual
+
+    # Restore the disc files, including its directory table, before removing
+    # add-on files. Backups survive an interrupted removal or later reinstall.
+    for name in sorted(changes,key=lambda n:(rows[n]["base"] is None,n)):
+        dest=local(root,name)
+        row=rows[name]
+        require(current(root,name)==changes[name],"Destination changed during removal: "+name)
+        if row["base"] is None:
+            dest.unlink()
+            continue
+        dest.parent.mkdir(parents=True,exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=scratch,delete=False) as out:
+            pending=Path(out.name)
+        try:
+            shutil.copyfile(local(originals,name),pending)
+            require(digest(pending)==row["base"],"Original changed during restoration: "+name)
+            os.replace(pending,dest)
+        finally:
+            pending.unlink(missing_ok=True)
+    require(all(current(root,n)==row["base"] for n,row in rows.items()),
+            "Final verification of the original GameCube content failed; retry Build Game.")
+    print("Original GameCube files verified. Bundled PS2 content removed.")
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--game", type=Path, required=True, help="Windows PAL installation")
-    root = parser.parse_args().game.resolve(strict=True)
+    parser.add_argument("--remove", action="store_true", help="Restore the verified original GameCube files")
+    args=parser.parse_args()
+    root = args.game.resolve(strict=True)
     recipe=read_json(HERE/"checksums.json"); rows=recipe["rows"]
     require(current(root,"build-kit/multiplayer/runtime-kit.json")==recipe["kit_sha256"],"The matching Windows multiplayer build kit is required.")
     require(current(root,"game_data/sys/main.dol")==recipe["dol_sha256"] and current(root,"game_data/files/Levels/RlevelDM_2.ssw")==recipe["donor_sha256"],"Install your supported original GameCube PAL disc first.")
-    bundle=local(HERE,"ps2-content.zip")
-    require(bundle.is_file() and digest(bundle)==recipe["content_sha256"],"The multiplayer content package is missing or damaged. Extract the complete Windows release and retry Build Game.")
     scratch=local(root,".ssne-ps2-import-237")
     with single_import(scratch):
+        if args.remove:
+            remove_content(root, rows, scratch)
+            return
+        bundle=local(HERE,"ps2-content.zip")
+        require(bundle.is_file() and digest(bundle)==recipe["content_sha256"],"The multiplayer content package is missing or damaged. Extract the complete Windows release and retry Build Game.")
         changed=[]
         for name,row in rows.items():
             actual=current(root,name)

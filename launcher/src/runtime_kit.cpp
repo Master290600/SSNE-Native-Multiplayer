@@ -46,7 +46,7 @@ std::vector<std::string> strings(const JSONValue& v,const char* key){
 void verify(const RuntimeKit& k,bool compiler,bool disc=true){
     const auto project=P(k.project_dir),kit=P(k.kit_dir);
     matches(kit/"launcher-kit.json",k.sidecar_sha256);matches(kit/"runtime-kit.json",k.descriptor_sha256);
-    if (!k.ps2_content_sha256.empty())
+    if (k.include_ps2_content && !k.ps2_content_sha256.empty())
         matches(contained(project,"Extras/PS2/checksums.json"),k.ps2_content_sha256);
     matches(P(k.recipe),k.recipe_sha256);matches(P(k.symbols),k.symbols_sha256);matches(P(k.recompiler),k.recompiler_sha256);
     if(compiler)matches(P(k.compiler),k.compiler_sha256);
@@ -64,14 +64,15 @@ std::string runtime_file_sha256(const fs::path& path,std::string& error){
     if(!f.eof()){error="cannot read complete file "+S(path);return {};}
     error.clear();return gc::Sha256::hex(h.finish());
 }
-bool load_runtime_kit(const std::string& project_dir,const std::string& data_dir,RuntimeKit& out,std::string& error,bool verify_disc){
+bool load_runtime_kit(const std::string& project_dir,const std::string& data_dir,RuntimeKit& out,std::string& error,bool verify_disc,bool include_ps2_content){
     try{
         RuntimeKit k;k.project_dir=S(fs::weakly_canonical(P(project_dir)));k.kit_dir=S(P(k.project_dir)/"build-kit/multiplayer");k.data_dir=S(fs::weakly_canonical(P(data_dir)));
         const auto project=P(k.project_dir),kit=P(k.kit_dir);auto side=json(kit/"launcher-kit.json");need(number(side,"schema")==1,"Unsupported native launcher kit schema");
         k.sidecar_sha256=runtime_text_sha256(bytes(kit/"launcher-kit.json"));k.descriptor_sha256=hash_field(side,"runtime_kit_sha256");matches(kit/"runtime-kit.json",k.descriptor_sha256);
         auto d=json(kit/"runtime-kit.json");k.build=number(d,"build");k.protocol=number(d,"protocol");
-        need(k.build >= 202 && k.protocol >= 63 && k.protocol <= 71, "Unsupported native multiplayer runtime build/protocol");
+        need(k.build >= 202 && k.protocol >= 63 && k.protocol <= 72, "Unsupported native multiplayer runtime build/protocol");
         if (side.find("ps2_content_sha256")) k.ps2_content_sha256=hash_field(side,"ps2_content_sha256");
+        k.include_ps2_content=include_ps2_content;
         k.recipe=S(contained(project,relative(str(side,"patch_recipe"))));k.recipe_sha256=hash_field(side,"patch_recipe_sha256");
         k.symbols=S(contained(project,relative(str(side,"symbols"))));k.symbols_sha256=hash_field(side,"symbols_sha256");
         k.compiler=S(project/"build-kit/toolchain/bin/clang++.exe");k.compiler_sha256=hash_field(d,"compiler_sha256");
@@ -89,6 +90,9 @@ bool load_runtime_kit(const std::string& project_dir,const std::string& data_dir
         const std::vector<std::string> order={"file:lib/CMakeFiles/ssne-port.dir/port/src/native_menu_carousel.cpp.obj","file:lib/CMakeFiles/ssne-port.dir/port/src/native_menu_mouse.cpp.obj","file:lib/CMakeFiles/ssne-port.dir/port/src/main.cpp.obj"};
         auto first=std::find(k.link_args.begin(),k.link_args.end(),order[0]);need(first!=k.link_args.end()&&size_t(k.link_args.end()-first)>=order.size()&&std::equal(order.begin(),order.end(),first),"Native carousel/mouse/main link order differs");
         k.fingerprint=runtime_text_sha256("ssne-native-launcher-build-v1\n"+k.sidecar_sha256+"\n"+k.descriptor_sha256+"\n"+k.recipe_sha256+"\n"+k.symbols_sha256+"\n"+k.dol_sha256);
+        // Keep existing installed receipts valid at the default setting.
+        if (!k.include_ps2_content && !k.ps2_content_sha256.empty())
+            k.fingerprint=runtime_text_sha256(k.fingerprint+"\nwithout-ps2-content");
         verify(k,false,verify_disc);out=std::move(k);error.clear();return true;
     }catch(const std::exception& e){error=e.what();return false;}
 }
@@ -112,11 +116,13 @@ bool runtime_build_ready(const RuntimeKit& k,const std::string& output,std::stri
         if(has_root)matches(legacy,hash);
         need(number(release,"build")==k.build&&number(release,"protocol")==k.protocol&&str(release,"entrypoint")=="native"&&hash_field(release,"kit_descriptor_sha256")==k.descriptor_sha256&&hash_field(release,"product_sha256")==hash&&hash_field(release,"entrypoint_sha256")==hash,"Native release manifest does not match its verified runtime kit/executable");
         const auto receipt=dir/"native-build.json";
-        if (!k.ps2_content_sha256.empty()) need(fs::is_regular_file(receipt),"Build Game to install the included PS2 content");
+        if (!k.ps2_content_sha256.empty()) need(fs::is_regular_file(receipt),"Choose Build Game to apply the selected PS2 content setting");
         if(fs::exists(receipt)){
             auto v=json(receipt);need(number(v,"schema")==1&&str(v,"fingerprint")==k.fingerprint&&hash_field(v,"exe_sha256")==hash&&hash_field(v,"descriptor_sha256")==k.descriptor_sha256&&(v.find("project_executable")!=nullptr)==has_root,"Native game was built with another kit or changed; choose Build Game");
             if(has_root)need(str(v,"project_executable")==native_project_exe,"Native build receipt refers to another executable");
-            if (!k.ps2_content_sha256.empty()) {
+            if (!k.include_ps2_content)
+                need(!v.find("ps2_content_sha256"),"Build Game to remove the installed PS2 content");
+            if (k.include_ps2_content && !k.ps2_content_sha256.empty()) {
                 need(v.find("ps2_content_sha256") && hash_field(v,"ps2_content_sha256")==k.ps2_content_sha256,
                      "Build Game to install the included PS2 content");
                 // Readiness is refreshed on startup, after a build and before Play.

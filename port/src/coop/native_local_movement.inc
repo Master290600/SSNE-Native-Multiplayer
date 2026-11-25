@@ -1,6 +1,6 @@
 // Host movement parameters and velocity are advisory for the local view.
 constexpr char movement_key[]="Session.OnFootMotion";
-constexpr unsigned motion_fields=10;
+constexpr unsigned motion_fields=12;
 // PAL 800C09F0..800C0A1C bounds an automatic step by the player's
 // sphere radius minus the original clearance (0.30 for the PAL player).
 float walking_step_limit(float radius){
@@ -19,6 +19,19 @@ bool plausible_tuning(const MovementTuning& p){
 float movement_parameter(uint32_t actor,unsigned field){
     const auto pointer=mem_read32(actor+field);
     return presentation_readable(pointer,0x28)?u2f(mem_read32(pointer+0x24)):0.f;
+}
+
+MovementTuning local_land_tuning(uint32_t actor,const EntityState& own){
+    const auto powers=own.properties.find("powerups");
+    const auto* powerups=powers==own.properties.end()?nullptr:std::get_if<std::vector<float>>(&powers->second);
+    const bool skates=powerups && !powerups->empty() && (*powerups)[0]!=0.f;
+    float acceleration=movement_parameter(actor,skates?0x1E8:0x1E0);
+    const auto combo=movement_unsigned(own.properties,"combo_phase");
+    if(combo==4 || combo==5)acceleration*=movement_parameter(actor,0x204);
+    return {acceleration,movement_parameter(actor,skates?0x1EC:0x1E4),
+        movement_parameter(actor,0x1F0),movement_parameter(actor,0x1F4),
+        movement_parameter(actor,0x20C),movement_parameter(actor,0x214),u2f(mem_read32(0x802DA91Cu)),
+        movement_parameter(actor,0x1E0),movement_parameter(actor,0x1E4)};
 }
 
 bool static_movement_contact(const ssne::NativeSegmentHit& hit){
@@ -131,9 +144,17 @@ void capture_on_foot_motion(PPCContext& context,NativeWorld& native,const Native
         }
         const auto radius=ssne::native_player_collision_radius(actor);
         if(!radius || mem_read32(actor+0x340)!=1 ||
-           mem_read32(actor+0x328) || mem_read32(actor+0x370) || mem_read32(actor+0x330) ||
-           mem_read32(actor+0x704) || mem_read32(actor+0x6FC) ||
+           mem_read32(actor+0x328) || mem_read32(actor+0x370) || mem_read32(actor+0x6FC) ||
            ssne::native_party_spawn_waiting(actor))continue;
+        const auto carried=mem_read32(actor+0x330),contact=mem_read32(actor+0x704);
+        if(carried || contact){
+            // PAL assigns both references to the pushing leaf. Keep normal
+            // host handling for platform riders, jump pads and other carries.
+            if(carried && carried==contact && presentation_readable(carried,0x4C) &&
+               mem_read32(carried+0x48)==0x80206868u && resting_on_landing(context,actor,*radius))
+                pack[entity.owner.slot*motion_fields]=5.f;
+            continue;
+        }
         const auto controller=mem_read32(actor+0x344);
         if(!presentation_readable(controller,0x38))continue;
         const uint32_t phase=mem_read32(controller+4);
@@ -178,6 +199,8 @@ void capture_on_foot_motion(PPCContext& context,NativeWorld& native,const Native
         pack[offset+7]=tune.air_decay;
         pack[offset+8]=tune.jump_height;
         pack[offset+9]=tune.jump_duration;
+        pack[offset+10]=movement_parameter(actor,0x1E0);
+        pack[offset+11]=movement_parameter(actor,0x1E4);
     }
     mission[movement_key]=std::move(pack);
 }
@@ -188,8 +211,15 @@ std::optional<MovementContact> local_static_step(PPCContext& context,const Movem
     std::string error;
     auto sweep=[&](const MovementPoint& start,const MovementPoint& target,ssne::NativeSphereResult& hit){
         if(!ssne::native_world_sphere(context,start,target,radius,hit,error))return false;
-        for(const auto& contact:hit.contacts)
-            if(contact.source_kind!=3 && !static_movement_contact(contact))return false;
+        for(const auto& contact:hit.contacts){
+            // PAL has already clipped the sphere against this moving brush
+            // in the confirmed door pose. Keep its lateral stop/slide just
+            // like the wall beside it. Dropping the whole step here shows
+            // an older interpolated camera for a frame at the door jamb.
+            const bool brush_side=contact.source_kind==2 && !(contact.flags&0x80000000u) &&
+                                  std::abs(contact.normal[1])<.725f;
+            if(contact.source_kind!=3 && !static_movement_contact(contact) && !brush_side)return false;
+        }
         return movement_length(movement_difference(hit.position,start))<=
                movement_length(movement_difference(target,start))+.20f;
     };
@@ -265,15 +295,8 @@ std::optional<MovementContact> local_static_step(PPCContext& context,const Movem
 }
 
 MovementIntent on_foot_intent(const LocalControlSample& controls,float yaw){
-    // The GameCube stick discards 15 counts, with full input at 72 after
-    // clamping. Normalize diagonals to the same speed as a single direction.
-    auto axis=[](uint8_t value){
-        const int centred=int(value)-128;
-        return std::copysign(float(std::clamp(std::abs(centred)-15,0,72))/72.f,float(centred));
-    };
-    float right=axis(controls.input.pad.stick_x),forward=axis(controls.input.pad.stick_y);
-    const float length=std::max(1.f,std::hypot(right,forward));
-    return {controls.sequence,controls.jump_pressed,right/length,forward/length,yaw};
+    const auto axes=native_movement_axes(controls.input.pad.stick_x,controls.input.pad.stick_y);
+    return {controls.sequence,controls.jump_pressed,axes[0],axes[1],yaw};
 }
 
 // PAL's swim controller (800AAA90) queries the two points above the
@@ -355,7 +378,8 @@ std::optional<MovementContact> local_swim_step(PPCContext& context,const Movemen
     return MovementContact{point,false};
 }
 
-std::optional<WeaponGaitInput> render_local_movement(PPCContext& context,LocalMovement& motion,const WorldState& world,
+std::optional<WeaponGaitInput> render_local_movement(PPCContext& context,LocalMovement& motion,CommandMovement& command_motion,
+        MovementStreamIdentity& command_stream,AuthoritativeClient& client,const WorldState& world,
         const EntityState& own,EntityState& visual,uint32_t actor,const LocalControlSample& controls,
         double now,float yaw,float pitch){
     const auto meta=world.mission.find(movement_key);
@@ -372,25 +396,127 @@ std::optional<WeaponGaitInput> render_local_movement(PPCContext& context,LocalMo
     }
     const auto slot=own.owner.slot;
     const float* row=pack->data()+slot*motion_fields;
-    const MovementTuning tune{row[4],row[5],row[6],row[7],row[8],row[9]};
+    const MovementTuning tune{row[4],row[5],row[6],row[7],row[8],row[9],u2f(mem_read32(0x802DA91Cu)),row[10],row[11]};
+    const auto stream=movement_unsigned(own.properties,"movement_stream");
+    const auto checkpoint=own.properties.find("movement_checkpoint");
+    const auto native_state=checkpoint==own.properties.end()?std::optional<ssne::NativeMovementState>{}:
+        decode_movement_checkpoint(checkpoint->second);
     const MovementPoint velocity{row[1],row[2],row[3]};
     const bool swimming=row[0]==3.f || row[0]==4.f;
-    const bool valid_swim=row[4]>0 && row[4]<=50 && row[5]>0 && row[5]<=50 &&
-                          row[6]>=0 && row[6]<=100 && row[7]>.01f && row[7]<=60;
-    if((swimming?!valid_swim:((row[0]!=1.f && row[0]!=2.f) || !plausible_tuning(tune))) ||
-       !(movement_length(velocity)<160.f)){
-        motion.reset();
-        return {};
-    }
     const MovementAnchor anchor{*anchor_pos,velocity,world.input_ack[slot],row[0]==1.f};
     // If polling stalls, stop accelerating on old input. Retain the local
     // capsule and its unacknowledged steps until fresh controls arrive.
     const bool fresh=now-controls.sampled_at<=.25;
     const auto intent=fresh?on_foot_intent(controls,yaw):MovementIntent{controls.sequence,0,0,0,yaw};
+    const bool land_stream=stream && native_state && !swimming;
+    const MovementStreamIdentity identity{world.epoch,own.id,stream};
+    const auto completed=movement_unsigned(own.properties,"movement_ack");
+    // Start sending the land commands as soon as the host opens the stream.
+    // The camera can finish its own launch while this history builds up.
+    if(land_stream && motion.surface_jump_active())client.movement_commands(identity,completed,now,yaw);
+    if(land_stream && !motion.surface_jump_active() && !motion.entering_water()){
+        if(command_stream!=identity){command_motion.reset();command_stream=identity;}
+        motion.reset();
+        // A supported ledge can temporarily have no published mode row.
+        const auto command_tune=plausible_tuning(tune)?tune:local_land_tuning(actor,own);
+        const auto commands=client.movement_commands(identity,completed,now,yaw);
+        CommandMovement::PeerPositions peers;
+        // The stepper caps speed at 160 units/s. Exclude players beyond the
+        // entire 10 ms replay horizon to avoid rebasing for distant motion.
+        const float reach=3.f*(*radius)+1.6f*float(commands.size());
+        for(unsigned peer_slot=0;peer_slot<max_players;++peer_slot){
+            const auto& player=world.players[peer_slot];
+            const float mode=(*pack)[peer_slot*motion_fields];
+            if(peer_slot==slot || !player.connected || !player.ready || player.spectator ||
+               (mode!=1.f && mode!=2.f))continue;
+            const auto item=world.entities.find(player.character);
+            if(item==world.entities.end() || item->second.kind!=EntityKind::Player ||
+               item->second.owner!=player.id)continue;
+            const auto& properties=item->second.properties;
+            const auto hp=properties.find("health"),pose=properties.find("position");
+            const auto* health=hp==properties.end()?nullptr:std::get_if<float>(&hp->second);
+            const auto* position=pose==properties.end()?nullptr:std::get_if<MovementPoint>(&pose->second);
+            if(health && *health>0.f && position &&
+               movement_length(movement_difference(*position,native_state->position))<=reach)
+                peers[peer_slot]=*position;
+        }
+        auto colliders=std::span<const std::optional<MovementPoint>>{};
+        if(std::any_of(peers.begin(),peers.end(),[](const auto& position){return position.has_value();}))
+            colliders=peers;
+        const auto predicted=command_motion.sample(completed,*native_state,
+            commands,command_tune,[&](const MovementPoint& from,const MovementPoint& to,bool walking,
+                                    MovementCollisionContext& query)->std::optional<MovementContact>{
+                ssne::NativeGroundMotionState state{query.ground_state};
+                ssne::NativeGroundMotionResult result;
+                std::string error;
+                if(!ssne::native_command_ground_motion(context,from,to,*radius,query.dt,walking,state,result,error,colliders))return {};
+                query.ground_state=state.step;
+                MovementContact contact{result.position,result.grounded};
+                contact.contact_kind=result.contact_kind;contact.sliding=result.sliding;
+                contact.player_contact=result.player_contact;
+                if(result.position!=from)contact.entered_water=local_medium(context,result.position)==1;
+                return contact;
+            },peers);
+        const auto axes=native_movement_axes(controls.input.pad.stick_x,controls.input.pad.stick_y);
+        const WeaponGaitInput gait{std::hypot(axes[0],axes[1]),command_motion.falling(native_state->phase==3)};
+        // Unsupported dynamic contacts retain the coherently buffered native
+        // camera. Never replace it with an unbuffered authority snapshot.
+        if(predicted){
+            const auto camera=command_motion.camera_position(now,command_tune,
+                    [&](const MovementPoint& from,const MovementPoint& to)->std::optional<MovementPoint>{
+                ssne::NativeGroundMotionState ground;
+                ssne::NativeGroundMotionResult sweep;
+                std::string error;
+                if(!ssne::native_command_ground_motion(context,from,to,*radius,0.f,true,ground,sweep,error,colliders))
+                    return {};
+                return sweep.position;
+            });
+            auto offset=movement_difference(camera,*shown);
+            if(const auto compression=visual.properties.find("camera_head_compression");compression!=visual.properties.end()){
+                if(const auto* buffered=std::get_if<float>(&compression->second)){
+                    const auto local=command_motion.head_compression().value_or(native_state->curve[5]);
+                    offset[1]+=*buffered-local;
+                }
+            }
+            for(const char* prefix:{"camera_row","weapon_model0_row","weapon_model1_row"}){
+                PresentationMatrix matrix;
+                if(!presentation_matrix(visual.properties,prefix,matrix))continue;
+                for(unsigned axis=0;axis<3;++axis)matrix[axis*4+3]+=offset[axis];
+                put_presentation_matrix(visual.properties,prefix,matrix);
+            }
+            return gait;
+        }
+        if(!command_motion.water_entry())return gait;
+        const auto& entry=*command_motion.water_entry();
+        motion.enter_water(now,anchor,intent,entry.position,entry.velocity);
+    }
+    command_motion.reset();command_stream={};
+    const bool valid_swim=row[4]>0 && row[4]<=50 && row[5]>0 && row[5]<=50 &&
+                          row[6]>=0 && row[6]<=100 && row[7]>.01f && row[7]<=60;
+    const bool brush_push=row[0]==5.f;
+    const auto health=own.properties.find("health");
+    const auto* hitpoints=health==own.properties.end()?nullptr:std::get_if<float>(&health->second);
+    const bool transient_contact=row[0]==0.f && hitpoints && *hitpoints>0.f &&
+                                 mem_read32(actor+0x340)==1 && !ssne::native_party_spawn_waiting(actor);
+    if((swimming && !valid_swim) ||
+       (!swimming && !brush_push && !transient_contact && !motion.entering_water() && !motion.leaving_water() &&
+            ((row[0]!=1.f && row[0]!=2.f) || !plausible_tuning(tune))) ||
+       !(movement_length(velocity)<160.f)){
+        motion.reset();
+        return {};
+    }
+    const auto dry_tune=swimming || !plausible_tuning(tune)?local_land_tuning(actor,own):tune;
     SwimInput swim;
     swim.capsule_diameter=2.f * (*radius);
+    if(plausible_tuning(dry_tune)){
+        // The native swim controller uses a launch velocity, separate from
+        // the authored jump-height curve used by a standing player.
+        const float speed=u2f(mem_read32(0x80210F98u));
+        if(std::isfinite(speed) && speed>0.f && speed<=50.f)swim.surface_jump_speed=speed;
+    }
     {
-        swim.surface=row[0]==4.f;
+        const auto local=motion.swimming_position();
+        swim.surface=local?at_swim_surface(context,*local).value_or(row[0]==4.f):row[0]==4.f;
         if(swim.surface && (intent.right<0 || pitch<.52359879f))pitch=0;
         const float forward=(swimming?row[4]:movement_parameter(actor,0x1F8))*intent.forward;
         const float side=(swimming?row[5]:movement_parameter(actor,0x1FC))*intent.right;
@@ -402,14 +528,35 @@ std::optional<WeaponGaitInput> render_local_movement(PPCContext& context,LocalMo
                            flat*std::cos(yaw)-side*std::sin(yaw)};
         swim.drag=swimming?row[7]:u2f(mem_read32(0x802DA920u));
     }
-    const auto predicted=motion.sample(now,anchor,intent,tune,
-        [&](const MovementPoint& from,const MovementPoint& to,bool walking)->std::optional<MovementContact>{
-            if(swimming || motion.entering_water()){
-                const auto surface=swim.surface?std::optional<float>{anchor.position[1]}:std::nullopt;
+    const auto predicted=(brush_push || (transient_contact && !motion.surface_jump_active()))?motion.follow_brush_push(now,*anchor_pos,[&](const MovementPoint& from,const MovementPoint& to){
+        ssne::NativeSphereResult boundary;
+        std::string error;
+        return ssne::native_world_sphere(context,from,to,*radius,boundary,error)?boundary.position:from;
+    },transient_contact):motion.sample(now,anchor,intent,dry_tune,
+        [&](const MovementPoint& from,const MovementPoint& to,bool walking,MovementCollisionContext& query)->std::optional<MovementContact>{
+            const bool leaving=motion.leaving_water();
+            if(!leaving && (swimming || motion.entering_water())){
+                const auto surface=row[0]==4.f?std::optional<float>{anchor.position[1]}:std::nullopt;
                 return local_swim_step(context,from,to,*radius,surface);
             }
-            auto step=local_static_step(context,from,to,walking,*radius);
-            if(step && step->position!=from)
+            std::optional<MovementContact> step;
+            if(walking || leaving){
+                ssne::NativeGroundMotionState state{query.ground_state};
+                ssne::NativeGroundMotionResult result;
+                std::string error;
+                if(ssne::native_command_ground_motion(context,from,to,*radius,query.dt,walking,state,result,error)){
+                    query.ground_state=state.step;
+                    const bool pending_lift=state.step[0]>0.f && state.step[0]<walking_step_limit(*radius);
+                    step=MovementContact{result.position,walking?result.grounded || pending_lift:result.contact_kind==1};
+                }else{
+                    if(!error.empty())return {};
+                    // Animated doors and carried platforms keep the established
+                    // sweep path, without a leftover static-world step.
+                    query.ground_state={};
+                    step=local_static_step(context,from,to,walking,*radius);
+                }
+            }else step=local_static_step(context,from,to,false,*radius);
+            if(step && step->position!=from && (!leaving || to[1]<from[1]))
                 step->entered_water=local_medium(context,step->position)==1;
             return step;
         },swimming?&swim:nullptr,&swim);
@@ -417,7 +564,18 @@ std::optional<WeaponGaitInput> render_local_movement(PPCContext& context,LocalMo
                                motion.falling(!anchor.grounded && velocity[1]<0.f)};
     if(!predicted)return gait;
 
-    const auto offset=movement_difference(*predicted,*shown);
+    auto offset=movement_difference(*predicted,*shown);
+    const auto compression=visual.properties.find("camera_head_compression");
+    const auto* buffered=compression==visual.properties.end()?nullptr:std::get_if<float>(&compression->second);
+    const auto camera_mode=visual.properties.find("camera_mode");
+    const auto* mode=camera_mode==visual.properties.end()?nullptr:std::get_if<int64_t>(&camera_mode->second);
+    if(!swimming && !brush_push && !transient_contact && mode && (*mode==0 || *mode==1) &&
+       buffered && std::isfinite(*buffered) && *buffered>=0.f && *buffered<=.2f){
+        if(const auto local=motion.head_compression())
+            // The buffered camera/body already contains -buffered. Preserve
+            // its native base height/gait/shake, replacing just jump compression.
+            offset[1]+=*buffered-*local;
+    }
     for(const char* prefix:{"camera_row","weapon_model0_row","weapon_model1_row"}){
         PresentationMatrix matrix;
         if(!presentation_matrix(visual.properties,prefix,matrix))continue;

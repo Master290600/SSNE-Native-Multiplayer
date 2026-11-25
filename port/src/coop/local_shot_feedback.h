@@ -13,6 +13,22 @@ inline constexpr char local_weapon_key[]="Session.LocalWeapon";
 inline constexpr char local_weapon_origin_key[]="Session.LocalWeaponOrigins";
 inline constexpr char local_weapon_capacity_key[]="Session.LocalWeaponCapacity";
 inline constexpr char local_weapon_last_round_key[]="Session.LocalWeaponLastRound";
+inline constexpr char local_pistol_state_key[]="Session.LocalPistolState";
+
+struct LocalPistolState {
+    unsigned reloadable=0, reloading=0, last_round=0, last_ready=0, last_rearm=0;
+
+    int64_t encode() const {
+        return reloadable | (reloading<<2) | (last_round<<4) | (last_ready<<6) | (last_rearm<<8);
+    }
+    static LocalPistolState read(const Properties& mission,unsigned slot){
+        const auto it=mission.find(local_pistol_state_key);
+        const auto* values=it==mission.end()?nullptr:std::get_if<std::vector<int64_t>>(&it->second);
+        if(!values || values->size()!=max_players || slot>=max_players || (*values)[slot]<0 || (*values)[slot]>1023)return {};
+        const auto word=unsigned((*values)[slot]);
+        return {word&3,(word>>2)&3,(word>>4)&3,(word>>6)&3,(word>>8)&3};
+    }
+};
 
 struct LocalWeaponRepeat {
     unsigned rounds=0;
@@ -116,7 +132,7 @@ class LocalShotFeedback {
 public:
     unsigned observe(uint64_t epoch,PlayerId player,EntityId character,uint64_t ack,uint64_t press,uint64_t release,
                      uint64_t shot_floor,LocalWeaponStatus status,double now,LocalWeaponRepeat repeat={},
-                     bool require_ready_idle=false){
+                     bool require_ready_idle=false,bool predict_final_pistol=false){
         const bool dual=status.weapon==1 && status.available==3;
         if(epoch_!=epoch || player_!=player || character_!=character){
             *this={};
@@ -170,7 +186,7 @@ public:
             // Keep the held-fire cadence for other stock single-hand weapons.
             const bool pistol_rearmed=status.weapon==1 && release>last.press;
             if(last.weapon==status.weapon && (pistol_rearmed || now-last.began>=repeat.interval) &&
-               outstanding+1<repeat.rounds)
+               (outstanding+1<repeat.rounds || (predict_final_pistol && outstanding+1==repeat.rounds)))
                 hands=1;
         }
         for(unsigned hand=0;hand<2;++hand)
@@ -179,6 +195,14 @@ public:
         if(dual && (hands&1))hands=1; // PAL updates the right hand first.
         previews_.push_back({press,shot_floor,status.weapon,hands,0,0,0,now,dual});
         return hands;
+    }
+
+    bool final_pistol_round(unsigned hand,unsigned rounds,uint64_t acknowledged,uint64_t press) const {
+        if(!rounds || hand>=2 || press<=acknowledged)return false;
+        const auto unacknowledged=std::count_if(previews_.begin(),previews_.end(),[&](const Preview& shot){
+            return shot.weapon==1 && (shot.pending&(1u<<hand)) && shot.press>acknowledged && shot.press<=press;
+        });
+        return unacknowledged==rounds;
     }
 
     unsigned visual_hands(unsigned hands)const{

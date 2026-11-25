@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "settings.h"
+#include "mod_menu.h"
 
 namespace port {
 
@@ -40,9 +41,16 @@ struct MenuInfo {
     bool states_available = false;  // the game is running (states can be saved / loaded)
     bool cheats_available = false;  // the game's cheat code was found (verified USA/PAL revision)
     std::string states_dir;
+    bool vulkan_active = false;     // the GPU renderer actually started through Vulkan
+    ModMenuControls mod_controls;
+    int host_speed_percent = 0, host_jump_percent = 0;
 };
 
 bool menu_open();
+bool menu_cheats_selected();
+void menu_snapshot_mod_level();   // called as the offline simulation enters a pause
+void menu_select_cheats_section(int section);
+void menu_trace_cheat_widget(const char* id, bool enabled);
 void menu_set_open(bool open);
 void menu_select_tab(int tab);    // 0 graphics, 1 audio, 2 keyboard & mouse, 3 gamepad, 4 hotkeys, 5 save states, 6 players, 7 cheats
 bool menu_capturing();              // waiting for a key/button to bind

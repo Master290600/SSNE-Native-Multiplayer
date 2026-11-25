@@ -1031,6 +1031,7 @@ thread_local unsigned g_authoritative_netricsa_depth=0;
 uint32_t g_authoritative_information_gui=0; // guest-thread-owned
 std::atomic<bool> g_authoritative_information_open{false},g_replica_control_active{false};
 uint32_t g_authoritative_information_object=0;
+uint32_t g_information_close_requested=0;
 std::map<unsigned,uint32_t> g_information_cameras;
 PPCFunc g_information_camera_setter=nullptr;
 bool information_camera(unsigned slot,uint32_t engine=0){
@@ -1245,13 +1246,18 @@ void hle_authoritative_time_step(PPCContext& ctx) {
     g_vehicle_input.observe(int(slot),valid && g_netplay_world_ready && vehicle_actor_driving(player,true),now_ms());
     publish_vehicle_presentation();
     const auto information=valid?mem_read32(player+0x720):0;
-    g_authoritative_information_open=information>=0x80000000u && information<=guest_ram_end()-0xA4 && mem_read32(information+0x90)==player && mem_read32(information+0x6C)!=0;
+    const bool valid_information=information>=0x80000000u && information<=guest_ram_end()-0xA4 &&
+        mem_read32(information+0x48)==0x80219030u && mem_read32(information+0x90)==player;
+    g_authoritative_information_open=valid_information && mem_read32(information+0x6C)!=0;
+    if(!g_authoritative_information_open || g_information_close_requested!=information)
+        g_information_close_requested=0;
+    const bool cinematic=g_netplay_world_ready && native_cutscene_presenting();
     // Consume the host's close press before sampling native actions. Otherwise
     // the same Z edge closes here and reopens in the ordinary player update.
     // Keep it consumed while held; a new press on a closed panel still opens
     // through the host's original player action.
     if(!valid || !g_netplay_world_ready || replica_simulation() || !(get_pad(int(slot)).buttons&PAD_Z))g_host_information_z_consumed=false;
-    else if(g_authoritative_information_open)g_host_information_z_consumed=true;
+    else if(g_authoritative_information_open || cinematic)g_host_information_z_consumed=true;
     refresh_network_pads(ctx);
     update_replica_pause_menu(ctx,player,slot,valid && g_netplay_world_ready);
     // Opening local information does not pause the shared host world. Thus
@@ -1263,17 +1269,19 @@ void hle_authoritative_time_step(PPCContext& ctx) {
         const bool down=(get_pad(int(slot)).buttons&PAD_Z)!=0;
         const bool pressed=previous==player && down && !z_down;
         previous=player;z_down=down;
-        const auto info=mem_read32(player+0x720);
-        if(pressed && !g_replica_pause_menu_open && !native_movie_presenting() && !native_replica_results_presenting() && info>=0x80000000u && info<=guest_ram_end()-0xA4u && mem_read32(info+0x48)==0x80219030u){
-            if(g_authoritative_information_open){
+        const auto info=information;
+        if(valid_information && (cinematic || (pressed && !g_replica_pause_menu_open &&
+                !native_movie_presenting() && !native_replica_results_presenting()))){
+            if(g_authoritative_information_open && !g_information_close_requested){
                 auto call=ctx;call.msr&=~0x8000u;call.r[1]-=0x200;mem_write32(call.r[1],ctx.r[1]);
                 // Original information close: fade/remove the GUI first. Its
                 // 8010236C callback releases page textures after removal.
                 // Immediate 801020F8 freed textures still referenced by the
                 // next GUI update, corrupting its virtual texture calls.
                 call.r[3]=mem_read32(info+0x94);ssne_call(call,0x801022ECu);
-                log_message("[coop-local-netricsa-close] slot="+std::to_string(slot)+" replica="+std::to_string(replica_simulation())+" deferred_resources=1");
-            }else if(replica_simulation()){
+                g_information_close_requested=info;
+                log_message("[coop-local-netricsa-close] slot="+std::to_string(slot)+" replica="+std::to_string(replica_simulation())+" deferred_resources=1 cinematic="+std::to_string(cinematic));
+            }else if(!g_authoritative_information_open && !cinematic && replica_simulation()){
             // Exact information-panel action from800BF764; no player/world tick.
             auto call=ctx;call.msr&=~0x8000u;call.r[1]-=0x200;
             mem_write32(call.r[1],ctx.r[1]);
@@ -1957,8 +1965,10 @@ void hle_netplay_render(PPCContext& ctx) {
         const unsigned local=g_netplay_local_player.load();
         const uint32_t shared=native_party_extended()?0xFF000000u:0xC030u;
         const uint32_t own=local<g_netplay_count ? (1u<<local)|(1u<<(local+(native_party_extended()?8:6)))|(1u<<(local+(native_party_extended()?16:10))) : 0u;
-        uint32_t information=0;for(const auto& [slot,camera]:g_information_cameras)if(information_camera(slot))information|=1u<<slot;
-        ctx.r[4]&=shared|information|(native_cutscene_presenting()?0u:own);
+        uint32_t information=0;
+        const bool cinematic=native_cutscene_presenting();
+        if(!cinematic)for(const auto& [slot,camera]:g_information_cameras)if(information_camera(slot))information|=1u<<slot;
+        ctx.r[4]&=shared|information|(cinematic?0u:own);
     }
     ctx.r[4]=native_spectator_filter_render_mask(ctx.r[4]);
     ssne_call_original(ctx, game_address(0x80117434), g_netplay_render_original);
@@ -3249,7 +3259,7 @@ void switch_authoritative_sdk(bool enabled){
             for(size_t i=0;i<g_ssne_func_count;++i){const auto address=g_ssne_funcs[i].address;const auto after=*ssne_hook_slot(address);if(before[i]!=after)authority_hooks.push_back({address,before[i],after});}
         }catch(...){for(size_t i=0;i<g_ssne_func_count;++i)ssne_install_hook(g_ssne_funcs[i].address,before[i]);authority_hooks.clear();throw;}
     }else for(const auto& hook:authority_hooks)ssne_install_hook(hook.address,enabled?hook.network:hook.offline);
-    dynamic_authority=enabled;g_netplay_world_ready=false;g_network_pause_gui=0;g_pause_action_bank=0;g_replica_pause_menu_open=false;g_authoritative_information_open=false;g_replica_control_active=false;g_host_information_z_consumed=false;
+    dynamic_authority=enabled;g_netplay_world_ready=false;g_network_pause_gui=0;g_pause_action_bank=0;g_replica_pause_menu_open=false;g_authoritative_information_open=false;g_information_close_requested=0;g_replica_control_active=false;g_host_information_z_consumed=false;
     if(!enabled){g_netplay_character_guis.clear();g_netplay_random_streams.clear();}
     log_message(std::string("[native-network-runtime] active=")+(enabled?"1":"0")+" hooks="+std::to_string(authority_hooks.size()));
 }
@@ -3354,6 +3364,9 @@ void set_cheats(const Cheats& c) {
     g_cheat_damage = std::clamp(c.damage, 1.0f, 100.0f);
 }
 bool cheats_available() { return g_cheats_ok.load(); }
+std::array<float, 2> cheat_movement_factors() {
+    return {g_cheat_speed.load(), g_cheat_jump.load()};
+}
 bool cheats_active() { return g_cheats_on.load(); }
 bool cheat_flying() { return g_flying.load(); }
 

@@ -6,6 +6,7 @@
 #include "local_release_weapon_feedback.h"
 #include "local_weapon_loop_feedback.h"
 #include "local_movement.h"
+#include "command_movement.h"
 #include "authoritative_session.h"
 #include "native_bootstrap.h"
 #include "native_replica.h"
@@ -115,6 +116,8 @@ private:
     NativeReplica replica_{native_};
     ClientPresentation presentation_;
     LocalMovement local_movement_;
+    CommandMovement command_movement_;
+    MovementStreamIdentity command_movement_stream_{};
     HostCaptureClock host_capture_clock_;
     HostCaptureClock host_idle_publication_clock_;
     uint64_t host_publication_serial_=0;

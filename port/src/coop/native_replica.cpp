@@ -89,7 +89,7 @@ const auto& render_property_names(){
     }};
     return names;
 }
-bool lifecycle_property(const std::string& key){return key=="particles_enabled" || key=="brush_segment" || key=="brush_progress" || key=="movement_mode" || key=="camera_frozen" || key=="selected_weapon" || key=="weapon_modes";}
+bool lifecycle_property(EntityKind kind,const std::string& key){return key=="particles_enabled" || key=="brush_segment" || key=="brush_progress" || replica_detail::brush_audio_lifecycle_field(kind,key) || replica_detail::player_camera_lifecycle_field(kind,key) || player_movement_metadata(kind,key) || key=="movement_mode" || key=="camera_frozen" || key=="selected_weapon" || key=="weapon_modes";}
 bool reuse_lifecycle_scalars(){static const bool enabled=[] {const auto* value=std::getenv("SSNE_REPLICA_LIFECYCLE_REUSE");return !value || std::strcmp(value,"0");}();return enabled;}
 bool compare_lifecycle_scalars(){static const bool enabled=[] {const auto* hidden=std::getenv("SSNE_TEST_HIDDEN");const auto* value=std::getenv("SSNE_TEST_COMPARE_REPLICA_LIFECYCLE");return hidden && !std::strcmp(hidden,"1") && value && !std::strcmp(value,"1");}();return enabled;}
 template<class Keep> EntityState filtered_fields(const EntityState& e,Keep keep){
@@ -366,7 +366,21 @@ bool build_writes(const EntityState& e,uint32_t object,std::vector<Write>& write
     // than repeating its resource/schema walk for every member of the group.
     bool notice_checked=false,corpse_checked=false,hint_checked=false,combo_checked=false,weapon_bar_checked=false;
     for(const auto& [key,value]:e.properties) {
-        if(defer_lifecycle && lifecycle_property(key))continue;
+        if(player_movement_metadata(e.kind,key)){
+            if(!replica_detail::valid_player_movement_metadata(e.kind,key,value))
+                return fail("Invalid player movement metadata: "+key);
+            // The predictor owns this checkpoint and physically completed ACK.
+            // They never describe guest scalar writes, even after a factory.
+            continue;
+        }
+        if(replica_detail::player_camera_lifecycle_field(e.kind,key)){
+            if(!replica_detail::valid_player_camera_head_compression(value))
+                return fail("Invalid player camera head compression");
+            // Original 800A981C subtracts this walking-controller state from
+            // the camera height. It is presentation metadata, never a RAM write.
+            continue;
+        }
+        if(defer_lifecycle && lifecycle_property(e.kind,key))continue;
         switch(plan_field(key)) {
         case PlanField::Bomb: {
             const auto prefix=key.substr(0,12);const auto data=e.properties.find(prefix),masks=e.properties.find(prefix+"_masks"),slot=e.properties.find("weapon_model_slot");
@@ -773,7 +787,12 @@ bool commit_scalar_writes(std::vector<Write>& writes,std::string& error) {
     return true;
 }
 }
-void NativeReplica::reset(){end_presentation();muzzle_flash_bases_={};presentation_scratch_={};presentation_reference_={};presentation_plan_.clear();bindings_.clear();door_clocks_.clear();arrow_clocks_.clear();particle_ids_.clear();combo_presented_.clear();combo_timers_.clear();epoch_=0;projectile_visuals_.clear();seen_projectiles_.clear();projectile_visual_sequence_=0;ssne::replica_clear_enemy_poses();}
+void NativeReplica::reset(){end_presentation();muzzle_flash_bases_={};presentation_scratch_={};presentation_reference_={};presentation_plan_.clear();bindings_.clear();door_clocks_.clear();arrow_clocks_.clear();corpse_ids_.clear();pickup_hover_poses_.clear();particle_ids_.clear();combo_presented_.clear();combo_timers_.clear();epoch_=0;projectile_visuals_.clear();seen_projectiles_.clear();projectile_visual_sequence_=0;ssne::replica_clear_enemy_poses();}
+bool NativeReplica::advance_corpse_dissolves(PPCContext& context,float seconds,std::string& error){
+    std::vector<uint32_t> objects;objects.reserve(corpse_ids_.size());
+    for(const auto id:corpse_ids_)if(const auto object=local_address(id))objects.push_back(object);
+    return advance_native_corpse_dissolves(context,objects,seconds,error);
+}
 bool NativeReplica::advance_particles(PPCContext& context,float seconds,std::string& error){
     if(particle_ids_.empty())return true;
     std::vector<uint32_t> objects;objects.reserve(particle_ids_.size());
@@ -849,7 +868,7 @@ std::optional<PresentationMatrix> presented_weapon_marker(
         // Its visible palette is valid even when the dormant guest animator
         // still carries the no-animation sentinel for the second hand.
         const bool has_palette=visual_bones && visual_bones->size()==binding->count*12;
-        if(parent!=-1 && (((weapon==2 || weapon==11) && has_palette) || mem_read32(binding->model+0x40)!=UINT32_MAX)){
+        if(parent!=-1 && (((weapon==2 || weapon==4 || weapon==11) && has_palette) || mem_read32(binding->model+0x40)!=UINT32_MAX)){
             if(parent<0 || unsigned(parent)>=binding->count)return {};
             PresentationMatrix bone;
             if(has_palette)
@@ -859,6 +878,27 @@ std::optional<PresentationMatrix> presented_weapon_marker(
         }
     return matrix_product(root,muzzle);
 }
+
+std::optional<PresentationMatrix> presented_minigun_barrel(
+    uint32_t instance,float degrees,const PresentationMatrix& root,
+    const std::optional<NativeEnemyPoseBinding>& binding,const std::vector<float>* bones){
+    if(!readable(instance,0x270) || !std::isfinite(degrees))return {};
+    auto marker=presented_weapon_marker(instance,4,int32_t(mem_read32(instance+0x26C)),root,binding,bones);
+    if(!marker)return {};
+    // 8005758C spins the barrel around the marker's world-space Z axis.
+    const auto& m=*marker;
+    const float length=std::hypot(m[2],m[6],m[10]);
+    if(!std::isfinite(length) || length<.0001f)return {};
+    const float x=m[2]/length,y=m[6]/length,z=m[10]/length;
+    const float angle=degrees*.017453292f,s=std::sin(angle),c=std::cos(angle),k=1.f-c;
+    PresentationMatrix spin{x*x*k+c,x*y*k-z*s,x*z*k+y*s,0.f,
+                            y*x*k+z*s,y*y*k+c,y*z*k-x*s,0.f,
+                            z*x*k-y*s,z*y*k+x*s,z*z*k+c,0.f};
+    auto pose=matrix_product(spin,m);
+    for(unsigned row=0;row<3;++row)pose[row*4+3]=m[row*4+3];
+    return pose;
+}
+
 std::optional<std::array<float,3>> presented_muzzle_position(
     uint32_t instance,unsigned weapon,const PresentationMatrix& root,
     const std::optional<NativeEnemyPoseBinding>& binding,const std::vector<float>* visual_bones){
@@ -994,6 +1034,34 @@ bool NativeReplica::play_local_weapon_flash(PPCContext& context,uint32_t actor,u
     return true;
 }
 
+void NativeReplica::with_local_collision_brushes(PPCContext& context,double now,double round_trip,const std::function<void()>& sample){
+    struct Brush {unsigned resource;float confirmed;};
+    const auto level=mem_read32(0x802DACC0u),manager=readable(level,0x29C)?mem_read32(level+0x298):0;
+    if(!readable(manager,0x18) || mem_read32(manager)!=0x8021E660u ||
+       context.r[13]!=0x802E22A0u || context.r[1]<0x80000800u || !readable(context.r[1]-0x800,0x800)){
+        sample();return;
+    }
+    struct Restore {
+        PPCContext& context;uint32_t manager;std::vector<Brush> brushes;
+        ~Restore(){for(const auto& b:brushes)set_local_brush_collision_progress(context,manager,b.resource,b.confirmed);}
+    } restore{context,manager,{}};
+    for(const auto& [id,clock]:door_clocks_){
+        const auto pose=clock.authority();
+        const auto progress=clock.collision_progress(now,round_trip);
+        if(progress==pose.progress)continue;
+        const auto object=clock.object();
+        if(local_address(id)!=object || !readable(object,0xCC) || !mem_read32(object+0xB0))continue;
+        const auto cfg=mem_read32(object+0x5C);
+        if(!readable(cfg,0x38))continue;
+        const auto resource=mem_read32(cfg+0xC),table=mem_read32(manager+0x10);
+        if(resource>=mem_read32(manager+0x14) || resource>65535u || !readable(table,(resource+1)*80))continue;
+        const auto entry=table+resource*80;
+        if(mem_read32(entry+0xC)!=pose.segment || mem_read32(entry+0x10)!=f2u(pose.progress))continue;
+        restore.brushes.push_back({resource,pose.progress});
+        set_local_brush_collision_progress(context,manager,resource,progress);
+    }
+    sample();
+}
 bool NativeReplica::begin_presentation(const std::map<EntityId,EntityState>& entities,std::string& error){
     return begin_presentation_native(entities,nullptr,error);
 }
@@ -1045,6 +1113,13 @@ bool NativeReplica::begin_presentation_native(const std::map<EntityId,EntityStat
         if(!append(binding->model+0x84,mem_read32(binding->model+0x84),false))return false;++pose_count;return true;
     };
     const double brush_now=replica_render_time();
+    // PAL 800C8350 drives the shared pickup hover at 4 rad/s, amplitude .2.
+    const float pickup_lift=pickup_hover_poses_.empty()?0.f:
+        float(.2*std::sin(pickup_hover_phase_+(brush_now-pickup_hover_start_)*4.));
+    static const bool trace_cosmetics=getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_TEST_LOCAL_COSMETICS");
+    if(trace_cosmetics && !pickup_hover_poses_.empty())
+        ssne::log_message("[coop-local-pickup-hover] count="+std::to_string(pickup_hover_poses_.size())+
+            " lift="+std::to_string(pickup_lift));
     for(const auto& [id,clock]:door_clocks_){
         const auto pose=clock.pose(brush_now);
         if(pose==clock.authority())continue;
@@ -1126,6 +1201,21 @@ bool NativeReplica::begin_presentation_native(const std::map<EntityId,EntityStat
                 if(!bone(object,e.kind==EntityKind::Enemy?native_enemy_pose_binding(object):native_corpse_pose_binding(object),e.properties,"enemy_bone_")){error="Client enemy skeleton changed during presentation";return false;}
             }
         }
+        if(e.kind==EntityKind::Pickup){
+            const auto hover=pickup_hover_poses_.find(id);
+            if(hover!=pickup_hover_poses_.end()){
+                const auto binding=native_render_binding(object,EntityKind::Pickup);
+                const auto glow=native_pickup_glow_binding(object);
+                for(unsigned axis=0;axis<3;++axis){
+                    const auto& pose=hover->second;
+                    const float lift=pickup_lift*pose.axis[axis];
+                    if((binding && binding->model && !stage(binding->matrix+axis*16+12,pose.model[axis]+lift)) ||
+                       (pose.has_glow && glow && glow->model && !stage(glow->matrix+axis*16+12,pose.glow[axis]+lift))){
+                        error="Invalid local pickup hover pose";return false;
+                    }
+                }
+            }
+        }
         if(e.kind==EntityKind::Player && mem_read32(object+0x17C)==unsigned(ssne::netplay_local_player()) && u2f(mem_read32(object+0xCC))>0){
             const auto weapon=mem_read32(object+0x5DC);if(weapon>=12)continue;
             const auto selected=e.properties.find("weapon_model_slot");if(selected==e.properties.end() || uint32_t(std::get<int64_t>(selected->second))!=weapon)continue;
@@ -1202,12 +1292,16 @@ bool NativeReplica::begin_presentation_native(const std::map<EntityId,EntityStat
                 if(weapon==4 && camera_changed){
                     const auto barrel=native_minigun_barrel(object,hand);
                     if(barrel && barrel->model){
-                        // PAL 8005758C gives the barrel its own spin about the
-                        // gun mount. Carry that pose with the rendered gun root,
-                        // including the client's local stride.
-                        const auto adjustment=has_root?rigid_attachment_motion(guest_visual_matrix(root),visual_root):std::nullopt;
-                        const auto pose=matrix_product(adjustment.value_or(camera_delta),guest_visual_matrix(barrel->matrix));
-                        for(unsigned i=0;i<12;++i)if(!stage(barrel->matrix+i*4,pose[i])){
+                        const auto spin=e.properties.find(prefix+"_local_spin");
+                        const auto* degrees=spin==e.properties.end()?nullptr:std::get_if<float>(&spin->second);
+                        const auto palette=e.properties.find(prefix+"_bone_matrices");
+                        const auto* bones=palette==e.properties.end()?nullptr:std::get_if<std::vector<float>>(&palette->second);
+                        auto pose=degrees && has_root?presented_minigun_barrel(instance,*degrees,visual_root,binding,bones):std::nullopt;
+                        if(!pose){
+                            const auto adjustment=has_root?rigid_attachment_motion(guest_visual_matrix(root),visual_root):std::nullopt;
+                            pose=matrix_product(adjustment.value_or(camera_delta),guest_visual_matrix(barrel->matrix));
+                        }
+                        for(unsigned i=0;i<12;++i)if(!stage(barrel->matrix+i*4,(*pose)[i])){
                             error="Invalid interpolated minigun barrel";return false;
                         }
                     }
@@ -1486,6 +1580,28 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
     // Reject an invalid guest call context before committing even scalar fields.
     if(mem_read32(0x80000000u)!=0x47334250u || context.r[13]!=0x802E22A0u || context.r[1]<0x80000800u || !readable(context.r[1]-0x800u,0x800u)){result.error="Native replica lifecycle context is unavailable";return result;}
     if(!epoch){result.error="Invalid replica epoch";return result;}
+    const std::vector<int64_t>* pickup_hover=nullptr;
+    if(vehicles)if(const auto it=vehicles->find(native_pickup_hover_key);it!=vehicles->end()){
+        pickup_hover=std::get_if<std::vector<int64_t>>(&it->second);
+        if(!pickup_hover || pickup_hover->size()<3 || pickup_hover->size()>source.size()+2 ||
+           (*pickup_hover)[0]<0 || (*pickup_hover)[0]>UINT32_MAX ||
+           (*pickup_hover)[1]<0 || (*pickup_hover)[1]>UINT32_MAX){
+            result.error="Invalid pickup presentation metadata";return result;
+        }
+        const float phase=u2f(uint32_t((*pickup_hover)[0])),lift=u2f(uint32_t((*pickup_hover)[1]));
+        if(!std::isfinite(phase) || phase<0.f || phase>6.284f || !std::isfinite(lift) || std::abs(lift)>.201f){
+            result.error="Invalid pickup presentation clock";return result;
+        }
+        for(auto it=pickup_hover->begin()+2;it!=pickup_hover->end();++it){
+            const auto entity=source.find(EntityId(*it));
+            if(*it<=0 || entity==source.end() || entity->second.kind!=EntityKind::Pickup){
+                result.error="Pickup presentation has no authoritative entity";return result;
+            }
+        }
+    }
+    for(const auto& [id,entity]:source)if(!replica_detail::valid_player_movement_fields(entity)){
+        result.error="Invalid player movement metadata id="+std::to_string(id);return result;
+    }
     auto local=local_.capture_bindings();if(!local.error.empty()){result.error=local.error;return result;}auto staged=epoch==epoch_?bindings_:std::map<EntityId,EntityId>{};
     timings.mark("capture_bindings");perf_phase.next(ssne::perf::detail::Preflight);
     const bool fresh_epoch=epoch!=epoch_;
@@ -1636,6 +1752,7 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
         if(!staged.contains(id) || r==e.properties.end() || s==e.properties.end() || p==e.properties.end() || !std::holds_alternative<int64_t>(r->second) || !std::holds_alternative<int64_t>(s->second) || !std::holds_alternative<float>(p->second)){result.error="Incomplete native moving-brush command";return result;}
         auto object=local_.local_address(staged.at(id));auto resource=std::get<int64_t>(r->second),segment=std::get<int64_t>(s->second);auto progress=std::get<float>(p->second);
         if(!validate_native_brush_geometry(object,resource,segment,progress,result.error))return result;
+        if(!validate_native_brush_audio(object,e,result.error))return result;
         brushes.push_back({id,object,resource,segment,progress});
     }
     std::vector<std::pair<uint32_t,unsigned>> movement;
@@ -1723,12 +1840,40 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
         // Private reference: retain the original complete filtered-world copy.
         std::map<EntityId,EntityState> scalar_fields;
         for(const auto& [id,e]:source)scalar_fields.emplace_hint(scalar_fields.end(),id,filtered_fields(e,[&](const std::string& key){
-            return !lifecycle_property(key) && key!="marker_active" && key!="powerups" && !key.starts_with("weapon_model") && !key.starts_with("weapon_bomb") &&
+            return !lifecycle_property(e.kind,key) && key!="marker_active" && key!="powerups" && !key.starts_with("weapon_model") && !key.starts_with("weapon_bomb") &&
                 !(e.kind==EntityKind::Player && (render_field(key) || key.starts_with("body_flash") || key.starts_with("body_render") || key.starts_with("body0_bone_") || key.starts_with("body1_bone_") || key.starts_with("body2_bone_") || key.starts_with("body3_bone_")));
         }));
         result=apply_scalars(epoch,scalar_fields);
     }
     if(!result.applied){rollback();return result;}
+    const bool reset_pickup_clock=fresh_epoch || pickup_hover_poses_.empty();
+    pickup_hover_poses_.clear();
+    if(pickup_hover){
+        if(reset_pickup_clock){
+            pickup_hover_start_=replica_render_time();pickup_hover_phase_=u2f(uint32_t((*pickup_hover)[0]));
+        }
+        const float host_lift=u2f(uint32_t((*pickup_hover)[1]));
+        for(auto it=pickup_hover->begin()+2;it!=pickup_hover->end();++it){
+            const auto id=EntityId(*it);
+            const auto object=local_address(id);
+            const auto& properties=source.at(id).properties;
+            PresentationMatrix model;
+            if(!readable(object,0x98) || !presentation_matrix(properties,"render_row",model))continue;
+            PickupHoverPose pose;
+            const auto glow=properties.find("pickup_glow_pose");
+            const auto* glow_matrix=glow==properties.end()?nullptr:std::get_if<std::vector<float>>(&glow->second);
+            pose.has_glow=glow_matrix && glow_matrix->size()==12;
+            bool valid=true;
+            for(unsigned axis=0;axis<3;++axis){
+                pose.axis[axis]=u2f(mem_read32(object+0x8C+axis*4));
+                valid&=std::isfinite(pose.axis[axis]) && std::abs(pose.axis[axis])<=1.01f;
+                const float lift=host_lift*pose.axis[axis];
+                pose.model[axis]=model[axis*4+3]-lift;
+                if(pose.has_glow)pose.glow[axis]=(*glow_matrix)[axis*4+3]-lift;
+            }
+            if(valid)pickup_hover_poses_.emplace(id,pose);
+        }
+    }
     timings.mark("scalars");perf_phase.next(ssne::perf::detail::Destructibles);
     if(fresh_epoch){muzzle_flash_bases_={};projectile_visuals_.clear();seen_projectiles_.clear();projectile_visual_sequence_=0;}
     for(auto id:promoted_projectile_replays)projectile_visuals_.erase(id);
@@ -1779,7 +1924,10 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
         const auto cfg=mem_read32(brush.object+0x5C);
         const NativeDoorPose confirmed{unsigned(brush.segment),brush.progress};
         auto& clock=door_clocks_[brush.id];
-        if(clock.object()==brush.object && clock.authority()==confirmed)continue;
+        if(clock.object()==brush.object && clock.authority()==confirmed){
+            clock.stop_collision_prediction();
+            continue;
+        }
         // PAL MovingBrush::Update (8007F39C) advances by elapsed / C4.
         // A positive keyframe duration replaces the configured base at +4.
         // At the transition, finish the old segment with its own timing.
@@ -1803,7 +1951,10 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
             else if(!arrow_clocks_.contains(marker.id))arrow_clocks_.emplace(marker.id,NativeArrowClock{replica_render_time(),marker.animation[0],marker.animation[1]});
         }
     }
-    for(auto brush:brushes)if(!apply_native_brush_geometry(context,brush.object,brush.resource,brush.segment,brush.progress,result.error))ssne::fatal(result.error.c_str());
+    for(auto brush:brushes){
+        if(!apply_native_brush_geometry(context,brush.object,brush.resource,brush.segment,brush.progress,result.error))ssne::fatal(result.error.c_str());
+        if(!apply_native_brush_audio(context,epoch,brush.object,source.at(brush.id),result.error,fresh_epoch))ssne::fatal(result.error.c_str());
+    }
     timings.mark("markers_brushes");perf_phase.next(ssne::perf::detail::PlayerResources);
     // Vehicle entry must bind +6C4 before mode3 initializes its controller.
     // Commit only after the entire entity AND vehicle preflight succeeded.
@@ -1858,7 +2009,12 @@ NativeReplicaResult NativeReplica::apply_native(PPCContext& context,uint64_t epo
         for(unsigned slot=0;slot<active.size();++slot)mem_write32(local_address(id)+0x4C8+24*slot,uint32_t(active[slot]));
     }
     timings.mark("weapon_models_effects");perf_phase.next(ssne::perf::detail::Skeletons);
-    for(const auto& [id,e]:source)if(e.kind==EntityKind::Physics && e.definition==3)if(!apply_native_corpse_lifecycle(context,local_address(id),e,result.error))ssne::fatal(result.error.c_str());
+    corpse_ids_.clear();
+    for(const auto& [id,e]:source)if(e.kind==EntityKind::Physics && e.definition==3){
+        if(!apply_native_corpse_lifecycle(context,local_address(id),e,result.error))ssne::fatal(result.error.c_str());
+        const auto life=e.properties.find("corpse_lifecycle");
+        if(life!=e.properties.end() && std::get<std::vector<float>>(life->second)[10]==1)corpse_ids_.push_back(id);
+    }
     for(const auto& [id,e]:source)if(e.properties.contains("boss_weakpoints"))if(!apply_native_boss_parts(local_address(id),e,result.error))ssne::fatal(result.error.c_str());
     ssne::replica_clear_enemy_poses();
     for(const auto& [id,e]:source)if(e.kind==EntityKind::Player)for(unsigned part=0;part<4;++part)if(e.properties.contains("body"+std::to_string(part)+"_bone_matrices")){
@@ -1921,6 +2077,9 @@ NativeReplicaResult NativeReplica::apply(uint64_t epoch,const std::map<EntityId,
 NativeReplicaResult NativeReplica::apply_scalars(uint64_t epoch,const std::map<EntityId,EntityState>& source,bool lifecycle_projection) {
     NativeReplicaResult result;
     if(presentation_active_){result.error="Native replica apply during active presentation lease";return result;}
+    for(const auto& [id,entity]:source)if(!replica_detail::valid_player_movement_fields(entity)){
+        result.error="Invalid player movement metadata id="+std::to_string(id);return result;
+    }
     auto prepare=[&](const std::map<EntityId,EntityState>& source,bool project,std::map<EntityId,EntityId>& next,std::vector<Write>& writes,std::string& error){
     if(!epoch){error="Invalid replica epoch";return false;}
     if(!project){
@@ -1972,7 +2131,7 @@ NativeReplicaResult NativeReplica::apply_scalars(uint64_t epoch,const std::map<E
         // fresh native validation on the same still-unmodified guest RAM.
         std::map<EntityId,EntityState> reference_fields;
         for(const auto& [id,e]:source)reference_fields.emplace_hint(reference_fields.end(),id,filtered_fields(e,[&](const std::string& key){
-            return !lifecycle_property(key) && key!="marker_active" && key!="powerups" && !key.starts_with("weapon_model") && !key.starts_with("weapon_bomb") &&
+            return !lifecycle_property(e.kind,key) && key!="marker_active" && key!="powerups" && !key.starts_with("weapon_model") && !key.starts_with("weapon_bomb") &&
                 !(e.kind==EntityKind::Player && (render_field(key) || key.starts_with("body_flash") || key.starts_with("body_render") || key.starts_with("body0_bone_") || key.starts_with("body1_bone_") || key.starts_with("body2_bone_") || key.starts_with("body3_bone_")));
         }));
         std::map<EntityId,EntityId> reference_bindings;std::vector<Write> reference_writes;std::string reference_error;

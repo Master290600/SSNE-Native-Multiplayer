@@ -592,6 +592,27 @@ def rehost_sessions(p):
   p.expect_root(0x3d)
   record(p,'native_pause_quit_confirmed',pid=m.processes['host'].pid)
 
+ if getattr(m.a,'case',None)=='role-switch':
+  m.start_role('client',m.a.client_language)
+  m.wait(lambda:m.mouse('client').get('surfaces') and m.mouse_ack('client').get('image_rect'),20)
+  p.command('client','cancel')
+  guest_pid=m.processes['client'].pid
+  online('client','initial-host')
+  click(0x14b,0x148,'client');click(0xa9,0xa7,'client');click(0x5d,0x59,'client')
+  wait_lobby(p,'client')
+  click(0x153,0x9a,'client');page(p,7,'client');click(0x14c,0x148,'client')
+  m.wait(lambda:not m.state('client').get('active') and m.state('client').get('scene')==3,30)
+  p.expect_root(0x3d,'client')
+  online('host','new-host')
+  click(0x14b,0x148);click(0xa9,0xa7);click(0x5d,0x59)
+  wait_lobby(p)
+  join(2)  # Reuse the former host process and join before the new host chooses a map.
+  assert m.processes['client'].pid==guest_pid
+  assert m.state('client').get('players')==2 and not lobby_setup('client').get('map')
+  record(p,'former_host_joined_lan_lobby',pid=guest_pid,players=2)
+  screenshot(p,'host','client')
+  return
+
  for round_number in (1,2):
   online('host',round_number)
   if round_number==2:
@@ -614,25 +635,25 @@ def rehost_sessions(p):
 def main():
  ap=argparse.ArgumentParser()
  for key in ('exe','data','card','output'):ap.add_argument('--'+key,type=Path,required=True)
- ap.add_argument('--case',choices=('lobby','gameplay','results','all','rehost'),default='all');ap.add_argument('--language',type=int,choices=(0,1,2),default=1);ap.add_argument('--client-language',type=int,choices=(0,1,2),default=2)
+ ap.add_argument('--case',choices=('lobby','gameplay','results','all','rehost','role-switch'),default='all');ap.add_argument('--language',type=int,choices=(0,1,2),default=1);ap.add_argument('--client-language',type=int,choices=(0,1,2),default=2)
  ap.add_argument('--online-icon',type=Path,help='Installed online-icon.png, copied beside each private game for the rehost regression.')
  ap.add_argument('--scale',type=int,choices=range(1,9),default=1,help='Internal rendering scale of the private test processes.')
  ap.add_argument('--continue-method',choices=('mouse','keyboard'),default='mouse')
  ap.add_argument('--aspect',choices=('4x3','16x9','21x9'),default='16x9');ap.add_argument('--fps',type=int,default=60);ap.add_argument('--port',type=int,default=27940);ap.add_argument('--allow-start-key-fallback',action='store_true');a=ap.parse_args()
  for key in ('exe','data','card','output'):setattr(a,key,getattr(a,key).resolve())
- if a.case=='rehost':
+ if a.case in ('rehost','role-switch'):
   a.online_icon=a.online_icon or a.exe.parent/'online-icon.png'
   if not a.online_icon.is_file():ap.error('rehost needs the installed online-icon.png beside the executable or supplied with --online-icon')
  a.output.mkdir(parents=True,exist_ok=False);original=sha(a.card);aspect,width={'4x3':(0,960),'16x9':(3,960),'21x9':(3,1260)}[a.aspect]
  a.private_settings='[graphics]\nrenderer=gpu\nscale='+str(a.scale)+'\naspect='+str(aspect)+'\nhud_edges=1\nside_fill=1\nvsync=0\nwindow_w='+str(width)+'\nwindow_h=540\ntop_bar=0\nfullscreen=0\n[audio]\nmuted=1\n[general]\npause_unfocused=0\n'
  a.test_env={'SSNE_TEST_DEVICE_INPUT':'1','SSNE_NATIVE_MOUSE_COMMAND':COMMAND_FILE,'SSNE_NATIVE_INFO_MOUSE_TRACE':'1'};m=MultiplayerMenus(a,'',a.output)
- if a.case=='rehost':
+ if a.case in ('rehost','role-switch'):
   a.private_settings+='skip_intros=1\n'
   a.test_env.update(SSNE_DEV_CLIENT_UI='1',SSNE_MOUSE_DIAGNOSTICS_EAGER='1')
  report={'passed':False,'case':a.case,'continue_method':a.continue_method,'exe_sha256':sha(a.exe),'driver_sha256':sha(Path(__file__)),'language':a.language,'client_language':a.client_language,'aspect':a.aspect,'fps':a.fps,'steps':[],'scope':__doc__};p=Pointer(m,report)
  try:
   m.start_role('host',a.language);m.wait(lambda:m.mouse().get('surfaces') and m.mouse_ack().get('image_rect'),20);p.command('host','cancel')
-  if a.case=='rehost':rehost_sessions(p)
+  if a.case in ('rehost','role-switch'):rehost_sessions(p)
   else:
    host_create(p);client_join_and_roles(p)
    if a.case!='lobby':

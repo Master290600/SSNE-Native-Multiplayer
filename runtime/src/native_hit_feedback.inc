@@ -1,15 +1,58 @@
 // Ordinary hits use the splatter controller, independently of wall impacts/gibs.
 PPCFunc original_splatter_velocity=nullptr,original_splatter_direction=nullptr,original_hurt_feedback=nullptr;
 thread_local std::map<uint32_t,NativeFeedbackEvent> pending_splatters;
-PPCFunc original_combo_speech=nullptr;
+PPCFunc original_combo_speech=nullptr,original_combo_mixer=nullptr;
+thread_local bool mute_remote_combo_cue=false;
 std::optional<unsigned> combo_feedback_slot(uint32_t actor){
     if(!readable(actor,0x790) || mem_read32(actor+0x48)!=0x802121E8u)return {};
     const auto slot=mem_read32(actor+0x17C);if(slot>=native_party_capacity() || mem_read32(native_party_registry()+slot*4)!=actor)return {};return slot;
 }
+void trace_combo_audio(const char* phase,const NativeFeedbackEvent& e,uint32_t result){
+    if(!getenv("SSNE_TEST_HIDDEN") || !getenv("SSNE_COOP_TRACE_LIFETIMES"))return;
+    int gain=-1;
+    const auto index=result&63u;
+    if(e.kind==8 && e.code && int32_t(result)>=0 && index<48){
+        const auto record=0x802D69C8u+index*192u,voice=mem_read32(record);
+        if(mem_read32(record+0xAC)==result && readable(voice,0x19E))gain=mem_read16(voice+0x19C);
+    }
+    log_message(std::string("[coop-combo-audio-")+phase+"] sequence="+std::to_string(e.sequence)+
+                " slot="+std::to_string(e.variant)+" code="+std::to_string(e.code)+
+                " result="+std::to_string(int32_t(result))+" gain="+std::to_string(gain));
+}
+void publish_combo_audio(NativeFeedbackEvent e,uint32_t result){
+    {std::lock_guard lock(effect_mutex);e.sequence=++feedback_sequence;retain_native_event(feedback_events,e);}
+    trace_combo_audio("host",e,result);
+}
+void combo_mixer_hook(PPCContext& c){
+    if(mute_remote_combo_cue && (c.lr==0x80156FBCu || c.lr==0x80156FF0u)){
+        // Preserve the native voice handle used to time and stop the point-counting
+        // cue, with the original mixer writing silence before the voice starts.
+        constexpr uint32_t silent=uint32_t(-0x1000);
+        c.r[4]|=4;
+        c.r[5]=c.r[6]=c.r[7]=c.r[10]=silent;
+    }
+    ssne_call_original(c,0x801C9244,original_combo_mixer);
+}
+void play_host_combo_cue(PPCContext& c,const NativeFeedbackEvent& event){
+    struct MixerScope{
+        bool old=mute_remote_combo_cue;
+        explicit MixerScope(bool mute){mute_remote_combo_cue=mute;}
+        ~MixerScope(){mute_remote_combo_cue=old;}
+    } mixer(int(event.variant)!=netplay_local_player());
+    ssne_call_original(c,0x8010E7B0,original_shot);
+    if(int32_t(c.r[3])>=0)publish_combo_audio(event,c.r[3]);
+}
 void combo_speech_hook(PPCContext& c){
-    const auto slot=combo_feedback_slot(c.r[31]);const bool capture=authoritative && !presenting && slot && c.lr==0x800B5D6Cu && c.r[3]==0x89 && c.r[4]==0;
+    const auto slot=authoritative && !presenting && c.lr==0x800B5D6Cu && c.r[3]==0x89 && c.r[4]==0
+        ? combo_feedback_slot(c.r[31]) : std::nullopt;
+    if(slot && int(*slot)!=netplay_local_player()){
+        NativeFeedbackEvent e;e.kind=9;e.code=c.r[3];e.variant=*slot;
+        c.r[3]=0; // The callsite ignores the stream result.
+        publish_combo_audio(e,c.r[3]);
+        return;
+    }
     ssne_call_original(c,0x801115B8,original_combo_speech);
-    if(capture && c.r[3]){NativeFeedbackEvent e;e.kind=9;e.code=0x89;e.variant=*slot;std::lock_guard lock(effect_mutex);e.sequence=++feedback_sequence;retain_native_event(feedback_events,e);}
+    if(slot && c.r[3]){NativeFeedbackEvent e;e.kind=9;e.code=0x89;e.variant=*slot;publish_combo_audio(e,c.r[3]);}
 }
 bool hurt_feedback_binding(unsigned slot,uint32_t& hud){
     if(slot>=native_party_capacity())return false;
@@ -52,6 +95,11 @@ bool install_native_hit_feedback(std::string& error){
         original_splatter_velocity=ssne_find_func(0x800CF638)->func;ssne_install_hook(0x800CF638,splatter_velocity_hook);
         original_splatter_direction=ssne_find_func(0x800CF79C)->func;ssne_install_hook(0x800CF79C,splatter_direction_hook);}
     if(!original_combo_speech){if(!ssne_find_func(0x801115B8) || mem_read32(0x801115B8)!=0x9421FFF0u){error="Original combo announcement unavailable";return false;}original_combo_speech=ssne_find_func(0x801115B8)->func;ssne_install_hook(0x801115B8,combo_speech_hook);}
+    if(!original_combo_mixer){
+        const auto* mixer=ssne_find_func(0x801C9244);
+        if(!mixer || mem_read32(mixer->address)!=0x7C0802A6u){error="Original combo mixer unavailable";return false;}
+        original_combo_mixer=mixer->func;ssne_install_hook(mixer->address,combo_mixer_hook);
+    }
     return true;
 }
 bool play_native_hit_feedback(PPCContext& context,const NativeFeedbackEvent& e,std::string& error){
@@ -60,9 +108,9 @@ bool play_native_hit_feedback(PPCContext& context,const NativeFeedbackEvent& e,s
         if(int(e.variant)!=netplay_local_player())return true;
         const auto actor=mem_read32(native_party_registry()+e.variant*4);if(!combo_feedback_slot(actor)){error="Native combo audio owner unavailable";return false;}
         Scratch scratch(context);auto call=context;call.msr&=~0x8000u;call.r[1]-=0x200;mem_write32(call.r[1],context.r[1]);PresentationScope presentation;
-        if(e.kind==9){call.r[3]=e.code;call.r[4]=0;ssne_call(call,0x801115B8);return true;}
+        if(e.kind==9){call.r[3]=e.code;call.r[4]=0;ssne_call(call,0x801115B8);trace_combo_audio("client",e,call.r[3]);return true;}
         if(!e.code){call.r[3]=mem_read32(actor+0x43C);ssne_call(call,0x8010EDFC);mem_write32(actor+0x43C,UINT32_MAX);return true;}
-        call.r[3]=e.code;call.r[4]=uint32_t(e.values[0]);ssne_call(call,0x8010E7B0);
+        call.r[3]=e.code;call.r[4]=uint32_t(e.values[0]);ssne_call(call,0x8010E7B0);trace_combo_audio("client",e,call.r[3]);
         if(e.code==0x180 || e.code==0x182)mem_write32(actor+0x43C,call.r[3]);return true;
     }
     uint32_t hud=0;if(e.kind==7 && !hurt_feedback_binding(e.code,hud)){error="Native hurt HUD unavailable";return false;}

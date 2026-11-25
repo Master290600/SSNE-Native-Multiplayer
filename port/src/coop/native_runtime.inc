@@ -22,6 +22,7 @@ bool native_invitation_join_pending=false;
 bool native_invitation_host_pending=false;
 uint64_t native_session_fingerprint=0;
 bool native_invitation_copy_pending=false;
+std::atomic<bool> native_invitation_overlay_copy_requested{false};
 std::chrono::steady_clock::time_point native_invitation_copy_deadline;
 std::mutex native_invitation_clipboard_mutex;
 struct NativeInvitationClipboard {uint64_t generation=0,sequence=0;std::string text;};
@@ -35,6 +36,7 @@ void halt_invitation_network(){
     native_invitation_retirement.drain();
 }
 void stop_invitation_network(){
+    native_invitation_overlay_copy_requested=false;
     native_invitation_copy_pending=false;native_invitation_copy_deadline={};native_session_fingerprint=0;
     {std::lock_guard lock(native_invitation_clipboard_mutex);++native_invitation_clipboard_generation;native_invitation_clipboard={};native_invitation_copy_state=port::coop::NativeInvitationCopyState::Idle;}
     native_invitation_retirement.retire(std::move(native_invitation));
@@ -77,11 +79,10 @@ void update_native_invitation_copy(){
         native_invitation_copy_pending=false;queue_native_invitation_clipboard(status.code);
     }
 }
-void copy_native_lobby_invitation(){
-    std::lock_guard lock(g_session_mutex);
-    // A code request can only extend an existing host's open lobby. It never
-    // creates a second server/session or changes mode, map, readiness or actors.
-    if(!g_coop_host || !g_coop_server || !g_coop_engine_ready || !port::coop::native_lobby_visible() || mem_read32(ssne::game_address(0x802DB0E0))!=3)return;
+void copy_native_host_invitation(){
+    // Both guest-thread entry points hold the session mutex. The invitation
+    // transport attaches to the current server and survives level changes.
+    if(!g_coop_host || !g_coop_server || (!g_coop_engine_ready && !native_invitation_host_pending))return;
     {std::lock_guard clipboard_lock(native_invitation_clipboard_mutex);
         if(native_invitation_copy_state==port::coop::NativeInvitationCopyState::Waiting)return;
         ++native_invitation_copy_sequence;native_invitation_copy_state=port::coop::NativeInvitationCopyState::Waiting;native_invitation_clipboard={};
@@ -93,13 +94,48 @@ void copy_native_lobby_invitation(){
         if(!native_invitation){
             if(!native_invitation_retirement.prepare()){failed();return;}
             auto invitation=std::make_unique<port::coop::invite::InviteTransport>();std::string why;
-            if(!invitation->host(g_coop_server->status().port,g_lan_pin,native_session_fingerprint,native_invitation_config,why)){failed();log_line("[native-lobby-invite] "+why);return;}
+            if(!invitation->host(g_coop_server->status().port,g_lan_pin,native_session_fingerprint,native_invitation_config,why)){failed();log_line("[native-host-invite] "+why);return;}
             native_invitation=std::move(invitation);
         }
         native_invitation_copy_pending=true;
         native_invitation_copy_deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(uint64_t(native_invitation_config.connect_timeout_ms)+25000);
         update_native_invitation_copy();
-    }catch(const std::exception& e){failed();log_line(std::string("[native-lobby-invite] ")+e.what());}
+    }catch(const std::exception& e){failed();log_line(std::string("[native-host-invite] ")+e.what());}
+}
+void copy_native_lobby_invitation(){
+    std::lock_guard lock(g_session_mutex);
+    if(g_coop_engine_ready && port::coop::native_lobby_visible() && mem_read32(ssne::game_address(0x802DB0E0))==3)
+        copy_native_host_invitation();
+}
+void draw_host_invitation_controls(){
+    using port::coop::FrontText;
+    using port::coop::NativeInvitationCopyState;
+    using port::coop::invite::Phase;
+    if(!g_native_frontend_enabled || (!g_coop_engine_ready && !native_invitation))return;
+    const auto text=[](FrontText id){
+        return port::coop::native_name_utf8(port::coop::frontend_text(id,port::menu_ui::current_language));
+    };
+    const auto invite=native_invitation?native_invitation->status():port::coop::invite::Status{};
+    NativeInvitationCopyState copy_state;
+    {
+        std::lock_guard clipboard_lock(native_invitation_clipboard_mutex);
+        copy_state=native_invitation_copy_state;
+    }
+    const bool show_code=invite.phase!=Phase::Idle && invite.phase!=Phase::Failed && native_compact_invitation_code(invite.code);
+    if(show_code)ImGui::Text("%s  %s",text(FrontText::InvitationCode).c_str(),invite.code.c_str());
+    const bool busy=copy_state==NativeInvitationCopyState::Waiting ||
+        native_invitation_overlay_copy_requested.load(std::memory_order_acquire);
+    ImGui::BeginDisabled(busy);
+    const std::string button=text(show_code?FrontText::CopyInvitation:FrontText::CreateInvitation)+"###session_invitation";
+    if(ImGui::Button(button.c_str()))
+        native_invitation_overlay_copy_requested.store(true,std::memory_order_release);
+    ImGui::EndDisabled();
+    if(busy || copy_state==NativeInvitationCopyState::Copied || copy_state==NativeInvitationCopyState::Failed){
+        const auto feedback=busy?FrontText::InviteCopyWaiting:
+            copy_state==NativeInvitationCopyState::Copied?FrontText::InviteCopyCopied:FrontText::InviteCopyFailed;
+        ImGui::SameLine();
+        ImGui::TextUnformatted(text(feedback).c_str());
+    }
 }
 bool start_native_invitation_peer(){
     if(!native_invitation)return false;const auto network=native_invitation->status();
@@ -182,7 +218,7 @@ void stop_native_session(PPCContext& c){
     ssne::set_replica_simulation(false);ssne::set_native_results_save_host(true);
     port::coop::native_frontend_prepare_results_close(c);
     ssne::clear_native_replica_results(c,why);ssne::clear_native_cutscene_presentation();
-    ssne::stop_native_weapon_loops(c,why);ssne::stop_native_replica_speech(c,why);port::coop::stop_native_vehicle_audio(c,why);
+    ssne::stop_native_weapon_loops(c,why);ssne::stop_native_replica_speech(c,why);port::coop::stop_native_vehicle_audio(c,why);port::coop::stop_native_brush_audio(c,why);
     ssne::set_ammo_rules(native_offline_ammo.capacity,native_offline_ammo.pickup_multiplier);ssne::set_enemy_multiplier(native_offline_enemies);
     ssne::mod_options(native_offline_mods);ssne::mod_shared_options(0,3.f);ssne::mod_netplay_player(-1);
     const auto root=port::coop::native_global_configuration();
@@ -370,6 +406,11 @@ void setup_native_frontend(const std::string& data){
 }
 void session_frontend_frame(PPCContext& c,uint64_t frame){
     native_safe_context=&c;native_current_frame=frame;
+    if(native_invitation_overlay_copy_requested.load(std::memory_order_acquire)){
+        std::lock_guard lock(g_session_mutex);
+        if(native_invitation_overlay_copy_requested.exchange(false,std::memory_order_acq_rel))
+            copy_native_host_invitation();
+    }
     update_native_invitation_copy();
     if(native_connecting && native_invitation_join_pending){
         std::lock_guard lock(g_session_mutex);const auto status=native_invitation?native_invitation->status():port::coop::invite::Status{};

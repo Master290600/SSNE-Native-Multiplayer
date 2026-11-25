@@ -18,6 +18,8 @@ bool LauncherConfig::load(const std::string& path) {
         else if (k == "installed") installed = v == "1";
         else if (k == "close_on_launch") close_on_launch = v == "1";
         else if (k == "fullscreen") fullscreen = v == "1";
+        else if (k == "include_ps2_content") include_ps2_content = v == "1";
+        else if (k == "desktop_shortcut") desktop_shortcut = v == "1";
         else if (k == "check_updates") check_updates = v == "1";
         else if (k == "skip_version") skip_version = v;
     }
@@ -33,6 +35,8 @@ bool LauncherConfig::save(const std::string& path) const {
         << "installed=" << (installed ? 1 : 0) << "\n"
         << "close_on_launch=" << (close_on_launch ? 1 : 0) << "\n"
         << "fullscreen=" << (fullscreen ? 1 : 0) << "\n"
+        << "include_ps2_content=" << (include_ps2_content ? 1 : 0) << "\n"
+        << "desktop_shortcut=" << (desktop_shortcut ? 1 : 0) << "\n"
         << "check_updates=" << (check_updates ? 1 : 0) << "\n"
         << "skip_version=" << skip_version << "\n";
     return bool(out);

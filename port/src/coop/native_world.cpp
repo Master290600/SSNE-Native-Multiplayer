@@ -1,4 +1,5 @@
 #include "native_world.h"
+#include "movement_command_stream.h"
 #include "native_configuration.h"
 #include "native_presentation.h"
 #include "client_presentation.h"
@@ -8,6 +9,7 @@
 #include "ssne/runtime.h"
 #include "ssne/game_addresses.h"
 #include "ssne/native_party.h"
+#include "ssne/native_movement_step.h"
 #include "ssne/replica_simulation.h"
 #include <mutex>
 #include <cmath>
@@ -535,6 +537,7 @@ NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only,bool def
             entity.properties["brush_progress"]=progress;
             entity.properties["brush_active"]=int64_t(mem_read32(address+0xB0));
             entity.properties["brush_completed"]=int64_t(mem_read32(address+0x58));
+            if(!capture_native_brush_audio(address,entity,sample.error))return sample;
         }
         if((record.actor && !player) || corpse) {
             std::array<float,3> rotation,scale;bool valid_pose=true;
@@ -593,6 +596,12 @@ NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only,bool def
             if(slot>=ssne::native_party_capacity() || (mem_read32(ssne::native_party_registry()+slot*4)!=address && !ssne::native_party_spawn_waiting(address)))continue;
             entity.owner=state.owners[slot];entity.properties["player_slot"]=int64_t(slot);
             entity.properties["movement_mode"]=int64_t(mem_read32(address+0x340));
+            if(const auto movement=ssne::native_party_movement_state(address)){
+                const auto revision=ssne::native_party_spawn_revision(address);
+                if(revision>=uint64_t(INT64_MAX)){sample.error="Invalid native movement spawn revision";return sample;}
+                entity.properties["movement_checkpoint"]=encode_movement_checkpoint(*movement);
+                entity.properties["movement_spawn"]=int64_t(revision+1);
+            }
             entity.properties["camera_frozen"]=int64_t(mem_read32(address+0x370));
             // 800A6A8C copies the view matrix from the native camera at +24.
             // Replicate the host's prepared presentation state; replicas must
@@ -616,6 +625,16 @@ NativeWorldSample NativeWorld::capture(uint64_t tick,bool bindings_only,bool def
                     entity.properties["camera_mode"]=int64_t(mem_read32(camera+0xAC));
                     for(auto [name,offset]:{std::pair{"camera_bob",0x84u},std::pair{"camera_shake",0x88u}}) {
                         auto value=u2f(mem_read32(camera+offset));if(std::isfinite(value) && std::abs(value)<=10000.f)entity.properties[name]=value;
+                    }
+                    // PAL 800A981C returns actor+2F8 minus this original
+                    // walking-controller compression. Carry it with the pose
+                    // so local jump prediction can replace only its delayed
+                    // component without changing the native gait or shake.
+                    const auto controller=mem_read32(address+0x344);
+                    if(mem_read32(address+0x340)==1 && readable(controller,0x28) && mem_read32(controller)==0x80210E80u){
+                        const float compression=u2f(mem_read32(controller+0x24));
+                        if(std::isfinite(compression) && compression>=0.f && compression<=.2f)
+                            entity.properties["camera_head_compression"]=compression;
                     }
                 }
             }

@@ -14,7 +14,7 @@ void perf_scene_fixture_frame(PPCContext& context,uint64_t frame){
     auto number=[](const char* name,float fallback,float low,float high){const auto* p=getenv(name);const float v=p?float(atof(p)):fallback;return std::isfinite(v)?std::clamp(v,low,high):fallback;};
     const auto now=Clock::now();const auto scene=mem_read32(ssne::game_address(0x802DB0E0));
     const auto mode=mem_read32(ssne::game_address(0x802DB1BC));
-    const bool busy=ssne::local_information_open() || ssne::local_pause_menu_open() || ssne::native_movie_presenting() || ssne::native_cutscene_presenting() || ssne::native_results_presenting() || port::menu_open() || port::mod_menu_open();
+    const bool busy=ssne::local_information_open() || ssne::local_pause_menu_open() || ssne::native_movie_presenting() || ssne::native_cutscene_presenting() || ssne::native_results_presenting() || port::menu_open();
     auto readable=[](uint32_t p,unsigned n){return p>=0x80000000u && n<=ssne::guest_ram_size() && p<=ssne::guest_ram_end()-n;};
     auto actor_at=[&](unsigned slot){const auto registry=ssne::native_party_registry();if(slot>=ssne::native_party_capacity() || !readable(registry+slot*4,4))return uint32_t(0);const auto actor=mem_read32(registry+slot*4);return readable(actor,0x790) && ssne::native_party_actor_occupied(actor)?actor:0u;};
     auto place=[&](uint32_t actor,const std::array<float,3>& xyz){

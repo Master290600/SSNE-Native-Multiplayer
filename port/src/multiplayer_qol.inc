@@ -8,7 +8,7 @@ void sync_multiplayer_qol(){
     const auto current=g_chat_session_generation.load(std::memory_order_acquire);
     if(generation!=current || rebound){generation=current;g_tactical_ping_requested_at=0;g_roster_input.clear();g_roster_held=false;}
     const bool clear_view=g_chat_available && (g_focused || getenv("SSNE_TEST_HIDDEN")) &&
-        !g_chat.active() && !port::menu_open() && !port::mod_menu_open() &&
+        !g_chat.active() && !port::menu_open() &&
         !port::coop::native_frontend_visible() && !port::coop::native_lobby_visible() &&
         !ssne::local_pause_menu_open() && !ssne::local_information_open() && !ssne::native_results_presenting() &&
         !ssne::native_cutscene_presenting() && !ssne::native_movie_presenting() && !ssne::paused();
@@ -23,7 +23,7 @@ bool handle_multiplayer_qol_event(const SDL_Event& event){
         g_roster_input.clear();g_roster_held=false;g_roster_allowed=false;g_tactical_ping_requested_at=0;g_qol_input_allowed=false;return false;
     }
     if(event.type==SDL_KEYUP || event.type==SDL_MOUSEBUTTONUP){g_roster_input.update(g_set,port::MP_ROSTER,event);g_roster_held=g_roster_allowed && g_roster_input.active();}
-    if(!g_chat_available || !(g_focused || getenv("SSNE_TEST_HIDDEN")) || g_chat.active() || ImGui::GetIO().WantTextInput || port::menu_open() || port::mod_menu_open() || port::coop::native_frontend_text_active())return false;
+    if(!g_chat_available || !(g_focused || getenv("SSNE_TEST_HIDDEN")) || g_chat.active() || ImGui::GetIO().WantTextInput || port::menu_open() || port::coop::native_frontend_text_active())return false;
     auto consume=[&]{
         if(event.type==SDL_KEYDOWN && unsigned(event.key.keysym.scancode)<g_chat_key_suppressed.size())g_chat_key_suppressed[event.key.keysym.scancode]=true;
         if(event.type==SDL_MOUSEBUTTONDOWN && event.button.button>=1 && event.button.button<=5)g_chat_mouse_suppressed|=SDL_BUTTON(event.button.button);
@@ -172,12 +172,12 @@ void draw_multiplayer_qol(){
         }
     }
     const auto language=g_set.game_language>=0?unsigned(g_set.game_language):port::native_crosshair_language();
-    const bool visible=g_qol_input_allowed.load(std::memory_order_acquire) && !g_chat.active() && !port::menu_open() && !port::mod_menu_open();
-    const bool team_visible=g_set.team_hud && g_roster_allowed && !g_chat.active() && !port::menu_open() && !port::mod_menu_open();
+    const bool visible=g_qol_input_allowed.load(std::memory_order_acquire) && !g_chat.active() && !port::menu_open();
+    const bool team_visible=g_set.team_hud && g_roster_allowed && !g_chat.active() && !port::menu_open();
     if(team_visible && g_pointer_image.valid())port::draw_team_hud(team_rows,g_pointer_image,language);
     if(visible && !pings.empty() && ping_world && g_pointer_image.valid())if(const auto camera=ssne::mod_view_camera())
         port::draw_tactical_pings(pings,ping_world.get(),*camera,g_pointer_image,language);
-    if(g_roster_allowed && g_roster_held && !g_chat.active() && !port::menu_open() && !port::mod_menu_open()){
+    if(g_roster_allowed && g_roster_held && !g_chat.active() && !port::menu_open()){
         const auto* viewport=ImGui::GetMainViewport();
         const auto image=g_pointer_image.valid()?g_pointer_image:port::GameViewRect{viewport->Pos.x,viewport->Pos.y,viewport->Size.x,viewport->Size.y,1};
         ImGui::SetNextWindowPos(ImVec2(image.x+image.width*.5f,image.y+image.height*.22f),ImGuiCond_Always,ImVec2(.5f,0));

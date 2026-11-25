@@ -1,6 +1,6 @@
 {
   "build": 267,
-  "protocol": 71,
+  "protocol": 72,
   "dol_sha256": "c0b8ba71e0dd99ca632a2a6931db0a8f610d69c00a423d34c96a579eaa3710ad",
   "donor_sha256": "63896cb433b75f0fc8145b4fcaf8259ef0950272cbfc96187df56762aa04e3c4",
   "old_menu_extents": [
@@ -429,7 +429,7 @@
       "bytes": 4054
     }
   },
-  "kit_sha256": "2eee16f58219dc4a978b022d773f71207e712f42b143aeb2acd3a89073ea20a7",
+  "kit_sha256": "aa3255b0c8904cddec9e5dfe9043a5ca4659b6a603cd2a178bf3b884cbbe4bff",
   "content_sha256": "3335ea11d6f38344859dfabb21ce524d73c68c33ba3db6e923f0878e35876cbd",
   "content_revision": 249
 }

@@ -4,12 +4,16 @@
 # SSNE_RECOMPILED_DIR and players build the game on their own PC from their own disc.
 #
 #   tools/make_public_release.sh <out_dir> <llvm-mingw dir> [SDL2 source dir] [imgui source dir]
+#   Set SSNE_MESA_ARCHIVE to include the optional Windows Vulkan runtime.
 #
 # The llvm-mingw release must match toolchain_url in data/kit/kit.ini (the prebuilt libraries are linked with the
 # compiler the launcher downloads).
 set -e
 OUT=$1; LLVM=$2; SDLSRC=$3; IMGUISRC=$4
 [ -n "$OUT" ] && [ -n "$LLVM" ] || { echo "usage: $0 <out_dir> <llvm-mingw dir> [sdl2 src] [imgui src]"; exit 1; }
+if [ -n "${SSNE_MESA_ARCHIVE:-}" ] && [ ! -f "$SSNE_MESA_ARCHIVE" ]; then
+  echo "SSNE_MESA_ARCHIVE does not point to the pinned Mesa x64 archive."; exit 1
+fi
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD=$ROOT/build-release-win
 EXTRA=""
@@ -31,6 +35,9 @@ cp -r "$ROOT/runtime/include/ssne" "$OUT/build-kit/include/"
 for f in main settings settings_menu png_write; do cp "$BUILD/CMakeFiles/ssne-port.dir/port/src/$f.cpp.obj" "$OUT/build-kit/lib/port/$f.obj"; done
 "$LLVM/bin/x86_64-w64-mingw32-windres" -I "$ROOT/port/resources" -i "$ROOT/port/resources/game.rc" -O coff -o "$OUT/build-kit/lib/port/game-icon.obj"
 cp "$BUILD/libssne-runtime.a" "$BUILD/libimgui.a" "$BUILD/libgc.a" "$OUT/build-kit/lib/"
+if [ -n "${SSNE_MESA_ARCHIVE:-}" ]; then
+  python3 "$ROOT/tools/stage_vulkan.py" "$SSNE_MESA_ARCHIVE" "$OUT"
+fi
 cp "$BUILD/_deps/sdl2-build/libSDL2main.a" "$BUILD/_deps/sdl2-build/libSDL2.a" "$OUT/build-kit/lib/"
 "$STRIP" -g "$OUT"/build-kit/lib/*.a "$OUT"/build-kit/lib/port/*.obj
 

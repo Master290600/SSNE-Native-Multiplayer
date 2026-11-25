@@ -3,6 +3,9 @@
 #include "ssne/connected_camera_updates.h"
 #include "ssne/native_results.h"
 #include "ssne/native_cutscene.h"
+#include "ssne/native_movement_step.h"
+#include "ssne/native_movement_step_detail.h"
+#include "ssne/native_movement_input.h"
 #include <cstring>
 #include "ssne/weapon_groups.h"
 #include "ssne/runtime.h"
@@ -80,9 +83,190 @@ int actor_slot(uint32_t actor) {
 }
 }
 namespace {
+const void* movement_step_owner=nullptr;
+NativeMovementStepPrepare movement_step_prepare;
+NativeMovementStepCompleted movement_step_completed;
+PPCFunc walking_step_original=nullptr;
+struct MovementAnimationClock {
+    uint32_t actor=0,controller=0;
+    uint64_t life=0,completed=0;
+};
+std::array<MovementAnimationClock,8> movement_animation_clocks{};
+
+std::optional<movement_step_detail::Binding> movement_binding(uint32_t actor){
+    return movement_step_detail::binding(actor,native_party_registry(),native_party_capacity(),guest_ram_end(),
+        native_party_spawn_waiting(actor),[](uint32_t p){return mem_read32(p);});
+}
+
+void queued_walking_step(PPCContext& ctx){
+    const auto original=[&]{ssne_call_original(ctx,0x800A8680u,walking_step_original);};
+    if(!movement_step_owner || !movement_step_prepare || !movement_step_completed || replica_simulation()){
+        original();return;
+    }
+    const auto actor=ctx.r[4],controller=ctx.r[3];
+    const auto binding=movement_binding(actor);
+    if(!binding || binding->controller!=controller){original();return;}
+    const float dt=float(ctx.ps0[1]);
+    if(!movement_step_detail::step_time(dt)){
+        static unsigned reports=0;
+        if(reports++<8)log_message("[coop-movement-step-unsupported-dt] slot="+std::to_string(binding->slot)+" dt="+std::to_string(dt));
+        original();return;
+    }
+    const auto owner_token=movement_step_owner;
+    const NativeMovementStepInfo step{binding->slot,actor,controller,dt};
+    const auto life=native_party_spawn_revision(actor);
+    auto& animation_clock=movement_animation_clocks[step.slot];
+    const PPCContext entry=ctx;
+    for(unsigned iteration=0;iteration<4;++iteration){
+        if(iteration){
+            if(movement_step_owner!=owner_token || !movement_step_prepare || !movement_step_completed ||
+               native_party_spawn_revision(actor)!=life)return;
+            const auto current=movement_binding(actor);
+            if(!current || current->slot!=step.slot || current->controller!=controller)return;
+        }
+        const auto decision=movement_step_prepare(step);
+        if(decision.action==NativeMovementStepAction::Legacy){animation_clock={};if(!iteration)original();return;}
+        if(animation_clock.actor!=actor || animation_clock.controller!=controller || animation_clock.life!=life)
+            animation_clock={actor,controller,life,0};
+        if(decision.action==NativeMovementStepAction::Wait)return;
+        if(movement_step_owner!=owner_token || decision.action!=NativeMovementStepAction::Execute ||
+           !movement_step_detail::command_valid(decision.command)){
+            log_message("[coop-movement-step-invalid-command] slot="+std::to_string(step.slot));
+            return; // No unvalidated command, held-input fallback, or false ACK.
+        }
+        const auto channel=mem_read32(actor+0x178);
+        const auto base=mem_read32(0x802ABA9Cu);
+        if(channel>=native_party_capacity() || !valid(base,4))return;
+        const auto bank=base+native_party_controller_offset(channel);
+        if(!valid(bank,0x9C))return;
+        const auto actions=native_movement_actions(uint8_t(int(decision.command.stick_x)+128),
+                                                   uint8_t(int(decision.command.stick_y)+128));
+        if(!std::isfinite(actions[0]) || !std::isfinite(actions[1]))return;
+        // Walking clobbers volatile r3/r4/f1. Every catch-up invocation needs
+        // the original entry arguments, stack and return address again.
+        PPCContext call=entry;
+        {
+            movement_step_detail::ScopedWords words([](uint32_t p){return mem_read32(p);},
+                                                    [](uint32_t p,uint32_t value){mem_write32(p,value);});
+            // Only movement and JumpPressed belong to this queued step.
+            // Weapon/menu/look actions keep the original input processor.
+            words.set(bank+0x44,f2u(std::max(actions[1],0.f)));
+            words.set(bank+0x60,f2u(std::max(-actions[1],0.f)));
+            words.set(bank+0x98,f2u(std::max(actions[0],0.f)));
+            words.set(bank+0x7C,f2u(std::max(-actions[0],0.f)));
+            words.set(bank+0x10,decision.command.jump_pressed?1u:0u);
+            words.set(actor+0x290,f2u(decision.command.yaw));
+            ssne_call_original(call,0x800A8680u,walking_step_original);
+        }
+        ctx=call;
+        // ACK follows actual original physics, including contacts and timers.
+        // Teardown during a native callback cancels publication and catch-up.
+        if(movement_step_owner!=owner_token || !movement_step_completed ||
+           native_party_spawn_revision(actor)!=life)return;
+        ++animation_clock.completed;
+        movement_step_completed(step,decision.command);
+        if(!decision.catch_up)return;
+    }
+}
+
+void install_movement_steps(){
+    if(walking_step_original)return;
+    const auto* entry=ssne_find_func(0x800A8680u);
+    if(!entry || mem_read32(entry->address)!=0x9421FE88u)fatal("Unsupported PAL walking step");
+    const auto previous=*ssne_hook_slot(entry->address);
+    walking_step_original=previous?previous:entry->func;
+    ssne_install_hook(entry->address,queued_walking_step);
+}
+}
+
+void native_party_set_movement_steps(const void* owner,NativeMovementStepPrepare prepare,NativeMovementStepCompleted completed){
+    if(!owner || !prepare || !completed)return;
+    movement_animation_clocks={};
+    movement_step_owner=owner;movement_step_prepare=std::move(prepare);movement_step_completed=std::move(completed);
+}
+void native_party_clear_movement_steps(const void* owner){
+    if(movement_step_owner!=owner)return;
+    movement_animation_clocks={};
+    movement_step_prepare={};movement_step_completed={};movement_step_owner=nullptr;
+}
+std::optional<NativeMovementState> native_party_movement_state(uint32_t actor){
+    const auto binding=movement_binding(actor);
+    return binding?movement_step_detail::state(actor,*binding,[](uint32_t p){return mem_read32(p);}):std::nullopt;
+}
+std::optional<uint64_t> native_party_completed_movement_steps(uint32_t actor){
+    if(!movement_step_owner)return {};
+    const auto slot=actor_slot(actor);
+    if(slot<0 || mem_read32(actor+0x340)!=1)return {};
+    const auto& clock=movement_animation_clocks[slot];
+    if(clock.actor!=actor || clock.controller!=mem_read32(actor+0x344) ||
+       clock.life!=native_party_spawn_revision(actor))return {};
+    return clock.completed;
+}
+
+namespace {
 PPCFunc sphere_move_original = nullptr;
 PPCFunc ground_collision_original = nullptr;
+PPCFunc ground_support_original = nullptr;
 bool trace_sphere_queries = false;
+struct GroundPreview {
+    bool unsupported=false,invalid=false;
+};
+thread_local GroundPreview* ground_preview=nullptr;
+
+bool stationary_brush_side(uint32_t contact) {
+    // PAL's 8010C3E4 resolves this resource through the level's 200-entry
+    // brush registry. The kind byte identifies a MovingBrush entry.
+    const auto resource=mem_read32(contact+0x28);
+    const auto level=mem_read32(0x802DACC0u);
+    if(resource>=200 || !valid(level,0x7A8) || mem_read8(level+0x6E0+resource)!=1)return false;
+    const auto brush=mem_read32(level+0x3C0+4*resource);
+    // The replica gets the active and collision flags from the host.
+    // The local request flag (+0xB4) does not describe the current pose.
+    if(!valid(brush,0xB8) || mem_read32(brush+0x48)!=0x80206868u ||
+       mem_read32(brush+0xB0) || mem_read32(brush+0x58))return false;
+    const auto config=mem_read32(brush+0x5C);
+    if(!valid(config,0x1C) || mem_read32(config+0xC)!=resource || mem_read32(config+0x18))return false;
+
+    const auto x=u2f(mem_read32(contact+0x0C)),y=u2f(mem_read32(contact+0x10)),z=u2f(mem_read32(contact+0x14));
+    const auto normal_squared=x*x+y*y+z*z;
+    return std::abs(y)<.1f && std::abs(normal_squared-1.f)<.01f;
+}
+
+void filter_preview_contacts(PPCContext& ctx,uint32_t contacts,bool motion_sweep) {
+    if(!ground_preview)return;
+    if(ctx.r[3]>20 || !valid(contacts,20*48)){
+        ground_preview->invalid=true;
+        ctx.r[3]=0;
+        return;
+    }
+    unsigned kept=0;
+    for(unsigned i=0;i<ctx.r[3];++i){
+        const auto contact=contacts+i*48;
+        const auto kind=mem_read32(contact+36),flags=mem_read32(contact+32);
+        // The original actorMoveSphere dispatches trigger, carry and push
+        // callbacks after this query. Never let a visual preview dispatch them.
+        if(kind==3)continue;
+        const bool passive_side=motion_sweep && kind==2 && !(flags&0x80000000u) &&
+                                stationary_brush_side(contact);
+        if((kind!=0 && kind!=4 && !passive_side) || (flags&0x80000000u)){
+            ground_preview->unsupported=true;
+            continue;
+        }
+        const auto destination=contacts+kept*48;
+        if(kept!=i)std::memmove(host_ptr(destination),host_ptr(contact),48);
+        // The world sweep already clipped against this side. Keep the
+        // normal for step/slide handling while skipping brush callbacks.
+        if(passive_side)mem_write32(destination+36,0);
+        ++kept;
+    }
+    ctx.r[3]=kept;
+}
+
+void preview_ground_support(PPCContext& ctx) {
+    const auto contacts=ctx.r[6];
+    ssne_call_original(ctx,0x80141244u,ground_support_original);
+    filter_preview_contacts(ctx,contacts,false);
+}
 struct RestingSweep {
     PPCContext* context = nullptr;
     uint32_t start = 0, destination = 0;
@@ -106,8 +290,9 @@ void native_sphere_move(PPCContext& ctx) {
     static unsigned samples = 0;
     const bool trace = trace_sphere_queries && samples++ < 24;
     const auto from = ctx.r[4], output = ctx.r[6], hits = ctx.r[7];
+    const bool motion_sweep = ctx.lr == 0x800C065Cu;
     // Only the first world sweep inside this particular player's actorMoveSphere.
-    const bool at_rest = resting_sweep.context == &ctx && ctx.lr == 0x800C065Cu &&
+    const bool at_rest = resting_sweep.context == &ctx && motion_sweep &&
                          from == resting_sweep.start && output == resting_sweep.destination;
     if (trace) {
         std::string line="[coop-native-sphere-call] caller="+std::to_string(ctx.lr)+" radius="+std::to_string(ctx.ps0[1]);
@@ -116,7 +301,9 @@ void native_sphere_move(PPCContext& ctx) {
         log_message(line);
     }
     ssne_call_original(ctx, 0x80140620u, sphere_move_original);
-    if (at_rest && static_contacts(hits, ctx.r[3])) {
+    const bool static_rest_probe = at_rest && static_contacts(hits, ctx.r[3]);
+    filter_preview_contacts(ctx,hits,motion_sweep);
+    if (static_rest_probe) {
         // The only motion was our ground probe. Its separation bias, including
         // any lateral part on an incline, is not locomotion. Leave the contacts
         // intact. PAL now does its normal support sweep here to choose the height.
@@ -130,8 +317,20 @@ void ground_player_collision(PPCContext& ctx) {
     const auto actor = ctx.r[4], down = ctx.r[6], start = ctx.r[7];
     const auto motion = ctx.r[8], additional = ctx.r[9], destination = ctx.r[10];
     const auto original = [&] { ssne_call_original(ctx, 0x800C04ACu, ground_collision_original); };
+    if(ctx.lr==0x800A92A8u && actor_slot(actor)>=0 && getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_TEST_STAIRS_CAMERA")){
+        static unsigned clock_samples=0;
+        // Walking 800A8680 saves its incoming dt in preserved f27. f1 at
+        // this collision call already holds the capsule radius.
+        if(clock_samples++<20)log_message("[coop-ground-clock] slot="+std::to_string(actor_slot(actor))+" dt="+std::to_string(ctx.ps0[27]));
+    }
     if (ctx.lr != 0x800A92A8u || actor_slot(actor) < 0 || !valid(down, 12) ||
         !valid(start, 12) || !valid(motion, 12) || !valid(additional, 12) || !valid(destination, 12)) {
+        original();
+        return;
+    }
+    // Airborne zero displacement is meaningful on the original jump's t0
+    // step. Keep it unchanged; only walking calls request the support probe.
+    if(!mem_read32(ctx.r[1]+8)){
         original();
         return;
     }
@@ -193,6 +392,7 @@ void native_party_install_geometry_trace() {
     }
 }
 void native_party_install_ground_collision() {
+    install_movement_steps();
     install_sphere_move();
     const auto* entry = ssne_find_func(0x800C04ACu);
     if (!entry || mem_read32(entry->address) != 0x9421FE98u) fatal("Unsupported native player collision routine");
@@ -283,6 +483,205 @@ bool native_ground_support(PPCContext& context,const std::array<float,3>& centre
        hit.position[1]<end[1]-.005f || hit.position[1]>start[1]+.005f)return true;
     support=hit;
     return true;
+}
+
+// Replay the PAL player/player response after the world sweep. Its player
+// branch reads the two sphere centres and the mover's previous position,
+// clips against the world, and writes only the mover's position.
+static bool preview_player_contact(PPCContext& context,uint32_t mover,uint32_t peer,
+                                   uint32_t start,uint32_t corrected,float radius,
+                                   std::span<const std::optional<std::array<float,3>>> peers) {
+    constexpr uint32_t player_table=0x802121E8u;
+    const auto* response=ssne_find_func(0x800A7AB0u);
+    const auto manager=mem_read32(0x802ABAA4u);
+    if(!response || mem_read32(response->address)!=0x9421FEF8u ||
+       mem_read16(player_table+0x30) || mem_read32(player_table+0x34)!=0x800B74B0u ||
+       mem_read16(player_table+0x190) || mem_read32(player_table+0x194)!=0x8009C404u ||
+       !valid(manager,4) || mem_read32(manager)!=0x8021EB70u ||
+       mem_read16(0x8021EC10u) || mem_read32(0x8021EC14u)!=0x80140620u ||
+       u2f(mem_read32(0x8020E6C4u))!=radius)return false;
+
+    mem_write32(mover+0x48,player_table);
+    mem_write32(peer+0x48,player_table);
+    const float diameter=2.f*radius;
+    bool hit=false;
+    for(const auto& position:peers){
+        if(!position)continue;
+        float distance_squared=0.f;
+        for(unsigned axis=0;axis<3;++axis){
+            const float difference=u2f(mem_read32(corrected+4*axis))-(*position)[axis];
+            distance_squared+=difference*difference;
+        }
+        if(!(distance_squared>0.f && distance_squared<diameter*diameter))continue;
+        for(unsigned axis=0;axis<3;++axis){
+            mem_write32(mover+0x20+4*axis,mem_read32(corrected+4*axis));
+            mem_write32(mover+0x74+4*axis,mem_read32(start+4*axis));
+            mem_write32(peer+0x20+4*axis,f2u((*position)[axis]));
+        }
+        auto call=context;
+        call.msr&=~0x8000u;
+        call.r[1]-=0x1200u;
+        mem_write32(call.r[1],context.r[1]);
+        call.r[3]=0;call.r[4]=mover;call.r[5]=peer;
+        ssne_call_original(call,response->address,response->func);
+        for(unsigned axis=0;axis<3;++axis){
+            const auto adjusted=mem_read32(mover+0x20+4*axis);
+            hit|=adjusted!=mem_read32(corrected+4*axis);
+            mem_write32(corrected+4*axis,adjusted);
+        }
+    }
+    return hit;
+}
+
+static bool command_ground_motion(PPCContext& context,const std::array<float,3>& from,
+                                const std::array<float,3>& desired,float radius,float dt,bool walking,
+                                NativeGroundMotionState& state,NativeGroundMotionResult& result,
+                                std::string& error,
+                                std::span<const std::optional<std::array<float,3>>> peers={}) {
+    error.clear();
+    constexpr unsigned stack_size=0x5000;
+    constexpr uint32_t contact_buffer=0x8028AF98u;
+    const auto* collision=ssne_find_func(0x800C04ACu);
+    const auto* support=ssne_find_func(0x80141244u);
+    if(mem_read32(0x80000000u)!=0x47334250u || context.r[13]!=0x802E22A0u ||
+       context.r[2]!=0x802F22A0u || context.r[1]<0x80000000u+stack_size ||
+       context.r[1]>guest_ram_end()-4 || !collision || !support ||
+       mem_read32(collision->address)!=0x9421FE98u || mem_read32(support->address)!=0x9421FE48u ||
+       !valid(contact_buffer,20*48)){
+        error="Native ground motion context unavailable";
+        return false;
+    }
+    if(!std::isfinite(radius) || radius<=0.f || radius>100.f || !std::isfinite(dt) || dt<0.f || dt>.1f){
+        error="Invalid native ground motion parameters";
+        return false;
+    }
+    for(const auto& point:{from,desired})for(float value:point)if(!std::isfinite(value) || std::abs(value)>1000000.f){
+        error="Invalid native ground motion position";
+        return false;
+    }
+    for(float value:state.step)if(!std::isfinite(value) || std::abs(value)>1000000.f){
+        error="Invalid native ground motion step state";
+        return false;
+    }
+    if(!ground_support_original){
+        if(*ssne_hook_slot(support->address)){
+            error="Native ground support hook is in use";
+            return false;
+        }
+        ground_support_original=support->func;
+        ssne_install_hook(support->address,preview_ground_support);
+    }
+    install_sphere_move();
+
+    // The scratch actor never enters a game registry. The original routine
+    // needs only its carry reference and 708..718 step fields for static hits.
+    std::array<uint8_t,stack_size> saved_stack;
+    std::array<uint8_t,20*48> saved_contacts;
+    auto* stack=host_ptr(context.r[1]-stack_size);
+    std::memcpy(saved_stack.data(),stack,saved_stack.size());
+    std::memcpy(saved_contacts.data(),host_ptr(contact_buffer),saved_contacts.size());
+    struct RestorePreview {
+        uint8_t* stack;
+        const std::array<uint8_t,stack_size>& saved_stack;
+        const std::array<uint8_t,20*48>& saved_contacts;
+        GroundPreview* previous;
+        RestingSweep previous_rest;
+        ~RestorePreview(){
+            ground_preview=previous;
+            resting_sweep=previous_rest;
+            std::memcpy(stack,saved_stack.data(),saved_stack.size());
+            std::memcpy(host_ptr(contact_buffer),saved_contacts.data(),saved_contacts.size());
+        }
+    } restore{stack,saved_stack,saved_contacts,ground_preview,resting_sweep};
+    GroundPreview preview;
+    ground_preview=&preview;
+    NativeGroundMotionState next=state;
+    std::array<float,3> motion;
+    float length_squared=0.f;
+    for(unsigned axis=0;axis<3;++axis){
+        motion[axis]=desired[axis]-from[axis];
+        length_squared+=motion[axis]*motion[axis];
+    }
+    if(dt>0.f){
+        // PAL 800A91D8..9250 suppresses a small walking displacement and
+        // advances the step cooldown before invoking actorMoveSphere.
+        const float minimum=u2f(mem_read32(0x802DA91Cu));
+        if(walking && length_squared<minimum*minimum){motion={};next.step[4]=0.f;}
+        else next.step[4]=std::max(0.f,next.step[4]-dt);
+    }
+    const bool neutral=motion==std::array<float,3>{};
+    if(walking && neutral)motion[1]=-.001f;
+    const auto actor=context.r[1]-0x1000u;
+    const auto output=context.r[1]-0x800u;
+    const auto start=context.r[1]-0x780u;
+    const auto movement=context.r[1]-0x770u;
+    const auto carry=context.r[1]-0x760u;
+    const auto down=context.r[1]-0x750u;
+    const auto corrected=context.r[1]-0x740u;
+    std::memset(host_ptr(actor),0,0x71c);
+    std::memset(host_ptr(output),0,0x40);
+    for(unsigned i=0;i<5;++i)mem_write32(actor+0x708u+4*i,f2u(next.step[i]));
+    for(unsigned axis=0;axis<3;++axis){
+        mem_write32(start+4*axis,f2u(from[axis]));
+        mem_write32(movement+4*axis,f2u(motion[axis]));
+        mem_write32(carry+4*axis,0);
+        mem_write32(down+4*axis,f2u(axis==1?-1.f:0.f));
+        mem_write32(corrected+4*axis,f2u(from[axis]));
+    }
+    PPCContext call=context;
+    call.msr&=~0x8000u;
+    call.r[1]-=0x1200u;
+    mem_write32(call.r[1],context.r[1]);
+    mem_write32(call.r[1]+8,walking?1u:0u); // Original phase0 support-cast flag.
+    call.r[3]=output;call.r[4]=actor;call.r[5]=actor;call.r[6]=down;
+    call.r[7]=start;call.r[8]=movement;call.r[9]=carry;call.r[10]=corrected;
+    call.ps0[1]=call.ps1[1]=radius;
+    resting_sweep=walking && neutral && next.step[0]==0.f?RestingSweep{&call,start,corrected}:RestingSweep{};
+    ssne_call_original(call,collision->address,collision->func);
+    if(preview.invalid){error="Invalid native ground motion contact result";return false;}
+    if(preview.unsupported)return false;
+    NativeGroundMotionResult found;
+    if(!peers.empty()){
+        // PAL resolves player overlap in the air as well as on the floor.
+        // The pair response uses a second sphere sweep without a hit buffer.
+        ground_preview=nullptr;
+        resting_sweep={};
+        found.player_contact=preview_player_contact(context,actor,context.r[1]-0x600u,start,corrected,radius,peers);
+    }
+    for(unsigned axis=0;axis<3;++axis){
+        found.position[axis]=u2f(mem_read32(corrected+4*axis));
+        if(!std::isfinite(found.position[axis])){
+            error="Invalid native ground motion result";
+            return false;
+        }
+    }
+    found.grounded=mem_read32(output+8)!=0;
+    found.sliding=mem_read32(output+0x1c)!=0;
+    found.contact_kind=mem_read32(output);
+    if(found.contact_kind>1){error="Invalid native ground contact kind";return false;}
+    for(unsigned i=0;i<5;++i){
+        next.step[i]=u2f(mem_read32(actor+0x708u+4*i));
+        if(!std::isfinite(next.step[i])){
+            error="Invalid native ground motion step result";
+            return false;
+        }
+    }
+    state=next;
+    result=found;
+    return true;
+}
+bool native_static_ground_motion(PPCContext& context,const std::array<float,3>& from,
+                                const std::array<float,3>& desired,float radius,float dt,
+                                NativeGroundMotionState& state,NativeGroundMotionResult& result,
+                                std::string& error){
+    return command_ground_motion(context,from,desired,radius,dt,true,state,result,error);
+}
+bool native_command_ground_motion(PPCContext& context,const std::array<float,3>& from,
+                                 const std::array<float,3>& desired,float radius,float dt,bool walking,
+                                 NativeGroundMotionState& state,NativeGroundMotionResult& result,
+                                 std::string& error,
+                                 std::span<const std::optional<std::array<float,3>>> peers){
+    return command_ground_motion(context,from,desired,radius,dt,walking,state,result,error,peers);
 }
 namespace {
 bool spawn_actor_overlap(PPCContext& context,uint32_t actor,const std::array<float,3>& point,float radius,bool& occupied,std::string& error) {

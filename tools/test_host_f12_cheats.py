@@ -119,6 +119,65 @@ def client_read_only(p,settings):
     record(p,'client_f12_controls_disabled_and_pointer_ignored',controls={key:widgets[key] for key in CHEAT_IDS},cheats=before)
     settings.close('client')
 
+def merged_cheat_menu(p, settings):
+    m = p.m
+    def key(scancode, role):
+        p.command(role, f'key down {scancode}')
+        p.command(role, f'key up {scancode}')
+
+    def widgets(role):
+        items = m.ui(role).get('widgets', [])
+        return {item['id']: item for item in items}
+
+    def select(section, role):
+        settings.click('cheat_section_' + section, role)
+
+    key(69, 'host')  # F12
+    m.wait(lambda: m.ui()['menu_open'], 8)
+    settings.click('tab_cheats')
+    m.wait(lambda: 'cheat_god' in widgets('host'), 8)
+    settings.click('cheat_speed', 'host', .40)
+    m.wait(lambda: m.ui()['cheats']['speed'] > 100, 8)
+    speed = m.ui()['cheats']['speed']
+    select('enemies', 'host')
+    settings.click('cheat_no_spawns')
+    m.wait(lambda: m.ui()['cheats']['no_spawns'], 8)
+    def entries():
+        return [k for k in widgets('host') if k.startswith('cheat_catalog_') and k.removeprefix('cheat_catalog_').isdigit()]
+    m.wait(entries, 10)
+    settings.click(entries()[0])
+    assert widgets('host')['cheat_spawn']['enabled']
+    settings.click('cheat_catalog_search')
+    p.command('host', 'text zzzzzzzxz')
+    m.wait(lambda: not entries() and not widgets('host')['cheat_spawn']['enabled'], 8)
+    key(69, 'host')
+    m.wait(lambda: not m.ui()['menu_open'], 8)
+
+    key(73, 'client')  # Insert from the game goes straight to Player & Weapons.
+    m.wait(lambda: 'cheat_speed' in widgets('client'), 12)
+    m.wait(lambda: m.ui('client')['cheats']['speed'] == speed, 8)
+    assert not widgets('client')['cheat_speed']['enabled']
+    select('enemies', 'client')
+    m.wait(lambda: 'cheat_spawn' in widgets('client'), 8)
+    assert m.ui('client')['cheats']['no_spawns']
+    assert not widgets('client')['cheat_spawn']['enabled']
+    assert not widgets('client')['cheat_no_spawns']['enabled']
+    select('aim', 'client')
+    settings.click('cheat_item_esp', 'client')
+    m.wait(lambda: m.ui('client')['cheats']['item_esp'], 8)
+    assert not m.ui()['cheats']['item_esp']
+    settings.click('cheat_item_esp', 'client')
+    key(73, 'client')
+    m.wait(lambda: not m.ui('client')['menu_open'], 8)
+    settings.open('host')  # The fixture explicitly selects Graphics.
+    key(73, 'host')
+    m.wait(lambda: 'cheat_god' in widgets('host'), 8)
+    settings.click('cheat_off')
+    m.wait(lambda: m.ui()['cheats']['speed']==100 and not m.ui()['cheats']['no_spawns'], 8)
+    key(41, 'host')  # Escape closes the same window.
+    m.wait(lambda: not m.ui()['menu_open'], 8)
+    record(p, 'merged_cheats_shortcuts_catalog_and_role_permissions', replicated_speed=speed)
+
 
 def select_uzis(p):
     m=p.m
@@ -149,6 +208,7 @@ def verify_replica(p,offset):
 def exercise(p,settings):
     m=p.m;m.start_role('host',m.a.language);direct_gameplay_setup(p)
     fresh_players(m);log_start=len(m.log('client'))
+    merged_cheat_menu(p,settings)
     open_cheats(settings)
     for key in ('god','ammo','weapons'):switch(p,settings,key,True)
     settings.close();m.wait(lambda:shared(m,{'god':True,'ammo':True,'weapons':True}),12)
@@ -203,7 +263,7 @@ def arguments():
     assert a.exe.is_file() and a.card.is_file() and a.png.is_file() and (a.data/'sys/main.dol').is_file()
     assert 1024<a.port<65528
     a.case='host-client-direct';a.language=a.client_language=1;a.fps=60;a.allow_start_key_fallback=False
-    a.test_env={'SSNE_TEST_DEVICE_KEY_FILE':KEY_FILE,'SSNE_COOP_CAMPAIGN_VERIFY':'1'}
+    a.test_env={'SSNE_TEST_DEVICE_KEY_FILE':KEY_FILE,'SSNE_COOP_CAMPAIGN_VERIFY':'1','SSNE_TEST_CHAT':'1'}
     a.private_settings='[graphics]\nrenderer=gpu\nscale=1\naspect=3\nhud_edges=1\nside_fill=1\nvsync=0\nwindow_w=1100\nwindow_h=850\ntop_bar=0\nfullscreen=0\n[audio]\nmuted=1\n[general]\npause_unfocused=0\npause_in_menu=0\nskip_intros=1\ngame_language=1\nkbm_player='+str(a.kbm_player)+'\n'
     return a
 

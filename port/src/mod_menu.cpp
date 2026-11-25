@@ -1,157 +1,207 @@
 #include "mod_menu.h"
 #include "settings_menu.h"
-#include <imgui.h>
+#include "settings_menu_i18n.h"
+
 #include <algorithm>
-#include <cstdlib>
 #include <cstdio>
+#include <imgui.h>
+
 namespace port {
-namespace {int g_mod_tab=-1;bool g_mod_open=false;const ImVec4 kDim(.62f,.62f,.66f,1),kAccent(1,.76f,.22f,1),kWarn(1,.55f,.35f,1);}
-void mod_menu_select_tab(int tab){g_mod_tab=std::clamp(tab,0,4);}
-bool mod_menu_open() { return g_mod_open; }
-void mod_menu_set_open(bool open) { g_mod_open=open; if(open) menu_set_open(false); }
-void draw_mod_menu(const ModMenuControls& controls) {
- if(!g_mod_open) return;
- auto s=ssne::mod_state(); auto options=s.options;
- if(controls.netplay && controls.host) options=controls.requested;
- auto apply=[&](bool local=false) { if(controls.netplay) { auto& fn=local?controls.apply_local:controls.apply; if(fn) fn(options); } else ssne::mod_options(options); };
- auto vp=ImGui::GetMainViewport();
- ImGui::SetNextWindowPos(ImVec2(vp->Size.x*.5f,vp->Size.y*.5f),ImGuiCond_Always,ImVec2(.5f,.5f));
- ImGui::SetNextWindowSize(ImVec2(std::min(620.f,vp->Size.x-40),std::min(480.f,vp->Size.y-40)),ImGuiCond_Always);
- ImGui::SetNextWindowBgAlpha(1);
- bool visible=ImGui::Begin("Mod menu - Insert / Esc",&g_mod_open,ImGuiWindowFlags_NoCollapse|ImGuiWindowFlags_NoSavedSettings);
- if(visible) {
-  ImGui::TextWrapped(controls.netplay ? "Netplay: Aimbot / ESP and Item ESP use your own player and camera. Each PC configures them independently. The host controls shared cheats and spawns." : "Single player. Options last for this session. The game continues while this menu is open.");
-  if(controls.netplay && !controls.host) ImGui::TextDisabled("The host controls the shared mods.");
-  if(!s.active) ImGui::TextColored(kWarn,"Load a level to enable the controls.");
-  if(ImGui::BeginTabBar("##mods")) {
-   if(ImGui::BeginTabItem("Player cheats",nullptr,g_mod_tab==0?ImGuiTabItemFlags_SetSelected:0)) {
-    ImGui::BeginDisabled(!s.active || (controls.netplay && !controls.host));
-    bool changed=ImGui::Checkbox("God mode",&options.god);
-    changed|=ImGui::Checkbox("Infinite ammunition",&options.ammo);
-    changed|=ImGui::Checkbox("All weapons",&options.weapons);
-    changed|=ImGui::Checkbox("Prevent regular enemy spawns",&options.no_enemies);
-    changed|=ImGui::Checkbox("Rapid fire",&options.rapid_fire);
-    ImGui::BeginDisabled(!options.rapid_fire);
-    changed|=ImGui::SliderFloat("Fire rate multiplier",&options.fire_multiplier,1,10,"%.1fx");
-    ImGui::EndDisabled();
-    ImGui::TextWrapped("Increases native attack rates. Ammo use and weapon animations still apply.");
-    if(ImGui::Button("Disable all cheats")) { options={}; changed=true; }
-    if(changed) apply();
-    ImGui::EndDisabled();
-    ImGui::EndTabItem();
-   }
-   static bool open_targeting=getenv("SSNE_OPEN_MOD_TARGETING")!=nullptr;
-   if(ImGui::BeginTabItem("Aimbot / ESP",nullptr,(open_targeting || g_mod_tab==1)?ImGuiTabItemFlags_SetSelected:0)) {
-    open_targeting=false;
-    ImGui::BeginChild("Target options",ImVec2(0,-68),false);
-    ImGui::BeginDisabled(!s.active || !s.targeting_available);
-    bool changed=ImGui::Checkbox("Aimbot",&options.aimbot);
-    changed|=ImGui::Checkbox("Only while holding right mouse button",&options.aim_hold);
-    changed|=ImGui::SliderFloat("Aim cone (degrees)",&options.aim_fov,1,90,"%.0f");
-    changed|=ImGui::SliderFloat("Aim speed",&options.aim_speed,1,60,"%.0f");
-        changed|=ImGui::Combo("Aim point",&options.aim_point,"Model center\0Nearest bone to crosshair\0Head bone\0Torso bone\0Bone index\0");
-    if(options.aim_point==4)changed|=ImGui::SliderInt("Bone index",&options.aim_bone,0,127);
-    ImGui::BeginDisabled(options.aim_point!=0);
-    changed|=ImGui::Checkbox("Automatic aim height from model size",&options.auto_aim_height);
-    changed|=ImGui::SliderFloat(options.auto_aim_height?"Height adjustment":"Aim height (m)",&options.aim_height,0,10,"%.1f");
-    if(options.auto_aim_height) ImGui::TextDisabled("Uses model center. Height adjustment 1.0 is neutral.");
-    ImGui::EndDisabled();
-    ImGui::Separator();
-    changed|=ImGui::Checkbox("Enemy ESP (also through walls)",&options.esp);
-    changed|=ImGui::Checkbox("Enemy names",&options.esp_names);
-    changed|=ImGui::Checkbox("Distance",&options.esp_distance);
-    changed|=ImGui::Checkbox("Health bars / HP",&options.esp_health);
-    changed|=ImGui::Checkbox("Bones ESP (animated body parts)",&options.bone_esp);
-    changed|=ImGui::Checkbox("Bone names / indices",&options.bone_names);
-    changed|=ImGui::SliderFloat("Target / ESP range (m)",&options.range,5,500,"%.0f");
-    if(changed) apply(true);
-    ImGui::EndDisabled();
-    ImGui::EndChild();
-    ImGui::Text("Living enemies tracked: %u",s.tracked_enemies);
-    ImGui::TextWrapped("Targets use animated centers of named skin groups, not exact joints. Missing groups fall back to model center. Indices vary by monster. Yellow marks the aim target.");
-    if(!s.targeting_available) ImGui::TextColored(kWarn,"Targeting hooks unavailable for this game build.");
-    ImGui::EndTabItem();
-   }
-   static bool open_items=getenv("SSNE_OPEN_MOD_ITEMS")!=nullptr;
-   if(ImGui::BeginTabItem("Item ESP",nullptr,(open_items || g_mod_tab==2)?ImGuiTabItemFlags_SetSelected:0)) {
-    open_items=false;
-    ImGui::BeginDisabled(!s.active || !s.targeting_available);
-    bool changed=ImGui::Checkbox("Item ESP (also through walls)",&options.item_esp);
-    changed|=ImGui::Checkbox("Weapons",&options.item_weapons);
-    changed|=ImGui::Checkbox("Health",&options.item_health);
-    changed|=ImGui::Checkbox("Armor",&options.item_armor);
-    changed|=ImGui::Checkbox("Secrets (undiscovered triggers)",&options.item_secrets);
-    changed|=ImGui::Checkbox("Distance",&options.esp_distance);
-    changed|=ImGui::SliderFloat("ESP range (m)",&options.range,5,500,"%.0f");
-    if(changed)apply(true);
-    ImGui::EndDisabled();
-    ImGui::TextWrapped("Weapons: orange. Health: green. Armor: blue. Secrets: purple. Secret markers show the discovery trigger, which may be separate from a hidden pickup.");
-    ImGui::EndTabItem();
-   }   static bool select_spawn=getenv("SSNE_OPEN_MOD_SPAWN")!=nullptr;
-   if(ImGui::BeginTabItem("Spawn",nullptr,(select_spawn || g_mod_tab==3)?ImGuiTabItemFlags_SetSelected:0)) {
-    select_spawn=false;
-    ImGui::BeginDisabled(!s.active || (controls.netplay && !controls.host));
-    static int filter=0,count=1; static unsigned selected=0; static float distance=6;
-    static bool global=true;
-    ImGui::Checkbox("Global catalog (weapons / items)",&global);
-    ImGui::Combo("Type",&filter,"Enemies\0Weapons\0Items / ammunition\0");
-    auto matches=[&](const ssne::ModTemplate& t) {
-     if(filter==0) return t.enemy;
-     if(t.enemy) return false;
-     bool weapon=false;
-     for(auto& entry:ssne::mod_catalog()) if(!entry.enemy && entry.type==t.type) weapon=entry.weapon;
-     return filter==1 ? weapon : !weapon;
-    };
-    const char* preview=global?"Select an enemy or item":"Select a template";
-    if(global) {
-      for(auto &e:ssne::mod_catalog()) if(!e.availability_note && (filter==0?e.enemy:(!e.enemy&&e.weapon==(filter==1))) && selected==((e.enemy?0x80000000u:0x40000000u)|e.type)) preview=e.name.c_str();
-    } else for(auto& t:s.templates) if(t.id==selected && matches(t)) preview=t.name.c_str();
-    if(ImGui::BeginCombo(global?"Enemy / item":"Template",preview)) {
-     if(global) {
-       for(auto &e:ssne::mod_catalog()) if(!e.availability_note && (filter==0?e.enemy:(!e.enemy&&e.weapon==(filter==1)))) {
-         unsigned id=(e.enemy?0x80000000u:0x40000000u)|e.type;
-         if(ImGui::Selectable(e.name.c_str(),selected==id)) selected=id;
-       }
-     } else for(auto& t:s.templates) if(matches(t) && ImGui::Selectable(t.name.c_str(),t.id==selected)) selected=t.id;
-     ImGui::EndCombo();
+namespace {
+bool can_edit_shared(const ModMenuControls& controls) {
+    return !controls.netplay || controls.host;
+}
+
+void apply_shared(const ModMenuControls& controls, const ssne::ModOptions& options) {
+    if (!controls.netplay) ssne::mod_options(options);
+    else if (controls.host && controls.apply) controls.apply(options);
+}
+
+bool slider_float(const char* name, float& value, float low, float high, const char* format) {
+    return ImGui::SliderFloat(menu_ui::label(name).c_str(), &value, low, high, format);
+}
+
+struct CatalogChoice {
+    unsigned id;
+    const std::string& name;
+    const char* note;
+    bool available;
+};
+
+std::vector<CatalogChoice> spawn_catalog(const ssne::ModState& state, int category, bool global) {
+    const auto& catalog = ssne::mod_catalog();
+    std::vector<CatalogChoice> choices;
+    if (global) {
+        for (const auto& entry : catalog) {
+            if (entry.enemy ? category != 0 : (category == 0 || entry.weapon != (category == 1))) continue;
+            const bool loaded = std::any_of(state.templates.begin(), state.templates.end(), [&](const auto& t) {
+                return t.enemy == entry.enemy && t.type == entry.type;
+            });
+            const bool available = !entry.availability_note && (!entry.enemy || loaded);
+            const char* note = entry.availability_note;
+            if (!note && entry.enemy && !loaded) note = "Not loaded in this level";
+            choices.push_back({(entry.enemy ? 0x80000000u : 0x40000000u) | entry.type, entry.name, note, available});
+        }
+    } else {
+        for (const auto& t : state.templates) {
+            if (t.enemy != (category == 0)) continue;
+            if (!t.enemy) {
+                const bool weapon = std::any_of(catalog.begin(), catalog.end(), [&](const auto& entry) {
+                    return !entry.enemy && entry.weapon && entry.type == t.type;
+                });
+                if (weapon != (category == 1)) continue;
+            }
+            choices.push_back({t.id, t.name, nullptr, true});
+        }
     }
-    ImGui::SliderInt("Count",&count,1,10); ImGui::SliderFloat("Distance ahead",&distance,3,30,"%.1f");
-    bool exists=false; for(auto& t:s.templates) exists|=t.id==selected && matches(t);
-    if(global) for(auto&e:ssne::mod_catalog()) exists|=!e.availability_note && (filter==0?e.enemy:(!e.enemy&&e.weapon==(filter==1))) && selected==((e.enemy?0x80000000u:0x40000000u)|e.type);
-    ImGui::BeginDisabled(!exists);
-    if(ImGui::Button("Spawn")) {
-      if(controls.netplay) { if(controls.spawn) controls.spawn(selected,count,distance); }
-      else if(global) ssne::mod_spawn_type((selected&0x80000000u)!=0,selected&0x3FFFFFFFu,count,distance);
-      else ssne::mod_spawn(selected,count,distance);
+    return choices;
+}
+
+void show_spawn_status(const std::string& status) {
+    if (status.empty() || status == "Ready. Select cheats or a spawn template." ||
+        status == "Enter a level to use cheats and collect spawn templates.") return;
+    unsigned placed = 0, requested = 0;
+    if (std::sscanf(status.c_str(), "Spawned %u / %u.", &placed, &requested) == 2)
+        menu_ui::Text("Spawned %u / %u.", placed, requested);
+    else
+        ImGui::TextWrapped("%s", menu_ui::text(status.c_str()));
+}
+} // namespace
+
+void draw_rapid_fire(const ModMenuControls& controls, const ssne::ModState& state) {
+    auto options = controls.netplay && controls.host ? controls.requested : state.options;
+    const bool enabled = state.active && can_edit_shared(controls);
+    ImGui::BeginDisabled(!enabled);
+    bool changed = menu_ui::Checkbox("Rapid fire", &options.rapid_fire);
+    menu_trace_cheat_widget("cheat_rapid", enabled);
+    if (options.rapid_fire) {
+        changed |= slider_float("Fire rate multiplier", options.fire_multiplier, 1, 10, "%.1fx");
+        menu_trace_cheat_widget("cheat_fire_rate", enabled);
     }
+    if (changed) apply_shared(controls, options);
     ImGui::EndDisabled();
-    ImGui::TextWrapped(global?"Weapons and items do not require a level template. Enemies still require a model loaded in this level; absent models are refused. Vehicle weapon configurations are not independent pickups.":"Templates are collected from objects loaded in this level. Use an open area for spawning.");
+}
+
+void draw_spawn_controls(const ModMenuControls& controls, const ssne::ModState& state) {
+    const bool enabled = state.active && can_edit_shared(controls);
+    auto options = controls.netplay && controls.host ? controls.requested : state.options;
+    ImGui::BeginDisabled(!enabled);
+    if (menu_ui::Checkbox("Prevent regular enemy spawns", &options.no_enemies)) apply_shared(controls, options);
+    menu_trace_cheat_widget("cheat_no_spawns", enabled);
     ImGui::EndDisabled();
-    ImGui::EndTabItem();
-   }
-   static bool select_catalog=getenv("SSNE_OPEN_MOD_CATALOG")!=nullptr;
-   if(ImGui::BeginTabItem("Names / catalog",nullptr,(select_catalog || g_mod_tab==4)?ImGuiTabItemFlags_SetSelected:0)) {
-    select_catalog=false;
-    static int category=0;
-    ImGui::Combo("Show",&category,"Enemies\0Weapons\0Items / ammunition\0");
-    ImGui::TextWrapped("Known type catalog. Use Global catalog on the Spawn tab to spawn native types across levels. Boss components can require their encounter; vehicle weapons have no separate pickup.");
-    ImGui::BeginChild("##mod_catalog",ImVec2(0,-32),true);
-    for(auto& entry:ssne::mod_catalog()) {
-     if(category==0 ? !entry.enemy : (entry.enemy || entry.weapon!=(category==1))) continue;
-     bool loaded=false;
-     for(auto& t:s.templates) loaded|=!entry.availability_note && t.enemy==entry.enemy && t.type==entry.type;
-     ImGui::TextColored(loaded?kAccent:kDim,"%s",entry.name.c_str());
-     ImGui::SameLine();
-     ImGui::TextColored(kDim,"(%s)",entry.availability_note?entry.availability_note:(loaded?"template loaded":"not loaded in this level"));
+
+    static bool global = true;
+    static int category = 0, count = 1;
+    static float distance = 6;
+    static unsigned selected = 0;
+    static ImGuiTextFilter search;
+    const bool columns = ImGui::GetContentRegionAvail().x >= 570;
+    const bool table = columns && ImGui::BeginTable("##spawn-columns", 2, ImGuiTableFlags_SizingStretchProp);
+    if (table) {
+        ImGui::TableSetupColumn("##list", ImGuiTableColumnFlags_WidthStretch, 1.45f);
+        ImGui::TableSetupColumn("##placement", ImGuiTableColumnFlags_WidthStretch, 1.f);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
     }
-    ImGui::EndChild();
-    ImGui::EndTabItem();
-   }
-   ImGui::EndTabBar();g_mod_tab=-1;
-  }
-  ImGui::Separator(); ImGui::TextWrapped("%s",s.status.c_str());
- }
- ImGui::End();
+    menu_ui::SeparatorText("Catalog");
+    if (menu_ui::Checkbox("Show global catalog", &global)) selected = 0;
+    if (menu_ui::Combo("Category", &category, "Enemies\0Weapons\0Items / ammunition\0")) selected = 0;
+    const auto choices = spawn_catalog(state, category, global);
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::InputTextWithHint("##catalog-search", menu_ui::text("Search by name"), search.InputBuf, sizeof(search.InputBuf))) {
+        search.Build();
+        selected = 0;
+    }
+    menu_trace_cheat_widget("cheat_catalog_search", true);
+    if (ImGui::BeginListBox("##spawn-choices", ImVec2(-1, ImGui::GetTextLineHeightWithSpacing() * 7))) {
+        bool matches = false;
+        for (const auto& choice : choices) {
+            if (!search.PassFilter(choice.name.c_str())) continue;
+            matches = true;
+            ImGui::PushID(choice.name.c_str());
+            ImGui::PushID(static_cast<int>(choice.id));
+            ImGui::BeginDisabled(!choice.available);
+            if (ImGui::Selectable(choice.name.c_str(), selected && selected == choice.id)) selected = choice.id;
+            if (choice.available) menu_trace_cheat_widget(("cheat_catalog_" + std::to_string(choice.id)).c_str(), true);
+            if (choice.note && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                menu_ui::SetTooltip("%s", menu_ui::text(choice.note));
+            ImGui::EndDisabled();
+            ImGui::PopID();
+            ImGui::PopID();
+        }
+        if (!matches) menu_ui::TextDisabled("No matches");
+        ImGui::EndListBox();
+    }
+    if (table) ImGui::TableSetColumnIndex(1);
+    menu_ui::SeparatorText("Spawn");
+    const auto choice = std::find_if(choices.begin(), choices.end(), [&](const auto& value) {
+        return selected && value.available && value.id == selected;
+    });
+    if (choice != choices.end()) ImGui::TextWrapped("%s", choice->name.c_str());
+    else menu_ui::TextWrapped("Select an entry in the catalog.");
+    ImGui::BeginDisabled(!enabled);
+    menu_ui::TextUnformatted("Count");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::SliderInt("##spawn-count", &count, 1, 10);
+    menu_ui::TextUnformatted("Distance ahead");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::SliderFloat("##spawn-distance", &distance, 3, 30, "%.1f m");
+    ImGui::BeginDisabled(choice == choices.end());
+    if (menu_ui::Button("Spawn")) {
+        if (!controls.netplay) ssne::mod_spawn(selected, count, distance);
+        else if (controls.host && controls.spawn) controls.spawn(selected, count, distance);
+    }
+    menu_trace_cheat_widget("cheat_spawn", enabled && choice != choices.end());
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    if (enabled) show_spawn_status(state.status);
+    if (table) ImGui::EndTable();
+}
+
+void draw_aim_controls(const ModMenuControls& controls, const ssne::ModState& state) {
+    auto options = state.options;
+    const bool enabled = state.active && state.targeting_available;
+    ImGui::BeginDisabled(!enabled);
+    bool changed = menu_ui::Checkbox("Aimbot", &options.aimbot);
+    menu_trace_cheat_widget("cheat_aimbot", enabled);
+    if (options.aimbot) {
+        changed |= menu_ui::Checkbox("Only while holding right mouse button", &options.aim_hold);
+        changed |= slider_float("Aim cone", options.aim_fov, 1, 90, "%.0f°");
+        changed |= slider_float("Aim speed", options.aim_speed, 1, 60, "%.0f");
+        changed |= menu_ui::Combo("Aim point", &options.aim_point, "Model center\0Nearest bone to crosshair\0Head bone\0Torso bone\0Bone index\0");
+        if (options.aim_point == 4) changed |= menu_ui::SliderInt("Bone index", &options.aim_bone, 0, 127);
+        if (options.aim_point == 0) {
+            changed |= menu_ui::Checkbox("Automatic aim height from model size", &options.auto_aim_height);
+            changed |= slider_float(options.auto_aim_height ? "Height adjustment" : "Aim height (m)", options.aim_height, 0, 10, "%.1f");
+        }
+    }
+    menu_ui::SeparatorText("Enemy markers");
+    changed |= menu_ui::Checkbox("Enemy ESP (also through walls)", &options.esp);
+    if (options.esp) {
+        changed |= menu_ui::Checkbox("Enemy names", &options.esp_names);
+        changed |= menu_ui::Checkbox("Health bars / HP", &options.esp_health);
+    }
+    changed |= menu_ui::Checkbox("Show enemy bones", &options.bone_esp);
+    if (options.bone_esp) changed |= menu_ui::Checkbox("Bone names / indices", &options.bone_names);
+    menu_ui::SeparatorText("Item markers");
+    changed |= menu_ui::Checkbox("Item ESP (also through walls)", &options.item_esp);
+    menu_trace_cheat_widget("cheat_item_esp", enabled);
+    if (options.item_esp) {
+        changed |= menu_ui::Checkbox("Weapons", &options.item_weapons);
+        changed |= menu_ui::Checkbox("Health", &options.item_health);
+        changed |= menu_ui::Checkbox("Armor", &options.item_armor);
+        changed |= menu_ui::Checkbox("Secrets (undiscovered triggers)", &options.item_secrets);
+    }
+    menu_ui::SeparatorText("Range");
+    changed |= slider_float("Target and marker range", options.range, 5, 500, "%.0f m");
+    changed |= menu_ui::Checkbox("Show distance on markers", &options.esp_distance);
+    ImGui::EndDisabled();
+    if (changed) {
+        if (!controls.netplay) ssne::mod_options(options);
+        else if (controls.apply_local) controls.apply_local(options);
+    }
+    if (state.active && state.targeting_available) menu_ui::TextDisabled("Living enemies tracked: %u", state.tracked_enemies);
+    if (state.active && !state.targeting_available) menu_ui::TextDisabled("Targeting is unavailable for this game build.");
 }
 
 void draw_mod_overlay(float x,float y,float w,float h){

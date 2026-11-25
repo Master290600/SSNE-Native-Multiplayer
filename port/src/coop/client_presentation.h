@@ -158,7 +158,7 @@ inline bool presentation_continuous(const EntityState& a,const EntityState& b,do
 }
 inline bool presentation_field(const std::string& key){
     if(key.starts_with("rotor_row") || key=="pickup_glow_pose")return true;
-    if(key=="camera_mode" || key=="projectile_source" || key=="projectile_energy_phase" || key=="projectile_energy_visual")return true;
+    if(key=="camera_mode" || key=="camera_head_compression" || key=="projectile_source" || key=="projectile_energy_phase" || key=="projectile_energy_visual")return true;
     return key=="position" || key=="enemy_rotation" || key=="enemy_scale" || key.starts_with("camera_row") || key=="render_visible" || key.starts_with("render_row") || key.starts_with("body_render") ||
         ((key.starts_with("body") || key.starts_with("enemy_")) && key.find("_bone_")!=std::string::npos) ||
         (key.starts_with("weapon_model") && (key.find("_row")!=std::string::npos || key.find("_bone_")!=std::string::npos || key=="weapon_model_slot" || key=="weapon_model_visibility"));
@@ -181,6 +181,10 @@ inline bool presentation_vector_reuse_enabled(){
 inline void interpolate_property(Property& out,const Property& a,const Property& b,float alpha,const std::string& key){
     if(a.index()!=b.index())return;
     auto blend=[&](float x,float y){return x+(y-x)*alpha;};
+    if(key=="camera_head_compression"){
+        if(const auto* x=std::get_if<float>(&a))out=blend(*x,std::get<float>(b));
+        return;
+    }
     if(const auto* x=std::get_if<std::array<float,3>>(&a)){const auto& y=std::get<std::array<float,3>>(b);auto v=*x;for(unsigned i=0;i<3;++i){const auto delta=key=="enemy_rotation"?std::remainder(y[i]-v[i],6.283185307f):y[i]-v[i];v[i]+=delta*alpha;}out=v;}
     else if(const auto* x=std::get_if<std::array<float,4>>(&a)){const auto& y=std::get<std::array<float,4>>(b);auto v=*x;for(unsigned i=0;i<4;++i)v[i]=blend(v[i],y[i]);out=v;}
     else if(const auto* x=std::get_if<std::vector<float>>(&a)){
@@ -240,8 +244,9 @@ class ClientPresentation {
         return e.kind==EntityKind::Player || e.kind==EntityKind::Enemy || e.kind==EntityKind::Pickup || e.kind==EntityKind::Projectile ||
             (e.kind==EntityKind::Physics && (e.definition==3 || e.definition==4));
     }
-    static bool blends_value(const Property& a,const Property& b){
+    static bool blends_value(const Property& a,const Property& b,const std::string& key){
         if(a.index()!=b.index())return false;
+        if(key=="camera_head_compression" && std::holds_alternative<float>(a))return true;
         if(std::holds_alternative<std::array<float,3>>(a) || std::holds_alternative<std::array<float,4>>(a))return true;
         const auto* x=std::get_if<std::vector<float>>(&a);
         return x && x->size()==std::get<std::vector<float>>(b).size();
@@ -279,7 +284,7 @@ class ClientPresentation {
                                 if(lifetime_edge)eligible=false;
                             }
                             if(eligible && key.find("_bone_matrices")!=std::string::npos){auto count=key.substr(0,key.size()-8)+"count",layout=key.substr(0,key.size()-8)+"layout";if(!a->second.properties.contains(count) || !b->second.properties.contains(count) || !a->second.properties.contains(layout) || !b->second.properties.contains(layout) || a->second.properties.at(count)!=current.properties.at(count) || b->second.properties.at(count)!=current.properties.at(count) || a->second.properties.at(layout)!=current.properties.at(layout) || b->second.properties.at(layout)!=current.properties.at(layout))eligible=false;}
-                            if(eligible && blends_value(x->second,y->second)){
+                            if(eligible && blends_value(x->second,y->second,key)){
                                 field.before=&x->second;field.after=&y->second;field.blend=true;
                             }
                         }

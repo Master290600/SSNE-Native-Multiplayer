@@ -6,6 +6,8 @@
 #include <timeapi.h>
 #endif
 #include <SDL_opengl.h>
+#include "presentation_gl.h"
+#include "zink_runtime.h"
 #include <imgui.h>
 #include "movie_view.h"
 #include "ssne/movie_presentation.h"
@@ -147,6 +149,7 @@ uint8_t g_coop_weapon=255;
 
 bool network_game(){return g_net_host || g_net_client || g_coop_host || g_coop_client;}
 void halt_invitation_network();
+void draw_host_invitation_controls();
 void stop_network(){std::lock_guard lock(g_session_mutex);halt_invitation_network();g_net.stop();if(g_coop_server)g_coop_server->stop();if(g_coop_peer)g_coop_peer->stop();}
 std::unique_ptr<port::coop::NativeWorld> g_native_world;
 unsigned g_net_players=2;
@@ -352,20 +355,20 @@ bool update_game_texture() {
     int w, h;
     if (!ssne::gx_get_frame(g_pixels, w, h, g_frame_seq, g_software_frame_wide)) return false;
     if (!g_tex) {
-        glGenTextures(1, &g_tex);
-        glBindTexture(GL_TEXTURE_2D, g_tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        port::gl::GenTextures(1, &g_tex);
+        port::gl::BindTexture(GL_TEXTURE_2D, g_tex);
+        port::gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        port::gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        port::gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        port::gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
-    glBindTexture(GL_TEXTURE_2D, g_tex);
+    port::gl::BindTexture(GL_TEXTURE_2D, g_tex);
     if (w != g_tex_w || h != g_tex_h) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_pixels.data());
+        port::gl::TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_pixels.data());
         g_tex_w = w;
         g_tex_h = h;
     } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_pixels.data());
+        port::gl::TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, g_pixels.data());
     }
     return true;
 }
@@ -525,7 +528,7 @@ void draw_hitmarker(ImDrawList& draw, const port::GameViewRect& image,
 }
 
 void draw_hitmarkers(ImDrawList& draw, const port::GameViewRect& image) {
-    if (!g_set.hitmarker_enabled || g_coop_spectating || port::menu_open() || port::mod_menu_open()) return;
+    if (!g_set.hitmarker_enabled || g_coop_spectating || port::menu_open()) return;
     const bool online = g_coop_host || g_coop_client;
     for (unsigned slot=0; slot<(online?1u:4u); ++slot) {
         const auto pulse = ssne::native_hitmarker_pulse(slot);
@@ -556,7 +559,7 @@ void draw_game_view() {
     const ImVec2 p0(image.x,image.y);
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
-    dl->AddCallback([](const ImDrawList*, const ImDrawCmd*) { glDisable(GL_BLEND); }, nullptr);  // the game image is opaque
+    dl->AddCallback([](const ImDrawList*, const ImDrawCmd*) { port::gl::Disable(GL_BLEND); }, nullptr);  // the game image is opaque
     if (!movie && fill && w < W - 1.f) {  // only the actual image, not its blurred side fill, accepts input
         float fh = W * 0.75f;
         dl->AddImage((ImTextureID)(intptr_t)fill, ImVec2(vp->Pos.x, vp->Pos.y + (H - fh) * 0.5f), ImVec2(vp->Pos.x + W, vp->Pos.y + (H + fh) * 0.5f));
@@ -954,7 +957,10 @@ ssne::PadState scripted_pad(const ssne::PadState& live) {
         char name[24]{}; float at = 0, duration = 0.2f;
         if (sscanf(item.c_str(), "%23[^@]@%f:%f", name, &at, &duration) >= 2 && now >= at && now < at + duration) {
             if(!strcmp(name,"UISHOT")){static std::vector<size_t> sent;if(std::find(sent.begin(),sent.end(),pos)==sent.end()){g_test_ui_shot=true;sent.push_back(pos);}}
-            if(!strncmp(name,"MODTAB",6) && name[6]>='0' && name[6]<='4')port::mod_menu_select_tab(name[6]-'0');
+            if (!strncmp(name, "MODTAB", 6) && name[6] >= '0' && name[6] <= '4') {
+                constexpr int sections[] = {0, 2, 2, 1, 1};
+                port::menu_select_cheats_section(sections[name[6] - '0']);
+            }
             if(!strcmp(name,"MODON") || !strcmp(name,"MODOFF")){auto options=ssne::mod_current_options();options.god=options.ammo=options.weapons=options.no_enemies=options.rapid_fire=!strcmp(name,"MODON");apply_menu_mods(options);}
             if(!strcmp(name,"ESPON") || !strcmp(name,"ESPOFF")){auto options=ssne::mod_current_options();options.esp=options.bone_esp=!strcmp(name,"ESPON");ssne::mod_local_options(options);}
             if(!strcmp(name,"AIMON") || !strcmp(name,"AIMOFF")){auto options=ssne::mod_current_options();options.aimbot=!strcmp(name,"AIMON");options.aim_hold=false;options.aim_point=3;ssne::mod_local_options(options);static std::vector<size_t> traced;if(std::find(traced.begin(),traced.end(),pos)==traced.end()){traced.push_back(pos);const auto current=ssne::mod_current_options();log_line("[mod-input-test] action="+std::string(name)+" client="+std::to_string(g_coop_client)+" aimbot="+std::to_string(current.aimbot)+" point="+std::to_string(current.aim_point));}}
@@ -1044,7 +1050,7 @@ void chat_capture_transition(bool was_active) {
         g_coop_yaw=g_coop_pitch=0;ssne::mod_aim_input(false,false);
     } else if(was_active && !g_chat.active()) {
         const bool restore=g_chat_restore_capture && g_chat_available && (g_focused || getenv("SSNE_TEST_HIDDEN")) &&
-            ssne::player_control_active() && !port::menu_open() && !port::mod_menu_open() && g_set.mouse_look;
+            ssne::player_control_active() && !port::menu_open() && g_set.mouse_look;
         g_chat_restore_capture=false;cancel_native_mouse();
         if(restore){g_mouse_captured=true;if(!getenv("SSNE_TEST_HIDDEN"))SDL_SetRelativeMouseMode(SDL_TRUE);}
     }
@@ -1061,7 +1067,7 @@ bool handle_chat_event(const SDL_Event& event) {
         const auto mask=SDL_BUTTON(event.button.button);released=(g_chat_mouse_suppressed&mask)!=0;g_chat_mouse_suppressed&=~mask;
     }
     const bool was_active=g_chat.active();
-    const bool can_open=!port::menu_open() && !port::mod_menu_open() && !port::coop::native_frontend_text_active() && !ImGui::GetIO().WantTextInput;
+    const bool can_open=!port::menu_open() && !port::coop::native_frontend_text_active() && !ImGui::GetIO().WantTextInput;
     const bool open_requested=port::multiplayer_event_slots(g_set,port::MP_CHAT,event,true)!=0;
     const bool consumed=g_chat.handle_event(event,g_chat_available,can_open,open_requested);
     if(consumed && event.type==SDL_KEYDOWN && unsigned(event.key.keysym.scancode)<SDL_NUM_SCANCODES)
@@ -1103,8 +1109,8 @@ void feed_local_pad(const ssne::PadState& live,int offline_port=0,uint16_t press
     auto p=(getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_TEST_DEVICE_INPUT"))?live:scripted_pad(live);
     p=port::coop::native_results_input(p,ssne::native_results_presenting());
     p.buttons|=take_native_menu_pad_pulse();
-    if(port::menu_open() || port::mod_menu_open())p={};
-    if(port::menu_open() || port::mod_menu_open() || g_chat.active() || ssne::local_pause_menu_open() || ssne::local_information_open() || ssne::native_results_presenting())pressed=0;
+    if(port::menu_open())p={};
+    if(port::menu_open() || g_chat.active() || ssne::local_pause_menu_open() || ssne::local_information_open() || ssne::native_results_presenting())pressed=0;
     if(g_coop_client && g_coop_engine_ready.load(std::memory_order_acquire))g_coop_engine->set_local_ui_pad(p);
     if(port::coop::native_frontend_input(p)){if(g_coop_client && g_coop_engine_ready.load(std::memory_order_acquire))g_coop_engine->set_local_ui_pad({});g_coop_yaw=g_coop_pitch=0;if(g_coop_host)g_coop_server->submit_host_input({});else if(g_coop_client)g_coop_peer->submit_input({});ssne::set_pad(0,{});if(offline_port)ssne::set_pad(offline_port,{});if(g_coop_local_player.load()>0)ssne::set_pad(g_coop_local_player.load(),{});return;}
     // Track edges across scenes: a confirmation held while leaving credits
@@ -1220,7 +1226,7 @@ void update_input(float dt) {
     if(getenv("SSNE_TEST_HIDDEN") && !getenv("SSNE_TEST_DEVICE_INPUT")){std::array<ssne::PadState,4> pads{};pads[std::clamp(g_set.kbm_player-1,0,3)]=(port::menu_open() || g_chat.active())?ssne::PadState{}:scripted_pad({});route_local_pads(pads);return;}
     apply_virtual_autopress();
     update_ports();
-    if (port::menu_open() || port::mod_menu_open() || g_chat.active()) {
+    if (port::menu_open() || g_chat.active()) {
         cancel_keyboard_jump();ssne::mod_aim_input(false,false);g_coop_yaw=g_coop_pitch=0;  // the game gets neutral controllers while the menu is open
         g_mouse_dx = g_mouse_dy = 0;
         g_wheel[0] = g_wheel[1] = WheelPulse{};
@@ -1385,7 +1391,7 @@ void update_input(float dt) {
         float dy = std::clamp(g_mouse_dy * sens / std::max(dt * 60.f, 0.25f), -1.f, 1.f);
         kbm.cy += g_set.mouse_invert_y ? dy : -dy;
     }
-    ssne::mod_aim_input((mb & SDL_BUTTON(SDL_BUTTON_RIGHT))!=0,g_mouse_captured && control && !port::mod_menu_open() && !port::menu_open() && !ImGui::GetIO().WantCaptureMouse);
+    ssne::mod_aim_input((mb & SDL_BUTTON(SDL_BUTTON_RIGHT))!=0,g_mouse_captured && control && !port::menu_open() && !ImGui::GetIO().WantCaptureMouse);
     if(network_game()){double yaw=0,pitch=0;ssne::mod_take_netplay_aim(yaw,pitch);g_coop_yaw+=yaw;g_coop_pitch+=pitch;}
     g_mouse_dx = g_mouse_dy = 0;
     std::array<ssne::PadState,4> pads;
@@ -1655,13 +1661,13 @@ void fill_state_slots(port::MenuInfo& mi) {
             SDL_Surface* rgba = bmp ? SDL_ConvertSurfaceFormat(bmp, SDL_PIXELFORMAT_ABGR8888, 0) : nullptr;
             if (bmp) SDL_FreeSurface(bmp);
             if (!rgba) { sl.tex = 0; continue; }
-            if (!tex[i]) glGenTextures(1, &tex[i]);
-            glBindTexture(GL_TEXTURE_2D, tex[i]);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, rgba->pitch / 4);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba->w, rgba->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba->pixels);
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            if (!tex[i]) port::gl::GenTextures(1, &tex[i]);
+            port::gl::BindTexture(GL_TEXTURE_2D, tex[i]);
+            port::gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            port::gl::TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            port::gl::PixelStorei(GL_UNPACK_ROW_LENGTH, rgba->pitch / 4);
+            port::gl::TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba->w, rgba->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba->pixels);
+            port::gl::PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
             sl.w = rgba->w; sl.h = rgba->h;
             SDL_FreeSurface(rgba);
             stamp[i] = t;
@@ -1731,7 +1737,10 @@ void draw_session_overlay() {
     ImGui::Text("%s | player %u | %u / %u connected",g_coop_host?"Host":"Client",status.player.slot+1,status.joined,status.capacity);
     ImGui::TextWrapped("%s",status.message.c_str());
     ImGui::Text("RTT: %u ms",status.ping_ms);
-    if(g_coop_host)ImGui::Text("PIN: %s | TCP: %u",g_lan_pin.c_str(),status.port);
+    if(g_coop_host){
+        ImGui::Text("PIN: %s | TCP: %u",g_lan_pin.c_str(),status.port);
+        if(port::menu_open() && status.connected)draw_host_invitation_controls();
+    }
     const auto people=g_coop_host?g_coop_server->participants():world?world->players:std::array<port::coop::Participant,port::coop::max_players>{};
     const auto bot_mask=g_coop_host?g_coop_server->bot_mask():world && world->mission.contains("Session.Bots.Mask")?uint8_t(std::get<int64_t>(world->mission.at("Session.Bots.Mask"))):0;
     for(const auto& person:people)if(person.connected)ImGui::Text("%u  %s%s%s",person.id.slot+1,person.name.c_str(),person.ready?"":" (loading)",bot_mask&(1u<<person.id.slot)?" (Bot)":person.afk?" (AFK)":"");
@@ -1864,7 +1873,7 @@ void apply_settings(SDL_Window* win) {
     if(getenv("SSNE_TEST_HIDDEN")){g_set.fullscreen=false;g_set.display=-1;}
     {
         ssne::Cheats c;
-        // Host party-wide switches have one owner, shared with the Insert menu.
+        // Network party switches are applied by the authoritative mod state.
         c.invulnerable = !network_game() && g_set.cheat_invulnerable;
         c.infinite_ammo = !network_game() && g_set.cheat_infinite_ammo;
         c.all_weapons = !network_game() && g_set.cheat_all_weapons;
@@ -1922,6 +1931,7 @@ void save_now() {
 
 int main(int argc, char** argv) {
     std::string data_dir;
+    port::ZinkRuntime zink;
     bool headless = false;
     std::string lan_address,coop_player_name;
     unsigned player_skin=0,enemy_multiplier=1,ammo_capacity=0,ammo_pickup_multiplier=1;
@@ -1948,9 +1958,19 @@ int main(int argc, char** argv) {
             }
         }
     }
+    const std::string asset_directory=base_dir;
     for(int i=1;i<argc;++i) {
         std::string a=argv[i];
-        if(a=="--custom-downloads" && i+1<argc)custom_downloads=argv[++i];
+        if(a=="--user-dir"){
+            if(i+1>=argc || !*argv[i+1]){fprintf(stderr,"Missing user directory.\n");return 1;}
+            const auto directory=std::filesystem::absolute(std::filesystem::u8path(argv[++i]),layout_error);
+            if(!layout_error)std::filesystem::create_directories(directory,layout_error);
+            if(layout_error){fprintf(stderr,"Cannot open user directory: %s\n",layout_error.message().c_str());return 1;}
+            const auto path=directory.u8string();
+            base_dir.assign(path.begin(),path.end());
+            base_dir+="/";
+        }
+        else if(a=="--custom-downloads" && i+1<argc)custom_downloads=argv[++i];
         else if(a=="--player-skin"){
             if(i+1>=argc){fprintf(stderr,"Missing player skin.\n");return 1;}
             char* end=nullptr;const auto value=std::strtol(argv[++i],&end,10);
@@ -2013,6 +2033,8 @@ int main(int argc, char** argv) {
 
     bool have_file = port::load_settings(g_set, g_settings_path);
     if(!have_file && !network_game())have_file=port::load_settings(g_set,base_dir+"settings-netplay.ini");
+    std::string runtime_renderer = g_set.renderer;
+    bool renderer_override = false;
     // Freeze the native language request before the guest thread starts.
     port::coop::configure_native_startup_language(g_set.game_language);
     // Command-line options override settings.ini for this run (and are saved if the menu changes anything).
@@ -2025,7 +2047,10 @@ int main(int argc, char** argv) {
         else if (a == "--mute") g_set.muted = true;
         else if (a == "--memcard" && i + 1 < argc) memcard = argv[++i];
         else if (a == "--no-memcard") memcard = "-";
-        else if (a == "--renderer" && i + 1 < argc) g_set.renderer = argv[++i];
+        else if (a == "--renderer" && i + 1 < argc) {
+            runtime_renderer = argv[++i];
+            renderer_override = true;
+        }
         else if (a == "--aspect" && i + 1 < argc) {
             std::string v = argv[++i];
             for (int k = 0; k < kAspectCount; k++) if (v == kAspects[k].name) g_set.aspect = k;
@@ -2041,7 +2066,7 @@ int main(int argc, char** argv) {
             if (g_set.fps_limit != 0) g_set.fps_limit = std::max(g_set.fps_limit, port::kMinFpsLimit);
         }
     }
-    if (root_install && custom_downloads.empty()) {
+    if (root_install && base_dir==asset_directory && custom_downloads.empty()) {
         const auto path = (install_root / "DownloadedCustomLevels").u8string();
         custom_downloads.assign(path.begin(), path.end());
     }
@@ -2064,7 +2089,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    data_dir=port::startup::data_directory(base_dir,data_dir);
+    data_dir=port::startup::data_directory(asset_directory,data_dir);
     // Hidden native tests isolate downloads just like their private card/data.
     const auto* downloads=getenv("SSNE_CUSTOM_DOWNLOADS");
     port::coop::configure_custom_map_downloads(downloads && *downloads?std::filesystem::u8path(downloads):custom_downloads.empty()?std::filesystem::u8path(base_dir)/"DownloadedCustomLevels":std::filesystem::u8path(custom_downloads));
@@ -2173,57 +2198,116 @@ int main(int argc, char** argv) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
+    auto vulkan_failure = [&](const std::string& cause) {
+        auto message = "Vulkan renderer error: " + cause;
+        log_line("[gpu] " + message);
+        if (!getenv("SSNE_TEST_HIDDEN"))
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Serious Sam - Vulkan", message.c_str(), nullptr);
+        return 1;
+    };
     if(!getenv("SSNE_TEST_HIDDEN"))attach_virtual_pads();  // development (SSNE_VIRTUAL_PADS)
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)  // no audio device: play silently
         log_line(std::string("[audio] audio unavailable: ") + SDL_GetError());
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     int wx, wy, ww, wh;
     initial_window_geometry(wx, wy, ww, wh);
-    const bool hidden_test=getenv("SSNE_TEST_HIDDEN")!=nullptr;
-    if(hidden_test){g_set.fullscreen=false;g_set.win_max=false;}
-    SDL_Window* win = SDL_CreateWindow("Serious Sam: Next Encounter Native", wx, wy, ww, wh,
-                                       SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (hidden_test?SDL_WINDOW_HIDDEN:0) |
-                                           (g_set.win_max ? SDL_WINDOW_MAXIMIZED : 0));
-    g_chat_window=win;
-    SDL_GLContext gl = SDL_GL_CreateContext(win);
-    bool core = gl != nullptr;
-    if (!gl) {  // no GL 3.3 core: fall back to a basic context and the software renderer
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, 0);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    const bool hidden_test = getenv("SSNE_TEST_HIDDEN") != nullptr;
+    if (hidden_test) { g_set.fullscreen = false; g_set.win_max = false; }
+    bool vulkan = runtime_renderer == "vulkan";
+    SDL_Window* win = nullptr;
+    SDL_GLContext gl = nullptr;
+    bool core = false;
+    auto start_graphics = [&]() -> std::string {
+        if (vulkan) {
+            auto game_dir = install_root;
+            if (game_dir.filename().empty()) game_dir = game_dir.parent_path();
+            const auto runtime = (game_dir.filename() == "Multiplayer" ? game_dir.parent_path() : game_dir) / "Vulkan";
+            std::string error;
+            if (!zink.load(runtime, error)) return error;
+        }
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        win = SDL_CreateWindow("Serious Sam: Next Encounter Native", wx, wy, ww, wh,
+                               SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
+                               (hidden_test ? SDL_WINDOW_HIDDEN : 0) | (g_set.win_max ? SDL_WINDOW_MAXIMIZED : 0));
+        if (!win) return SDL_GetError();
         gl = SDL_GL_CreateContext(win);
-        std::string have = "none";
-        if (gl) {
-            const char* v = reinterpret_cast<const char*>(glGetString(GL_VERSION));
-            const char* r = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
-            have = std::string(v ? v : "?") + " on " + (r ? r : "?");
+        core = gl != nullptr;
+        if (!core && !vulkan) {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, 0);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+            gl = SDL_GL_CreateContext(win);
         }
-        log_line("[gpu] OpenGL 3.3 core not available (driver offers " + have + "); using the software renderer. "
-                 "Updating the graphics driver usually fixes this.");
+        if (!gl) return SDL_GetError();
+        if (!port::gl::use_current_context()) return "The OpenGL dispatch table is incomplete.";
+        const char* renderer_name = reinterpret_cast<const char*>(port::gl::GetString(GL_RENDERER));
+        const std::string renderer = renderer_name ? renderer_name : "unknown";
+        if (vulkan) {
+            if (renderer.find("zink") == std::string::npos)
+                return "Expected Mesa Zink, but the active driver is " + renderer + ".";
+            log_line("[gpu] Vulkan via Mesa Zink: " + renderer);
+        } else if (!core) {
+            log_line("[gpu] OpenGL 3.3 core unavailable on " + renderer + "; using the software renderer.");
+        }
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGui::GetIO().IniFilename = nullptr;
+        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;  // the settings menu works with a controller
+        ImGui::StyleColorsDark();
+        update_ui_scale(win);
+        if (!ImGui_ImplSDL2_InitForOpenGL(win, gl)) return "The SDL interface could not initialize.";
+        if (!ImGui_ImplOpenGL3_Init(core ? "#version 330 core" : "#version 130")) return "The graphics overlay could not initialize.";
+        if (core && runtime_renderer != "software") {
+            std::string err;
+            {
+                std::string dir = base_dir + (vulkan ? "shadercache/vulkan" : "shadercache");
+                std::error_code ec;
+                std::filesystem::create_directories(std::filesystem::u8path(dir), ec);
+                if (!ec) ssne::gpu_renderer_set_shader_cache(dir);
+            }
+            int start_scale = g_set.scale > 0 ? g_set.scale : fit_scale(win);
+            if (ssne::gpu_renderer_init(SDL_GL_GetProcAddress, start_scale, err)) {
+                g_gpu = true;
+                g_auto.cur = start_scale;
+                ssne::gx_use_gpu(true);
+                if (g_set.scale < 0) ssne::gpu_renderer_set_native(native_height(win));
+                log_line("[gpu] " + ssne::gpu_renderer_info() + ", internal resolution " +
+                         (g_set.scale < 0 ? "native (" + std::to_string(native_height(win)) + " lines)"
+                                          : std::to_string(start_scale) + "x" + (g_set.scale ? "" : " (automatic)")));
+            } else {
+                if (vulkan) return err;
+                log_line("[gpu] GPU renderer unavailable (" + err + "); using the software renderer");
+            }
+        }
+        return {};
+    };
+    bool graphics_recovered = false;
+    for (;;) {
+        const std::string error = start_graphics();
+        if (error.empty()) break;
+        if (!vulkan || renderer_override) {
+            if (vulkan) return vulkan_failure(error);
+            log_line("[gpu] Renderer startup failed: " + error);
+            return 1;
+        }
+        log_line("[gpu] Vulkan renderer error: " + error + " Falling back to OpenGL.");
+        runtime_renderer = g_set.renderer = "gpu";
+        save_now();
+        vulkan = false;
+        graphics_recovered = true;
+        if (ImGui::GetCurrentContext()) {
+            if (ImGui::GetIO().BackendRendererUserData) ImGui_ImplOpenGL3_Shutdown();
+            if (ImGui::GetIO().BackendPlatformUserData) ImGui_ImplSDL2_Shutdown();
+            ImGui::DestroyContext();
+            g_ui_scale = 0;
+        }
+        if (gl) { SDL_GL_DeleteContext(gl); gl = nullptr; }
+        if (win) { SDL_DestroyWindow(win); win = nullptr; }
+        std::string restore_error;
+        if (!zink.restore_system_gl(restore_error)) return vulkan_failure(restore_error);
     }
-    if (!gl) { fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError()); return 1; }
-    if (core && g_set.renderer != "software") {
-        std::string err;
-        {
-            std::string dir = base_dir + "shadercache";
-            std::error_code ec;
-            std::filesystem::create_directories(std::filesystem::u8path(dir), ec);
-            if (!ec) ssne::gpu_renderer_set_shader_cache(dir);
-        }
-        int start_scale = g_set.scale > 0 ? g_set.scale : fit_scale(win);
-        if (ssne::gpu_renderer_init(SDL_GL_GetProcAddress, start_scale, err)) {
-            g_gpu = true;
-            g_auto.cur = start_scale;
-            ssne::gx_use_gpu(true);
-            if (g_set.scale < 0) ssne::gpu_renderer_set_native(native_height(win));
-            log_line("[gpu] " + ssne::gpu_renderer_info() + ", internal resolution " +
-                     (g_set.scale < 0 ? "native (" + std::to_string(native_height(win)) + " lines)"
-                                      : std::to_string(start_scale) + "x" + (g_set.scale ? "" : " (automatic)")));
-        } else {
-            log_line("[gpu] GPU renderer unavailable (" + err + "); using the software renderer");
-        }
-    }
+    g_chat_window = win;
+    if (graphics_recovered) toast("Vulkan unavailable. Switched to OpenGL. See F1 for details.");
     ssne::gpu_renderer_set_player_views(network_game());
     if(hidden_test)log_line("[input] hidden test: real keyboard/mouse/controller sampling and mouse capture disabled");
     ssne::gx_set_threaded(g_set.gx_thread);
@@ -2231,16 +2315,7 @@ int main(int argc, char** argv) {
     log_line(g_set.gx_thread && !getenv("SSNE_GX_SYNC") ? "[gx] graphics commands on their own thread"
                                                         : "[gx] graphics commands on the game's thread (gx_thread = 0)");
     apply_settings(win);
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGui::GetIO().IniFilename = nullptr;
-    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;  // the settings menu works with a controller
-    ImGui::StyleColorsDark();
-    update_ui_scale(win);
-    ImGui_ImplSDL2_InitForOpenGL(win, gl);
-    ImGui_ImplOpenGL3_Init(core ? "#version 330 core" : "#version 130");
-
-    port::initialize_crosshair_renderer(base_dir);
+    port::initialize_crosshair_renderer(asset_directory);
     port::update_crosshair_renderer(g_set);
     SDL_StartTextInput();
     open_audio();
@@ -2254,7 +2329,6 @@ int main(int argc, char** argv) {
     }
     auto toggle_menu = [&] {
         cancel_keyboard_jump();g_chat.close();g_chat_restore_capture=false;
-        port::mod_menu_set_open(false);
         port::menu_set_open(!port::menu_open());
         if(hidden_test)log_line(std::string("[settings-test] open=")+(port::menu_open()?"1":"0"));
         if (port::menu_open()) release_mouse();
@@ -2277,11 +2351,12 @@ int main(int argc, char** argv) {
         if(perf_scene_fixture_enabled() && !g_coop_host && !g_coop_client){d.local_ready=ssne::player_control_active() && mem_read32(ssne::game_address(0x802DB0E0))==4;d.ready_players=d.local_ready?1:0;}
         const auto gpu=ssne::gpu_renderer_stats();const auto output=ssne::gpu_renderer_output();
         d.gpu_ms=g_auto.gpu_ms;d.gpu_timer_valid=g_auto.gpu_ms>0;d.gpu_cpu_ms=gpu.frame_ms;d.pending=0;d.dropped=ssne::gpu_dropped_frames();d.draws=gpu.draws;d.copies=gpu.tex_copies;d.uploads=gpu.uploads;d.shader_programs=gpu.programs;
-        d.width=output.w;d.height=output.h;d.scale=ssne::gpu_renderer_scale();d.limit=g_set.fps_limit;d.fov=g_set.fov;d.vsync=g_set.vsync;d.paused=ssne::paused();d.presentation_busy=ssne::local_information_open() || ssne::local_pause_menu_open() || ssne::native_movie_presenting() || ssne::native_cutscene_presenting() || ssne::native_results_presenting() || port::menu_open() || port::mod_menu_open();d.focused=(SDL_GetWindowFlags(win)&SDL_WINDOW_INPUT_FOCUS)!=0;d.minimized=(SDL_GetWindowFlags(win)&SDL_WINDOW_MINIMIZED)!=0;d.background=background;
+        d.width=output.w;d.height=output.h;d.scale=ssne::gpu_renderer_scale();d.limit=g_set.fps_limit;d.fov=g_set.fov;d.vsync=g_set.vsync;d.paused=ssne::paused();d.presentation_busy=ssne::local_information_open() || ssne::local_pause_menu_open() || ssne::native_movie_presenting() || ssne::native_cutscene_presenting() || ssne::native_results_presenting() || port::menu_open();d.focused=(SDL_GetWindowFlags(win)&SDL_WINDOW_INPUT_FOCUS)!=0;d.minimized=(SDL_GetWindowFlags(win)&SDL_WINDOW_MINIMIZED)!=0;d.background=background;
         g_performance.sample(d);
     };
 
     bool quit = false;
+    int exit_status = 0;
     uint32_t last = SDL_GetTicks();
     bool crosshair_reload=false;
     double swap_ms = 100;  // how long the last SwapWindow blocked (vsync); ~0 when it doesn't wait
@@ -2312,23 +2387,32 @@ int main(int argc, char** argv) {
                 // Print Screen: Windows only delivers its key-up.
                 if (e.key.keysym.scancode == SDL_SCANCODE_PRINTSCREEN) take_screenshot(base_dir);
                 break;
-            case SDL_TEXTINPUT: port::coop::native_frontend_text_input(e.text.text);break;
+            case SDL_TEXTINPUT:
+                if (!port::menu_open()) port::coop::native_frontend_text_input(e.text.text);
+                break;
             case SDL_KEYDOWN: {
                 std::lock_guard session_lock(g_session_mutex);
                 SDL_Scancode sc = e.key.keysym.scancode;
-                if(port::coop::native_frontend_text_active() && sc!=SDL_SCANCODE_F12){
+                if(!port::menu_open() && port::coop::native_frontend_text_active() && sc!=SDL_SCANCODE_F12){
                     if((e.key.keysym.mod&KMOD_CTRL) && sc==SDL_SCANCODE_A){port::coop::native_frontend_edit_key(5);break;}
                     if((e.key.keysym.mod&KMOD_CTRL) && sc==SDL_SCANCODE_V){if(char* clipboard=SDL_GetClipboardText()){port::coop::native_frontend_text_input(clipboard);SDL_free(clipboard);}break;}
                     const unsigned edit_key=(sc==SDL_SCANCODE_RETURN || sc==SDL_SCANCODE_KP_ENTER)?1:sc==SDL_SCANCODE_ESCAPE?2:sc==SDL_SCANCODE_BACKSPACE?3:sc==SDL_SCANCODE_DELETE?4:0;
                     if(edit_key)port::coop::native_frontend_edit_key(edit_key);break;
                 }
-                if(!e.key.repeat && !port::menu_open() && !port::mod_menu_open() && !g_chat.active() && !ImGui::GetIO().WantCaptureKeyboard &&
+                if(!e.key.repeat && !port::menu_open() && !g_chat.active() && !ImGui::GetIO().WantCaptureKeyboard &&
                    ssne::player_control_active() && !ssne::player_in_vehicle() && !ssne::native_results_presenting() && !g_presentation_pointer_active && !g_coop_spectating)
                     for(const auto& binding:g_set.kb[port::ACT_L])if(binding.type==port::Bind::KEY && binding.code==sc)g_keyboard_jump_pressed=true;
                 if (sc == SDL_SCANCODE_F12 && (e.key.keysym.mod & KMOD_SHIFT)) { if (!e.key.repeat) take_screenshot(base_dir); break; }
                 if (sc == SDL_SCANCODE_F12 && !e.key.repeat) { toggle_menu(); break; }
-                if(sc==SDL_SCANCODE_INSERT && !e.key.repeat){cancel_keyboard_jump();port::mod_menu_set_open(!port::mod_menu_open());release_mouse();if(getenv("SSNE_TEST_HIDDEN"))log_line("[mod-menu-test] open="+std::to_string(port::mod_menu_open()));break;}
-                if(sc==SDL_SCANCODE_ESCAPE && port::mod_menu_open()){port::mod_menu_set_open(false);break;}
+                if (sc == SDL_SCANCODE_INSERT && !e.key.repeat) {
+                    if (port::menu_cheats_selected()) {
+                        toggle_menu();
+                    } else {
+                        if (!port::menu_open()) toggle_menu();
+                        port::menu_select_tab(7);
+                    }
+                    break;
+                }
                 if (sc == SDL_SCANCODE_ESCAPE && port::menu_open()) { toggle_menu(); break; }
                 if (sc == SDL_SCANCODE_F1 && !e.key.repeat) {
                     if (e.key.keysym.mod & KMOD_SHIFT) { g_set.top_bar = (g_set.top_bar + 2) % 3; changed = true; }
@@ -2397,7 +2481,7 @@ int main(int argc, char** argv) {
                 break;
             }
             case SDL_MOUSEBUTTONDOWN:
-                if (!hidden_test && !g_mouse_captured && !port::menu_open() && !port::mod_menu_open() && !g_chat.active() && ssne::player_control_active() && !port::menu_mouse_wants_pointer() && g_set.mouse_look && !ImGui::GetIO().WantCaptureMouse &&
+                if (!hidden_test && !g_mouse_captured && !port::menu_open() && !g_chat.active() && ssne::player_control_active() && !port::menu_mouse_wants_pointer() && g_set.mouse_look && !ImGui::GetIO().WantCaptureMouse &&
                     have_game_image()) {
                     g_mouse_captured = true;
                     g_capture_click = SDL_BUTTON(e.button.button);
@@ -2408,7 +2492,7 @@ int main(int argc, char** argv) {
                 if (g_mouse_captured) { g_mouse_dx += float(e.motion.xrel); g_mouse_dy += float(e.motion.yrel); }
                 break;
             case SDL_MOUSEWHEEL:
-                if (!port::menu_open() && !port::mod_menu_open() && e.wheel.y != 0) {
+                if (!port::menu_open() && e.wheel.y != 0) {
                     int dy = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
                     WheelPulse& w = g_wheel[dy > 0 ? 1 : 0];
                     w.pending = std::min(w.pending + std::abs(dy), 4);  // don't queue a long burst
@@ -2471,7 +2555,9 @@ int main(int argc, char** argv) {
         update_rumble();
         bool background = !g_focused && g_set.pause_unfocused;
         // A save / load requested from the menu needs the game to reach its next frame: don't hold it meanwhile.
-        ssne::set_paused(!network_game() && ((port::menu_open() && g_set.pause_in_menu && !ssne::savestate_pending()) || background));
+        const bool should_pause = !network_game() && ((port::menu_open() && g_set.pause_in_menu && !ssne::savestate_pending()) || background);
+        if (should_pause && !ssne::paused()) port::menu_snapshot_mod_level();
+        ssne::set_paused(should_pause);
         handle_state_result();
         if (background) SDL_Delay(15);  // nothing to show: keep the CPU/GPU mostly idle
         sample_performance(false);
@@ -2526,6 +2612,7 @@ int main(int argc, char** argv) {
             port::MenuInfo mi;
             mi.network=network_game();mi.network_host=g_coop_host;mi.bot_controls=g_coop_host?draw_bot_controls:nullptr;
             mi.gpu_active = g_gpu;
+            mi.vulkan_active = vulkan && g_gpu;
             if (g_gpu) {
                 mi.renderer_info = ssne::gpu_renderer_info();
                 auto o = ssne::gpu_renderer_output();
@@ -2555,6 +2642,27 @@ int main(int argc, char** argv) {
             }
             const std::array<bool,3> shared_before{g_set.cheat_invulnerable,g_set.cheat_infinite_ammo,g_set.cheat_all_weapons};
             bool was_open = port::menu_open();
+            if (was_open) {
+                std::lock_guard session_lock(g_session_mutex);
+                auto& mods = mi.mod_controls;
+                mods.netplay = mi.network;
+                mods.host = mi.network_host;
+                mods.requested = ssne::mod_current_options();
+                mods.apply = apply_menu_mods;
+                mods.apply_local = ssne::mod_local_options;
+                mods.spawn = spawn_menu_mod;
+                if (g_coop_client && g_coop_peer) {
+                    if (const auto world = g_coop_peer->latest_world()) {
+                        auto percent = [&](const char* name, int maximum) {
+                            const auto it = world->mission.find(name);
+                            const auto* value = it == world->mission.end() ? nullptr : std::get_if<int64_t>(&it->second);
+                            return value && *value >= 100 && *value <= maximum ? int(*value) : 0;
+                        };
+                        mi.host_speed_percent = percent("Session.Mods.SpeedPercent", 300);
+                        mi.host_jump_percent = percent("Session.Mods.JumpPercent", 500);
+                    }
+                }
+            }
             changed |= port::draw_menu(g_set, mi);
             if(mi.network_host && shared_before!=std::array<bool,3>{g_set.cheat_invulnerable,g_set.cheat_infinite_ammo,g_set.cheat_all_weapons}) {
                 auto shared=ssne::mod_current_options();
@@ -2566,20 +2674,12 @@ int main(int argc, char** argv) {
             { int slot; bool save; if (port::menu_take_state_request(slot, save)) request_state(save, slot); }
             if (was_open && !port::menu_open()) save_now();  // closed with the window's X button
         }
-        {
-            port::ModMenuControls controls;controls.netplay=network_game();controls.host=g_coop_host;
-            controls.requested=ssne::mod_current_options();
-            controls.apply=[](ssne::ModOptions options){apply_menu_mods(options);};
-            controls.apply_local=[](ssne::ModOptions options){ssne::mod_local_options(options);};
-            controls.spawn=[](unsigned id,int count,float distance){spawn_menu_mod(id,count,distance);};
-            port::draw_mod_menu(controls);
-        }
         if (changed) { apply_settings(win); save_now(); }
         ImGui::Render();
         // Present a new game image, the menus / log / messages, and every vblank in display sync (the game ticks with
         // it); otherwise only every 100 ms (the info bar), so that frame rate tools see the game's real rate.
         static uint32_t last_present = 0;
-        bool present = new_frame || port::menu_open() || port::mod_menu_open() || g_chat.active() || ssne::paused() || g_show_overlay || SDL_GetTicks() < g_toast_until ||
+        bool present = new_frame || port::menu_open() || g_chat.active() || ssne::paused() || g_show_overlay || SDL_GetTicks() < g_toast_until ||
                        !have_game_image() || ssne::vi_host_sync() || (g_set.sync_display && g_set.vsync && g_set.fps_limit == 60) ||
                        SDL_GetTicks() - last_present >= 100;
         if (!present) {
@@ -2590,15 +2690,15 @@ int main(int argc, char** argv) {
         last_present = SDL_GetTicks();
         int w, h;
         SDL_GL_GetDrawableSize(win, &w, &h);
-        glViewport(0, 0, w, h);
-        glClearColor(0, 0, 0, 1);
-        glClear(GL_COLOR_BUFFER_BIT);
+        port::gl::Viewport(0, 0, w, h);
+        port::gl::ClearColor(0, 0, 0, 1);
+        port::gl::Clear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         if(hidden_test && g_test_ui_shot){
             g_test_ui_shot=false;static unsigned sequence=0;
             if(const auto folder=getenv("SSNE_TEST_SCREENSHOT_DIR")){
                 std::vector<uint32_t> pixels(size_t(w)*h),flipped(pixels.size());
-                glReadPixels(0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+                port::gl::ReadPixels(0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
                 for(int y=0;y<h;++y)std::copy_n(pixels.data()+size_t(h-1-y)*w,w,flipped.data()+size_t(y)*w);
                 port::write_png(std::string(folder)+"/ui-"+std::to_string(++sequence)+".png",flipped.data(),w,h);
                 const auto output=ssne::gpu_renderer_output();
@@ -2611,7 +2711,7 @@ int main(int argc, char** argv) {
             static uint32_t at=SDL_GetTicks()+(getenv("SSNE_SCREENSHOT_MS")?uint32_t(atoi(getenv("SSNE_SCREENSHOT_MS"))):3000);
             if (SDL_GetTicks() >= at) {
                 std::vector<uint8_t> px(size_t(w) * h * 4);
-                glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                port::gl::ReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
                 SDL_Surface* sf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ABGR8888);
                 for (int y = 0; y < h; y++) memcpy((uint8_t*)sf->pixels + size_t(y) * sf->pitch, &px[size_t(h - 1 - y) * w * 4], size_t(w) * 4);
                 SDL_SaveBMP(sf, shot);
@@ -2621,7 +2721,16 @@ int main(int argc, char** argv) {
         }
         g_loop_phase = "present (SwapWindow)";
         auto swap_t0 = std::chrono::steady_clock::now();
-        SDL_GL_SwapWindow(win);
+        if (vulkan) {
+            std::string error;
+            if (!zink.present(error)) {
+                if (!renderer_override) { g_set.renderer = "gpu"; save_now(); }
+                exit_status = vulkan_failure(error + " OpenGL is available on the next start.");
+                break;
+            }
+        } else {
+            SDL_GL_SwapWindow(win);
+        }
         auto swap_t1 = std::chrono::steady_clock::now();
         swap_ms = std::chrono::duration<double, std::milli>(swap_t1 - swap_t0).count();
         ssne::perf::record(ssne::perf::index("swap"),swap_t1-swap_t0);
@@ -2657,9 +2766,9 @@ int main(int argc, char** argv) {
     // Exit. Give the display back first (leave fullscreen, destroy the GL context and window) so nothing of the
     // game stays on screen even if a later step stalls, save, and end the process from a watchdog if shutting the
     // game threads down takes too long.
-    std::thread([] {
+    std::thread([exit_status] {
         std::this_thread::sleep_for(std::chrono::seconds(3));
-        std::_Exit(0);
+        std::_Exit(exit_status);
     }).detach();
     for (SDL_GameController* c : g_pads) if (c) SDL_GameControllerRumble(c, 0, 0, 0);  // don't leave them vibrating
     save_now();
@@ -2678,5 +2787,5 @@ int main(int argc, char** argv) {
     ssne::scheduler_shutdown();
     log_line("[port] exit");
     if (g_log_file) fclose(g_log_file);
-    std::_Exit(0);  // guest threads may still be inside game code
+    std::_Exit(exit_status);  // guest threads may still be inside game code
 }

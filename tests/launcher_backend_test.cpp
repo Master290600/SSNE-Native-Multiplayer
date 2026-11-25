@@ -6,6 +6,7 @@ namespace fixture {
 unsigned translations=0,compiles=0,links=0,kills=0;
 bool fail_compile=false,fail_link=false,cancel_poll=false;
 bool fail_content=false;
+unsigned content_installs=0,content_removals=0;
 std::atomic<bool>* cancellation=nullptr;
 const std::string body="\nvoid f_80000000() {\n    int synthetic_value = 0;\n}\n";
 const std::string header="// Synthetic fixture header, no game code.\n";
@@ -21,11 +22,14 @@ struct Process {int code=0;};
 Process* spawn(const std::vector<std::string>& args,const std::string&,const std::string& log,std::string& error){
     using namespace fixture;error.clear();put(P(log),"Synthetic process collaborator; no executable run.\n");
     if (P(args.front()).filename()=="python.exe") {
-        check(args.size()==7 && args[1]=="-I" && args[2]=="-B" && args[3]=="-u" &&
+        const bool remove=args.size()==8 && args.back()=="--remove";
+        check((args.size()==7 || remove) && args[1]=="-I" && args[2]=="-B" && args[3]=="-u" &&
               P(args[4]).filename()=="import_ps2.py" && args[5]=="--game",
               "Content import must use the bundled installer and only the local installation path");
+        if(remove)++content_removals;else ++content_installs;
         if (fail_content) return new Process{9};
-        put(P(args[6])/"game_data/files/maps/fixture.ssw","map");
+        const auto map=P(args[6])/"game_data/files/maps/fixture.ssw";
+        if(remove)fs::remove(map);else put(map,"map");
         return new Process;
     }
     auto output=std::find(args.begin(),args.end(),"-o");
@@ -108,6 +112,17 @@ int main(){using namespace fixture;try{
         bound_side.object()->at("patch_recipe_sha256")=native_hash(native/"translation-recipe.json");
         put(native/"launcher-kit.json",launcher::write_json(bound_side));
     };
+    for(int protocol=63;protocol<=72;++protocol){
+        auto versioned=descriptor;versioned.object()->at("protocol")=protocol;bind_extended(versioned);
+        launcher::RuntimeKit accepted;
+        check(launcher::load_runtime_kit(S(project),S(data),accepted,error) && accepted.protocol==protocol,
+              "supported native protocol rejected: "+std::to_string(protocol)+" "+error);
+    }
+    auto future=descriptor;future.object()->at("protocol")=73;bind_extended(future);
+    launcher::RuntimeKit rejected;
+    check(!launcher::load_runtime_kit(S(project),S(data),rejected,error) &&
+          error=="Unsupported native multiplayer runtime build/protocol",
+          "unknown native protocol73 was accepted or rejected for the wrong reason");
     auto chat_descriptor=descriptor;chat_descriptor.object()->at("build")=205;chat_descriptor.object()->at("protocol")=64;
     bind_extended(chat_descriptor);launcher::RuntimeKit chat_kit;
     check(launcher::load_runtime_kit(S(project),S(data),chat_kit,error) && chat_kit.protocol==64 && chat_kit.build==205,"local chat protocol64 kit rejected: "+error);
@@ -152,7 +167,7 @@ int main(){using namespace fixture;try{
     auto vehicle_descriptor=editor_descriptor;vehicle_descriptor.object()->at("build")=246;vehicle_descriptor.object()->at("protocol")=71;
     bind_extended(vehicle_descriptor);launcher::RuntimeKit vehicle_kit;
     check(launcher::load_runtime_kit(S(project),S(data),vehicle_kit,error) && vehicle_kit.protocol==71 && vehicle_kit.build==246,"Campaign vehicle kit rejected: "+error);
-    auto unknown_descriptor=qol_descriptor;unknown_descriptor.object()->at("protocol")=72;
+    auto unknown_descriptor=qol_descriptor;unknown_descriptor.object()->at("protocol")=73;
     bind_extended(unknown_descriptor);
     check(!launcher::load_runtime_kit(S(project),S(data),survival_kit,error) && error.find("Unsupported native multiplayer runtime build/protocol")!=std::string::npos,"unknown future protocol not rejected by protocol validation");
     bind_extended(extended);launcher::RuntimeKit extended_kit;
@@ -223,10 +238,26 @@ int main(){using namespace fixture;try{
     check(!builder.build(selected,S(data),output,progress,cancel,error),"content installer error ignored");
     unchanged(dir,stable);
     check(!game_build_ready(selected,output,error,true),"failed content import marked ready");
+    BuildKit base_only=selected;
+    const auto inventory=get(content_recipe);
+    fs::remove(content_recipe);
+    check(launcher::load_runtime_kit(S(project),S(data),base_only.runtime,error,true,false),error);
+    check(selected.target_fingerprint()!=base_only.target_fingerprint(),"PS2 choices share a readiness fingerprint");
+    check(builder.build(base_only,S(data),output,progress,cancel,error),error);
+    check(content_installs==1 && content_removals==0,"base-only build ran the PS2 installer after failed preflight");
+    check(game_build_ready(base_only,output,error,true),"base-only build requires an optional package");
+    put(content_recipe,inventory);
+    check(!game_build_ready(selected,output,error,true),"base-only build was accepted as an enabled build");
     fail_content=false;
     check(builder.build(selected,S(data),output,progress,cancel,error),error);
     check(game_build_ready(selected,output,error,true),"content stage retry did not publish a valid receipt");
     put(data/"files/maps/fixture.ssw","truncated fixture");
     check(!game_build_ready(selected,output,error,true),"incomplete content accepted");
+    put(data/"files/maps/fixture.ssw","map");
+    check(!game_build_ready(base_only,output,error,true),"PS2-enabled build was accepted as a base-only build");
+    check(builder.build(base_only,S(data),output,progress,cancel,error),error);
+    check(content_removals==1 && !fs::exists(data/"files/maps/fixture.ssw"),"switch to base-only left installed content behind");
+    check(game_build_ready(base_only,output,error,true),"restored GameCube build did not become ready");
+    check(builder.build(selected,S(data),output,progress,cancel,error) && game_build_ready(selected,output,error,true),error);
     std::cout<<"Native backend tests passed, including automatic content installation and recovery.\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

@@ -1,3 +1,13 @@
+SSNE-RECOOP-Native 1.2.8.4 (Windows x64, multiplayer build 267, protocol 72)
+
+  - Improved client movement and camera transitions on steps, ledges, slopes, around doors and when swimming and jumping.
+  - Reworked local first-person animation, recoil, muzzle flashes and shot sounds. Remote shots, world pickups and enemy sounds use spatial audio. Private combo cues play for the player who earned them.
+  - Restored the Auldran Reptiloid's green projectile trail and shot-down orb particles. Improved client effects for spawning, dissolving and pickups.
+  - Improved invitations, joining and level transitions through the results screen. Hosts can copy the invitation code from F12 in-game.
+  - Improved AFK bot recovery in narrow spaces and around stairs.
+  - Added optional PS2 content and a direct game desktop shortcut to the launcher. Added experimental Vulkan through Mesa Zink to F12 graphics settings.
+  - Bots and Survival can still encounter bugs.
+
 SSNE-RECOOP-Native 1.2.8.4-beta.1 (Windows x64, multiplayer build 267 R15s, protocol 71)
 
   - Client movement and camera updates follow local input when walking and swimming. Ground handling and corrections have been revised for stairs, low ledges and the stone platform in Senator Cicero's Villa.

@@ -85,6 +85,7 @@ void native_frontend_finish_join(PPCContext&);
 // Safe from a NativeSession load callback: only queues the failure. The next
 // guest frontend frame leaves the session and shows its specific message.
 void native_frontend_custom_level_error(std::string);
+void native_frontend_bootstrap_error(const std::string&);
 // Transfer workers publish snapshots only; the guest owns every native GUI
 // operation. None resets a previous join/cancel. Ready is acknowledged as None
 // by the guest frame after the original Connecting/pause GUI has been closed;

@@ -570,7 +570,7 @@ bool load_settings(Settings& s, const std::string& path) {
     if (s.prompts != "gamecube" && s.prompts != "xbox" && s.prompts != "playstation" && s.prompts != "keyboard")
         s.prompts = "auto";
     // Sanitize.
-    if (s.renderer != "software") s.renderer = "gpu";
+    if (s.renderer != "software" && s.renderer != "vulkan") s.renderer = "gpu";
     s.scale = std::clamp(s.scale, -1, 8);
     s.aspect = std::clamp(s.aspect, 0, 3);
     {

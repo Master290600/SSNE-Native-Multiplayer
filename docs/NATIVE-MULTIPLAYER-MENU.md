@@ -14,7 +14,7 @@ In der Lobby öffnet die GameCube-Taste **Y** die native Bot-Verwaltung; **X** z
 
 Der AFK-Modus für den eigenen Spieler lässt sich über eine selbst zugewiesene Taste starten oder beenden: **F12 → Hotkeys → AFK an/aus**. Diese Aktion hat zunächst keine Tastenbelegung. Die Verbindungsseite bleibt auch auf dem Ergebnisbildschirm mit **X** erreichbar, bei PC-Standardbelegung mit **Q**. Ein Host kann den AFK-Modus mit seiner zugewiesenen Taste beenden und anschließend die originale Weiter-Funktion selbst bestätigen. Nach etwa 15 Sekunden auf einem aktiven Ergebnisbildschirm betätigt der Host automatisch diese native Weiter-Funktion. Auch eine offen gelassene Verbindungsseite wird vor dem automatischen Wechsel geschlossen. Clients folgen dem autoritativen Levelwechsel.
 
-Während einer Client-Sitzung ist die lokale Speicherkarte gegen durchgereichte Host-Speicherungen isoliert. Beim Verlassen werden die lokalen Profile und Einstellungen wiederhergestellt. Die bisherigen F12-Werkzeuge, das Insert-Modmenü und die erweiterten Startparameter bleiben verfügbar.
+Während einer Client-Sitzung ist die lokale Speicherkarte gegen durchgereichte Host-Speicherungen isoliert. Beim Verlassen werden die lokalen Profile und Einstellungen wiederhergestellt. Einfg öffnet direkt den Reiter **F12 → Cheats**. Der Host verwaltet dort gemeinsame Cheats und Spawns. Zielhilfe und Anzeigen stellt jeder auf seinem eigenen PC ein.
 
 ## Per Einladungscode über das Internet spielen
 

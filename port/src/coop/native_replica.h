@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <vector>
+#include <functional>
 namespace port::coop {
 namespace presentation_detail {
 // Stable last-write/try-emplace semantics, independent of the sorting path.
@@ -52,7 +53,9 @@ public:
     bool advance_projectile_visuals(PPCContext&,float seconds,std::string& error);
     bool advance_combo_huds(PPCContext&,float seconds,std::string& error);
     bool advance_particles(PPCContext&,float seconds,std::string& error);
+    bool advance_corpse_dissolves(PPCContext&,float seconds,std::string& error);
     bool play_local_weapon_flash(PPCContext&,uint32_t actor,unsigned weapon,unsigned hand);
+    void with_local_collision_brushes(PPCContext&,double now,double round_trip,const std::function<void()>& sample);
     // A render lease changes only verified camera/model/bone storage. Gameplay
     // fields and proxy visibility/lifetime are never borrowed for smoothing.
     bool begin_presentation(const std::map<EntityId,EntityState>&,std::string& error);
@@ -80,6 +83,13 @@ private:
     std::map<EntityId,EntityId> bindings_;
     std::map<EntityId,NativeDoorClock> door_clocks_;
     std::map<EntityId,NativeArrowClock> arrow_clocks_;
+    std::vector<EntityId> corpse_ids_;
+    struct PickupHoverPose {
+        std::array<float,3> model{},glow{},axis{};
+        bool has_glow=false;
+    };
+    std::map<EntityId,PickupHoverPose> pickup_hover_poses_;
+    double pickup_hover_start_=0.,pickup_hover_phase_=0.;
     std::vector<EntityId> particle_ids_; // Epoch/lifetime IDs, never cached guest pointers.
     std::map<EntityId,Properties> combo_presented_;
     struct ComboTimer {uint32_t actor=0;int64_t phase=0;float received=0,remaining=0;};

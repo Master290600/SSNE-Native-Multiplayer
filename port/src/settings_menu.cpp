@@ -25,6 +25,9 @@ bool g_exit_requested = false;  // "Exit game" button
 int g_state_req_slot = 0;       // Save states tab: requested slot (0 = none)
 bool g_state_req_save = false;
 int g_select_tab = -1;  // tab to select on the next frame
+int g_cheat_section = -1;
+bool g_cheats_selected = false;
+bool g_mod_level_at_pause = false;
 struct Capture { bool active = false; bool pad = false; int action = 0; int slot = 0; bool multiplayer = false; } g_cap;
 const char* g_capture_warning = nullptr;
 
@@ -51,13 +54,18 @@ std::string trace_json_string(const std::string& value) {
     for(unsigned char c:value) {if(c=='\"'||c=='\\'){out+='\\';out+=char(c);}else if(c<32||c==127){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}else out+=char(c);}
     return out+'\"';
 }
-void write_crosshair_ui_trace(const Settings& settings) {
+void write_crosshair_ui_trace(const Settings& settings, const MenuInfo& info) {
     if(!trace_crosshair_ui())return;static uint32_t last=0;static bool written=false;
     const auto now=SDL_GetTicks();if(written&&uint32_t(now-last)<25)return;last=now;written=true;
     std::ostringstream out;auto rect=[&](ImVec2 a,ImVec2 b){out<<'['<<a.x<<','<<a.y<<','<<b.x<<','<<b.y<<']';};
     out<<"{\"menu_open\":"<<(g_open?"true":"false")<<",\"frame\":"<<ImGui::GetFrameCount()<<",\"window\":";rect(g_crosshair_ui_window_a,g_crosshair_ui_window_b);
     out<<",\"clip\":";rect(g_crosshair_ui_clip_a,g_crosshair_ui_clip_b);
-    out<<",\"cheats\":{\"god\":"<<settings.cheat_invulnerable<<",\"ammo\":"<<settings.cheat_infinite_ammo<<",\"weapons\":"<<settings.cheat_all_weapons<<",\"fly\":"<<settings.cheat_fly<<",\"flying\":"<<ssne::cheat_flying()<<"}";
+    const auto mods = ssne::mod_current_options();
+    const bool client = info.network && !info.network_host;
+    out<<",\"cheats\":{\"god\":"<<settings.cheat_invulnerable<<",\"ammo\":"<<settings.cheat_infinite_ammo<<",\"weapons\":"<<settings.cheat_all_weapons
+       <<",\"fly\":"<<settings.cheat_fly<<",\"flying\":"<<ssne::cheat_flying()<<",\"speed\":"<<(client?info.host_speed_percent:settings.cheat_speed)
+       <<",\"jump\":"<<(client?info.host_jump_percent:settings.cheat_jump)<<",\"rapid\":"<<mods.rapid_fire<<",\"no_spawns\":"<<mods.no_enemies
+       <<",\"item_esp\":"<<mods.item_esp<<",\"aimbot\":"<<mods.aimbot<<"}";
     out<<",\"team_hud\":"<<(settings.team_hud?"true":"false")<<",\"capturing_mp\":"<<(g_cap.active && g_cap.multiplayer?"true":"false")
        <<",\"capture_action\":"<<(g_cap.active?g_cap.action:-1)<<",\"capture_slot\":"<<(g_cap.active?g_cap.slot:-1)
        <<",\"mp_conflict\":"<<trace_json_string(g_capture_warning?g_capture_warning:"")<<",\"multiplayer_bindings\":[";
@@ -212,6 +220,31 @@ bool crosshair_controls(Settings& s,const MenuInfo& info) {
 
 bool tab_graphics(Settings& s, const MenuInfo& info) {
     bool ch = false;
+    struct RendererChoice { const char* value; const char* label; };
+    static constexpr RendererChoice renderers[] = {
+        {"gpu", "GPU (OpenGL 3.3)"},
+#ifdef _WIN32
+        {"vulkan", "Vulkan (experimental)"},
+#endif
+        {"software", "Software (CPU)"},
+    };
+    const char* preview=renderers[0].label;
+    for(const auto& option:renderers)if(s.renderer==option.value)preview=option.label;
+    ImGui::SetNextItemWidth(260);
+    if(menu_ui::BeginCombo("Renderer",preview)){
+        for(const auto& option:renderers){
+            const bool selected=s.renderer==option.value;
+            if(menu_ui::Selectable(option.label,selected)){s.renderer=option.value;ch=true;}
+            if(trace_crosshair_ui())trace_crosshair_widget(std::string("renderer_")+option.value);
+            if(selected)ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    trace_crosshair_widget("renderer");
+    const char* active=info.gpu_active ? (info.vulkan_active?"vulkan":"gpu") : "software";
+    if(s.renderer!=active)menu_ui::TextColored(kWarn,"Takes effect the next time you start the game.");
+    if(info.gpu_active)menu_ui::TextColored(kDim,"Running: %s",info.renderer_info.c_str());
+    else menu_ui::TextColored(kDim,"Running: software renderer");
     menu_ui::SeparatorText("Presets");
     {
         static const char* kNames[] = {"Low", "Medium", "High", "Ultra"};
@@ -365,15 +398,6 @@ bool tab_graphics(Settings& s, const MenuInfo& info) {
 
     ch|=crosshair_controls(s,info);
 
-    menu_ui::SeparatorText("Renderer");
-    int r = s.renderer == "software" ? 1 : 0;
-    static const char* kRend[] = {"GPU (OpenGL 3.3)", "Software (CPU)"};
-    ImGui::SetNextItemWidth(260);
-    if (menu_ui::Combo("Renderer", &r, kRend, 2)) { s.renderer = r ? "software" : "gpu"; ch = true; }
-    bool running_sw = !info.gpu_active;
-    if ((s.renderer == "software") != running_sw) menu_ui::TextColored(kWarn, "Takes effect the next time you start the game.");
-    if (info.gpu_active) menu_ui::TextColored(kDim, "Running: %s", info.renderer_info.c_str());
-    else menu_ui::TextColored(kDim, "Running: software renderer");
     ImGui::Spacing();
     if (menu_ui::Button("Reset graphics to defaults")) { s.reset_graphics(); ch = true; }
     return ch;
@@ -406,6 +430,7 @@ bool tab_hotkeys(Settings& s) {
     ImGui::Spacing();
     static const char* keys[][2] = {
         {"F12  /  pad Back", "Settings menu (Esc closes it)"},
+        {"Insert", "Open or close the Cheats tab"},
         {"F1", "Log and statistics window"},
         {"Shift+F1", "Info bar at the top: full / frame rate only / hidden"},
         {"F2", "Release the mouse (click the game to capture it again)"},
@@ -549,20 +574,11 @@ bool tab_players(Settings& s, const MenuInfo& info) {
     return ch;
 }
 
-bool tab_cheats(Settings& s, const MenuInfo& info) {
-    ImGui::PushTextWrapPos(0.f);
-    if(menu_ui::Button("Open mod menu (Insert)"))mod_menu_set_open(true);
+bool draw_player_cheats(Settings& s, const MenuInfo& info, const ssne::ModState& state) {
     bool ch = false;
-    menu_ui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "Cheats are highly experimental and not fully tested: they can break the game (levels, scripts,");
-    menu_ui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "progress). They will stay that way: the game is meant to be played without them. Use at your own risk.");
-    menu_ui::TextColored(kDim, info.network ? (info.network_host ? "Host controls: invulnerability, ammo, weapons and movement apply to the party; flying and damage affect the host." : "Only the host can change gameplay cheats.") : "Cheats apply to the current single-player game.");
-    menu_ui::TextColored(kDim, "They work at once, also in a running level, and \"cheats\" shows in the info bar while one is on.");
-    if (info.network) menu_ui::TextColored(kDim,"Shared switches stay synchronized with the mod menu (Insert).");
-    else if (!info.cheats_available)
-        menu_ui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1), "Cheat hooks are unavailable for this disc revision.");
-    const bool cheats_enabled=(!info.network || info.network_host) && info.cheats_available;
+    const bool client = info.network && !info.network_host;
+    const bool cheats_enabled = info.cheats_available && !client;
     ImGui::BeginDisabled(!cheats_enabled);
-    menu_ui::SeparatorText("Player");
     ch |= menu_ui::Checkbox("Invulnerable", &s.cheat_invulnerable);
     trace_crosshair_widget("cheat_god",cheats_enabled);
     help("Nothing hurts Sam: health and armor stay where they are (enemies, falls, lava, drowning).");
@@ -572,32 +588,92 @@ bool tab_cheats(Settings& s, const MenuInfo& info) {
     ch |= menu_ui::Checkbox("All weapons", &s.cheat_all_weapons);
     trace_crosshair_widget("cheat_weapons",cheats_enabled);
     help("Every weapon, with full ammo for all of them (filled when turned on and at each level start).");
-    ImGui::SetNextItemWidth(300);
-    ch |= menu_ui::SliderInt("Movement speed", &s.cheat_speed, 100, 300, "%d%%");
-    help("How fast Sam runs, in the air and on skates too. 100% is the game's own speed.");
-    ImGui::SetNextItemWidth(300);
-    ch |= menu_ui::SliderInt("Jump height", &s.cheat_jump, 100, 500, "%d%%");
-    help("How high Sam jumps. 100% is the game's own height.");
-    ch |= menu_ui::Checkbox("Flying", &s.cheat_fly);
-    trace_crosshair_widget("cheat_fly",cheats_enabled);
-    help("The game's own debug flight: no gravity, and Sam passes through walls and floors (it's easy to\n"
-         "leave the level: turn it off above solid ground). Move and look as usual; hold jump to fly up and\n"
-         "fire to fly down.");
-    menu_ui::SeparatorText("Weapons");
-    ImGui::SetNextItemWidth(300);
-    ch |= menu_ui::SliderInt("Damage", &s.cheat_damage, 100, 1000, "%d%%");
-    help("How much damage Sam's weapons do. 100% is the game's own damage.");
-    menu_ui::SeparatorText("Game");
-    ch |= menu_ui::Checkbox("Unlock everything", &s.cheat_unlock_all);
-    trace_crosshair_widget("cheat_unlock",cheats_enabled);
-    help("The 10 lost levels, the gallery and the game's own treasure cheats, as if all the treasure had\n"
-         "been collected. Nothing is written to the memory card: turned off, they are locked again.");
-    ImGui::Spacing();
-    if (menu_ui::Button("Turn all cheats off")) { s.reset_cheats(); ch = true; }
-    trace_crosshair_widget("cheat_off",cheats_enabled);
     ImGui::EndDisabled();
-    ImGui::PopTextWrapPos();
+    draw_rapid_fire(info.mod_controls, state);
+
+    ImGui::BeginDisabled(!cheats_enabled);
+    int speed = client ? info.host_speed_percent : s.cheat_speed;
+    int jump = client ? info.host_jump_percent : s.cheat_jump;
+    if (speed > 0) {
+        ImGui::SetNextItemWidth(260);
+        if (menu_ui::SliderInt("Movement speed", &speed, 100, 300, "%d%%")) { s.cheat_speed = speed; ch = true; }
+        trace_crosshair_widget("cheat_speed", cheats_enabled);
+        help("How fast Sam runs, in the air and on skates too. 100% is the game's own speed.");
+    }
+    if (jump > 0) {
+        ImGui::SetNextItemWidth(260);
+        if (menu_ui::SliderInt("Jump height", &jump, 100, 500, "%d%%")) { s.cheat_jump = jump; ch = true; }
+        trace_crosshair_widget("cheat_jump", cheats_enabled);
+        help("How high Sam jumps. 100% is the game's own height.");
+    }
+    if (info.network) menu_ui::SeparatorText("Host player");
+    if (client) {
+        menu_ui::TextDisabled("Flying");
+        trace_crosshair_widget("cheat_fly", false);
+        menu_ui::TextDisabled("Damage");
+        menu_ui::TextDisabled("Unlock everything");
+        trace_crosshair_widget("cheat_unlock", false);
+    } else {
+        ch |= menu_ui::Checkbox("Flying", &s.cheat_fly);
+        trace_crosshair_widget("cheat_fly",cheats_enabled);
+        help("The game's own debug flight: no gravity, and Sam passes through walls and floors (it's easy to\n"
+             "leave the level: turn it off above solid ground). Move and look as usual; hold jump to fly up and\n"
+             "fire to fly down.");
+        ImGui::SetNextItemWidth(300);
+        ch |= menu_ui::SliderInt("Damage", &s.cheat_damage, 100, 1000, "%d%%");
+        help("How much damage Sam's weapons do. 100% is the game's own damage.");
+        ch |= menu_ui::Checkbox("Unlock everything", &s.cheat_unlock_all);
+        trace_crosshair_widget("cheat_unlock",cheats_enabled);
+        help("The 10 lost levels, the gallery and the game's own treasure cheats, as if all the treasure had\n"
+             "been collected. Nothing is written to the memory card: turned off, they are locked again.");
+    }
+    ImGui::EndDisabled();
+    const bool can_reset = !client && (info.cheats_available || state.active);
+    ImGui::BeginDisabled(!can_reset);
+    if (menu_ui::Button("Turn all cheats off")) {
+        s.reset_cheats();
+        if (info.network) {
+            if (info.mod_controls.apply) info.mod_controls.apply({});
+            if (info.mod_controls.apply_local) info.mod_controls.apply_local({});
+        } else ssne::mod_options({});
+        ch = true;
+    }
+    trace_crosshair_widget("cheat_off", can_reset);
+    ImGui::EndDisabled();
     return ch;
+}
+
+bool tab_cheats(Settings& s, const MenuInfo& info) {
+    bool changed = false;
+    auto state = ssne::mod_state();
+    // In single player the mod heartbeat stops while the F12 menu pauses the guest.
+    if (!info.network && ssne::paused()) state.active = state.available && g_mod_level_at_pause;
+    const char* labels[] = {"Player & weapons", "Enemies & items", "Aim assist & displays"};
+    const char* ids[] = {"cheat_section_player", "cheat_section_enemies", "cheat_section_aim"};
+    if (!ImGui::BeginTabBar("##cheat-sections")) return false;
+    for (int i = 0; i < 3; ++i) {
+        const bool active = menu_ui::BeginTabItem(labels[i], nullptr, g_cheat_section == i ? ImGuiTabItemFlags_SetSelected : 0);
+        trace_crosshair_widget(ids[i]);
+        if (!active) continue;
+        ImGui::BeginChild("##cheat-body");
+        ImGui::PushTextWrapPos(0);
+        if (info.network) {
+            if (i == 2) menu_ui::TextColored(kAccent, "Only on this PC");
+            else menu_ui::TextColored(kDim, info.network_host ? "You control these session settings." : "Only the host can change these settings.");
+        }
+        if (i == 0 && !info.cheats_available)
+            menu_ui::TextWrapped("Cheat hooks are unavailable for this disc revision.");
+        if (!state.active && i != 0) menu_ui::TextDisabled("Load a level to use these controls.");
+        if (i == 0) changed |= draw_player_cheats(s, info, state);
+        else if (i == 1) draw_spawn_controls(info.mod_controls, state);
+        else draw_aim_controls(info.mod_controls, state);
+        ImGui::PopTextWrapPos();
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+    g_cheat_section = -1;
+    return changed;
 }
 
 bool tab_gamepad(Settings& s, const MenuInfo& info) {
@@ -724,6 +800,10 @@ bool menu_take_rumble_test() {
 }
 
 bool menu_open() { return g_open; }
+void menu_snapshot_mod_level() { g_mod_level_at_pause = ssne::mod_state().active; }
+bool menu_cheats_selected() { return g_open && (g_select_tab == 7 || (g_select_tab < 0 && g_cheats_selected)); }
+void menu_select_cheats_section(int section) { g_cheat_section = std::clamp(section, 0, 2); }
+void menu_trace_cheat_widget(const char* id, bool enabled) { trace_crosshair_widget(id, enabled); }
 bool menu_take_state_request(int& slot, bool& save) {
     if (!g_state_req_slot) return false;
     slot = g_state_req_slot;
@@ -732,7 +812,7 @@ bool menu_take_state_request(int& slot, bool& save) {
     return true;
 }
 bool menu_take_exit_request() { bool r = g_exit_requested; g_exit_requested = false; return r; }
-void menu_set_open(bool open) { g_open = open; if (!open) {g_cap.active = false;g_capture_warning=nullptr;} }
+void menu_set_open(bool open) { g_open = open; if (!open) {g_cap.active = false;g_capture_warning=nullptr;g_cheats_selected=false;g_cheat_section=-1;} }
 void menu_select_tab(int tab) { g_select_tab = tab; }
 bool menu_capturing() { return g_open && g_cap.active; }
 
@@ -780,7 +860,7 @@ bool menu_handle_event(const SDL_Event& e, Settings& s, bool& changed) {
 bool draw_menu(Settings& s, const MenuInfo& info) {
     trace_crosshair_reset();
     menu_ui::set_language(s.game_language>=0?unsigned(s.game_language):unsigned(info.crosshair_language));
-    if (!g_open) {write_crosshair_ui_trace(s);return false;}
+    if (!g_open) {write_crosshair_ui_trace(s, info);return false;}
     bool ch = false;
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImVec2 size(std::min(760.f, vp->Size.x - 40), std::min(640.f, vp->Size.y - 40));
@@ -792,7 +872,7 @@ bool draw_menu(Settings& s, const MenuInfo& info) {
                                         ImGuiWindowFlags_NoSavedSettings);
     if(trace_crosshair_ui()){g_crosshair_ui_window_a=ImGui::GetWindowPos();const auto bounds=ImGui::GetWindowSize();g_crosshair_ui_window_b={g_crosshair_ui_window_a.x+bounds.x,g_crosshair_ui_window_a.y+bounds.y};const auto list=ImGui::GetWindowDrawList();g_crosshair_ui_clip_a=list->GetClipRectMin();g_crosshair_ui_clip_b=list->GetClipRectMax();}
     menu_ui::TextColored(kAccent, "SERIOUS SAM: NEXT ENCOUNTER NATIVE - Settings");
-    menu_ui::TextWrapped("   F12 / Esc to close. Changes apply and save immediately.");
+    menu_ui::TextWrapped("F12 / Esc closes settings. Insert opens Cheats.");
     const char* language_names[]={"Game setting (automatic)","English","Deutsch","Français"};
     int language=s.game_language+1;ImGui::SetNextItemWidth(230);
     if(menu_ui::BeginCombo("Game and menu language###menu_language",language_names[std::clamp(language,0,3)])){
@@ -834,7 +914,12 @@ bool draw_menu(Settings& s, const MenuInfo& info) {
         if(players_tab){ImGui::BeginChild("##pl");ch|=tab_players(s,info);ImGui::EndChild();ImGui::EndTabItem();}
         const bool cheats_tab=menu_ui::BeginTabItem("Cheats", nullptr, g_select_tab == 7 ? ImGuiTabItemFlags_SetSelected : 0);
         trace_crosshair_widget("tab_cheats");
-        if (cheats_tab) { ImGui::BeginChild("##c"); ch |= tab_cheats(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
+        if (cheats_tab) {
+            if (!g_cheats_selected && g_cheat_section < 0) g_cheat_section = 0;
+            ch |= tab_cheats(s, info);
+            ImGui::EndTabItem();
+        }
+        g_cheats_selected = cheats_tab;
         if (menu_ui::BeginTabItem("Save states", nullptr, g_select_tab == 5 ? ImGuiTabItemFlags_SetSelected : 0)) { ImGui::BeginChild("##s"); ch |= tab_states(s, info); ImGui::EndChild(); ImGui::EndTabItem(); }
         const bool hotkeys_tab=menu_ui::BeginTabItem("Hotkeys",nullptr,g_select_tab==4?ImGuiTabItemFlags_SetSelected:0);trace_crosshair_widget("tab_hotkeys");
         if(hotkeys_tab){ImGui::BeginChild("##h");ch|=tab_hotkeys(s);ImGui::EndChild();ImGui::EndTabItem();}
@@ -843,7 +928,7 @@ bool draw_menu(Settings& s, const MenuInfo& info) {
     }
     ImGui::End();
     if (!open) menu_set_open(false);
-    write_crosshair_ui_trace(s);
+    write_crosshair_ui_trace(s, info);
     return ch;
 }
 

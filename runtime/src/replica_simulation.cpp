@@ -5,6 +5,7 @@
 #include "ssne/native_entity.h"
 #include "ssne/native_party.h"
 #include "ssne/native_gait_motion.h"
+#include "ssne/native_movement_step.h"
 #include "ssne/native_render_paths.h"
 #include "ssne/native_model_update.h"
 #include "ssne/native_animation_pose.h"
@@ -171,16 +172,20 @@ void body_motion_hook(PPCContext& context){
     // Verified PAL normal player-update call. Startup/preview/dead/vehicle and
     // replica body paths retain their native behavior. The authoritative host's
     // bones, including this gait, are already transmitted to every replica.
-    const bool active=enabled && !replica_simulation() && context.lr==0x800BF890u && (frame_limit()==0 || frame_limit()>120) &&
+    const bool active=enabled && !replica_simulation() && context.lr==0x800BF890u &&
         readable(actor,0x790) && mem_read32(actor+0x48)==game_address(0x80212268u) && mem_read32(actor+0x148)==body &&
         native_party_actor_occupied(actor) && u2f(mem_read32(actor+0xCC))>0 && !mem_read32(actor+0x6C4) && readable(body,0xE8) && !mem_read32(body+0xBC);
-    if(!active){gait_states.erase(body);ssne_call_original(context,0x80153354u,original_body_motion);return;}
+    const auto completed=active?native_party_completed_movement_steps(actor):std::nullopt;
+    if(!active || (!completed && frame_limit()!=0 && frame_limit()<=120)){
+        gait_states.erase(body);ssne_call_original(context,0x80153354u,original_body_motion);return;
+    }
     const auto config=mem_read32(actor+0x23C),controller=mem_read32(actor+0x344),model=mem_read32(body+0x90);
     if(!readable(config,0x28) || !readable(controller,4) || !readable(model,0xB0)){gait_states.erase(body);ssne_call_original(context,0x80153354u,original_body_motion);return;}
     if(gait_states.size()>64)gait_states.clear();ensure_pose_observer();auto& state=gait_states[body];
     if(state.actor!=actor || state.controller!=controller || state.model!=model){state={actor,controller,model,{}};}
     std::array<float,3> position;for(unsigned i=0;i<3;++i)position[i]=u2f(mem_read32(body+0x3C+i*4));
-    const auto sample=state.motion.sample(mem_read32(context.r[13]-0x6D80),position,u2f(mem_read32(actor+0x140)),float(context.ps0[1]),u2f(mem_read32(config+0x24)));
+    const auto sample=state.motion.sample(mem_read32(context.r[13]-0x6D80),position,u2f(mem_read32(actor+0x140)),
+                                          float(context.ps0[1]),u2f(mem_read32(config+0x24)),completed);
     if(sample.duplicate){context.r[3]=0;return;}
     //80153354 copies current+3C to previous+30 before its remaining native
     // model/flash/orientation work. Give its displacement calculation a smooth

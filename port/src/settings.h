@@ -48,7 +48,7 @@ constexpr int kMinFpsLimit = 40;
 
 struct Settings {
     // Graphics
-    std::string renderer = "gpu";  // "gpu" or "software" (applies on restart)
+    std::string renderer = "gpu";  // "gpu" (OpenGL), "vulkan" or "software"; applies on restart
     int scale = 0;                 // GPU internal resolution 1..8, 0 = automatic (fits the window, lowered if the GPU is too
                                    // slow), -1 = native (exactly the size the image is shown at)
     int aspect = 1;                // 0 4:3, 1 16:9, 2 21:9, 3 automatic (the window's)

@@ -16,9 +16,13 @@ void require(bool ok,const char* message){if(!ok){std::cerr<<message<<'\n';std::
 void wait_for(const std::function<bool()>& check,const char* message){auto end=now_ms()+10000;while(!check()){require(now_ms()<end,message);std::this_thread::sleep_for(std::chrono::milliseconds(2));}}
 bool nonblock(SOCKET socket){u_long mode=1;return ioctlsocket(socket,FIONBIO,&mode)==0;}
 uint32_t read32(const uint8_t* p){return uint32_t(p[0])<<24|uint32_t(p[1])<<16|uint32_t(p[2])<<8|p[3];}
-// A real TCP relay. It delays/jitters whole application frames, drops selected
-// world/input frames, and briefly stalls forwarding. Frame loss is deliberately
-// stronger than TCP's normal reliable delivery; this is not a kernel packet-loss benchmark.
+// A real TCP relay. It delays/jitters application frames, discards selected
+// ordinary world/input updates, and briefly stalls forwarding. Full recovery
+// snapshots and control messages remain reliable: the host deliberately waits
+// for their acknowledgement before sending more worlds. Deleting that complete
+// recovery transaction would model a broken application relay, not TCP loss.
+// Even the discarded ordinary updates are stronger than reliable TCP delivery;
+// this exercises delta recovery rather than kernel packet-loss behaviour.
 class Link {
     struct Pending {std::vector<uint8_t> bytes;size_t sent=0;uint64_t due=0;};
     struct Flow {SOCKET source=INVALID_SOCKET,destination=INVALID_SOCKET;std::vector<uint8_t> receive;std::deque<Pending> pending;};
@@ -35,6 +39,11 @@ class Link {
             const auto* p=flow.receive.data()+consumed;auto size=read32(p+8);if(size>max_frame_bytes)return false;
             if(flow.receive.size()-consumed<size+12)break;auto type=wire::Message(uint16_t(p[6])<<8|p[7]);
             bool drop=(type==wire::Message::World && ++counter_%5==0) || (type==wire::Message::Input && ++counter_%10==0);
+            if(drop && type==wire::Message::World){
+                WorldDelta delta;std::string error;
+                if(!decode_delta(std::vector<uint8_t>(p+12,p+12+size),delta,error))return false;
+                if(delta.full)drop=false;
+            }
             if(drop)++dropped_;
             else {
                 auto jitter=int(random()%(2*jitter_+1))-int(jitter_);

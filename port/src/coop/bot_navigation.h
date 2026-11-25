@@ -113,8 +113,9 @@ public:
             for(unsigned i=best_,n=0;i && n<nodes_.size();i=nodes_[i].parent,++n)path_.push_back(nodes_[i].p);
             std::reverse(path_.begin(),path_.end());cursor_=0;
             // The search root can be behind us after following a partial path.
-            // Rejoin at the last nearby point, without cutting an unchecked edge.
-            for(unsigned i=0;i<path_.size();++i)if(bot_distance(start,path_[i])<cell_*.8f)cursor_=i+1;
+            // Use the same radius as waypoint arrival. A nearby fine-grid
+            // point can still be the only safe first step around a corner.
+            for(unsigned i=0;i<path_.size();++i)if(bot_distance(start,path_[i])<cell_*.35f)cursor_=i+1;
         }
         auto reached_point=[&](const BotPoint& point){
             if(bot_distance(start,point)<cell_*.35f)return true;

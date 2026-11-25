@@ -71,6 +71,9 @@ bool apply_native_corpse_lifecycle(PPCContext& context,uint32_t body,const Entit
     if(!context_ok(context) || !readable(body,0x188) || mem_read32(body+0x48)!=0x8020C6B8u || !validate_native_corpse_creation(e,error))return false;
     const auto& v=std::get<std::vector<float>>(e.properties.at("corpse_lifecycle"));
     const auto mode=mem_read32(body+0x174);if(mode==2)return true; // Explosion/gibs already use the authoritative event journal.
+    // Seed an already-running dissolve for a late join. Subsequent snapshots
+    // still own the corpse lifetime, while its local renderer owns the clock.
+    if(mem_read32(body+0x134) && v[10]==1)return true;
     const auto method=mode==1?0x8008DAA0u:0x8008D40Cu;
     for(auto fn:{method,0x8008E1E4u})if(!ssne_find_func(fn)){error="Original corpse presentation unavailable";return false;}
     StackScratch scratch(context);auto call=context;call.msr&=~0x8000u;call.r[1]-=0x200;mem_write32(call.r[1],context.r[1]);
@@ -104,6 +107,36 @@ bool apply_native_corpse_lifecycle(PPCContext& context,uint32_t body,const Entit
         }
     }
     mem_write32(dt_address,dt);return true;
+}
+bool advance_native_corpse_dissolves(PPCContext& context,std::span<const uint32_t> corpses,float seconds,std::string& error){
+    if(corpses.empty() || seconds<=0.f)return true;
+    if(!context_ok(context) || !std::isfinite(seconds) || seconds>.1f ||
+       !ssne_find_func(0x8008D40Cu) || !ssne_find_func(0x8008DAA0u)){
+        error="Original corpse presentation clock unavailable";
+        return false;
+    }
+    StackScratch scratch(context);
+    const auto clock=context.r[13]-0x7A08u;
+    struct RestoreClock {
+        uint32_t address,value;
+        ~RestoreClock(){mem_write32(address,value);}
+    } restore{clock,mem_read32(clock)};
+    mem_write32(clock,f2u(seconds));
+    static const bool trace=getenv("SSNE_TEST_HIDDEN") && getenv("SSNE_TEST_LOCAL_COSMETICS");
+    for(const auto body:corpses){
+        if(!readable(body,0x188) || mem_read32(body+0x48)!=0x8020C6B8u)continue;
+        const auto mode=mem_read32(body+0x174),phase=mem_read32(body+0x17C);
+        // 4 is the original retirement branch. Only host removal may
+        // retire this replica. 1..3 update its dissolve models/particles.
+        if(mode>1 || !mem_read32(body+0x134) || phase<1 || phase>=4)continue;
+        auto call=context;call.msr&=~0x8000u;call.r[1]-=0x200;
+        mem_write32(call.r[1],context.r[1]);call.r[3]=body;
+        ssne_call(call,mode==1?0x8008DAA0u:0x8008D40Cu);
+        if(trace)ssne::log_message("[coop-local-corpse-dissolve] native="+std::to_string(body)+
+            " phase="+std::to_string(mem_read32(body+0x17C))+
+            " clock="+std::to_string(u2f(mem_read32(body+0x154))));
+    }
+    return true;
 }
 bool capture_native_corpse_visual(PPCContext& context,uint32_t body,EntityState& e,std::string& error){
     if(!context_ok(context) || !readable(body,0x188) || mem_read32(body+0x48)!=0x8020C6B8u){error="Corpse visual owner unavailable";return false;}

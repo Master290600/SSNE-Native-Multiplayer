@@ -130,6 +130,7 @@ std::shared_ptr<WorldState> rich_world(float time,float phase){
     auto w=world(time,phase,-.2f+phase);w->revision=uint64_t(time*1000)+1;
     auto& local=w->entities.at(1);local.properties["position"]=std::array<float,3>{phase*.1f,0,0};
     local.properties["camera_mode"]=int64_t(0);local.properties["camera_frozen"]=int64_t(0);
+    local.properties["camera_head_compression"]=std::clamp(phase*.1f,0.f,.2f);
     const std::array<float,3> angles{.1f+phase*.01f,.02f,.01f};local.properties["view_angles"]=angles;
     auto camera=native_camera_rotation(angles);camera[3]=phase*.1f;camera[7]=1.7f;camera[11]=phase*.2f;put_presentation_matrix(local.properties,"camera_row",camera);
     local.properties["weapon_model_slot"]=int64_t(0);local.properties["weapon_model_visibility"]=std::vector<int64_t>{1,0};
@@ -147,6 +148,40 @@ std::shared_ptr<WorldState> rich_world(float time,float phase){
     EntityState door;door.id=8;door.kind=EntityKind::Door;door.properties["position"]=std::array<float,3>{3,0,0};w->entities.emplace(8,door);
     std::vector<int64_t> tags(20);tags[0]=100;tags[1]=1;tags[6]=2;w->mission["Session.Vehicles.Tags"]=tags;
     auto values=pose(11,phase);values.resize(128);values[0]=phase;values[1]=0;values[2]=1;values[3]=3.12f+phase;values[4]=0;values[5]=0;values[6]=100+phase;values[7]=200+phase;w->mission["Session.Vehicles.Values"]=values;return w;
+}
+void head_compression_regressions(){
+    auto snapshot=[](float time,float height){
+        auto w=rich_world(time,height);auto& player=w->entities.at(1);
+        const float compression=height*.1f;
+        player.properties["movement_mode"]=int64_t(1);
+        player.properties["position"]=std::array<float,3>{0,height,0};
+        player.properties["camera_head_compression"]=compression;
+        auto camera=matrix_identity();camera[7]=height+.95f-compression;
+        put_presentation_matrix(player.properties,"camera_row",camera);
+        for(unsigned hand=0;hand<2;++hand){auto gun=matrix_identity();gun[3]=hand?.3f:-.3f;gun[7]=-.4f;gun[11]=.8f;
+            put_presentation_matrix(player.properties,"weapon_model"+std::to_string(hand)+"_row",matrix_product(camera,gun));}
+        return w;
+    };
+    auto a=snapshot(0.f,0.f),b=snapshot(.05f,1.f),c=snapshot(.1f,2.f);
+    const auto saved_a=*a,saved_b=*b,saved_c=*c;
+    ClientPresentation reference,cached;
+    for(auto* p:{&reference,&cached}){p->push(a,100,{0,1});p->push(b,100.05,{0,1});p->push(c,100.1,{0,1});}
+    bool blended=false;
+    for(double now:{100.001,100.01,100.03,100.05,100.08,100.11}){
+        const auto expected=reference.sample(now);std::map<EntityId,EntityState> frame;cached.sample_into(now,frame);
+        require(entities_bits(frame,expected),"Cached head compression differs from reference snapshot phase");
+        const auto& player=frame.at(1);const auto body=std::get<std::array<float,3>>(player.properties.at("position"));
+        const float compression=std::get<float>(player.properties.at("camera_head_compression"));PresentationMatrix camera;
+        require(presentation_matrix(player.properties,"camera_row",camera),"Head compression lost the native camera");
+        require(std::abs(compression-body[1]*.1f)<.000001f,"Head compression used latest host state instead of buffered body phase");
+        require(std::abs(camera[7]-(body[1]+.95f-compression))<.000001f,"Buffered camera and compression sampled different jump phases");
+        blended|=compression>0.f && compression<.2f;
+    }
+    require(blended,"Compression regression never exercised an intermediate jump phase");
+    require(entities_bits(a->entities,saved_a.entities) && entities_bits(b->entities,saved_b.entities) && entities_bits(c->entities,saved_c.entities),"Compression sampling mutated authoritative snapshots");
+    auto absent=snapshot(.15f,1.f);absent->entities.at(1).properties.erase("camera_head_compression");
+    reference.push(absent,100.15,{0,1});cached.push(absent,100.15,{0,1});std::map<EntityId,EntityState> frame;cached.sample_into(100.151,frame);
+    require(!frame.at(1).properties.contains("camera_head_compression") && !reference.sample(100.151).at(1).properties.contains("camera_head_compression"),"Absent compression reused another controller's state");
 }
 void look_regressions(){
     const PlayerId owner{0,1};
@@ -277,4 +312,4 @@ void cached_frame_regressions(){
 }
 
 }
-int main(){try{vector_regressions();frame_regressions();look_regressions();cached_frame_regressions();std::cout<<"PASS presentation poses: exact float bits, immutable inputs, alias/fallback handling, complete frames, epoch/layout/lifetime/teleport guards, delayed camera acknowledgements and cached/reference frames; reuse="<<presentation_vector_reuse_enabled()<<'\n';return 0;}catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}}
+int main(){try{vector_regressions();frame_regressions();head_compression_regressions();look_regressions();cached_frame_regressions();std::cout<<"PASS presentation poses: exact float bits, immutable inputs, alias/fallback handling, complete frames, epoch/layout/lifetime/teleport guards, delayed camera acknowledgements, synchronized head compression and cached/reference frames; reuse="<<presentation_vector_reuse_enabled()<<'\n';return 0;}catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}}
